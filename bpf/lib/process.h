@@ -273,12 +273,7 @@ struct msg_k8s {
 #define BINARY_PATH_MAX_LEN 256
 
 struct heap_exe {
-	// because of verifier limitations, this has to be 2 * 256 bytes while 256
-	// should be theoretically sufficient, and actually is, in unit tests.
-	char buf[BINARY_PATH_MAX_LEN * 2];
-	// offset points to the start of the path in the above buffer. Use offset to
-	// read the path in the buffer since it's written from the end.
-	char *off;
+	char buf[BINARY_PATH_MAX_LEN];
 	__u32 len;
 	__u32 error;
 }; // All fields aligned so no 'packed' attribute.
@@ -305,6 +300,8 @@ struct msg_execve_event {
 #endif
 }; // All fields aligned so no 'packed' attribute.
 
+typedef __u64 mbset_t;
+
 // This structure stores the binary path that was recorded on execve.
 // Technically PATH_MAX is 4096 but we limit the length we store since we have
 // limits on the length of the string to compare:
@@ -318,6 +315,8 @@ struct binary {
 	__s64 path_length;
 	// BINARY_PATH_MAX_LEN first bytes of the path
 	char path[BINARY_PATH_MAX_LEN];
+	// matchBinary bitset for binary
+	mbset_t mb_bitset;
 }; // All fields aligned so no 'packed' attribute
 
 // The execve_map_value is tracked by the TGID of the thread group

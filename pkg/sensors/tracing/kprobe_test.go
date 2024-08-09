@@ -37,6 +37,8 @@ import (
 	bc "github.com/cilium/tetragon/pkg/matchers/bytesmatcher"
 	lc "github.com/cilium/tetragon/pkg/matchers/listmatcher"
 	sm "github.com/cilium/tetragon/pkg/matchers/stringmatcher"
+	"github.com/cilium/tetragon/pkg/metrics/consts"
+	"github.com/cilium/tetragon/pkg/metricsconfig"
 	"github.com/cilium/tetragon/pkg/observer"
 	"github.com/cilium/tetragon/pkg/observer/observertesthelper"
 	"github.com/cilium/tetragon/pkg/option"
@@ -47,6 +49,8 @@ import (
 	"github.com/cilium/tetragon/pkg/testutils/perfring"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
 	"github.com/cilium/tetragon/pkg/tracingpolicy"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -3886,6 +3890,55 @@ func TestKprobeMatchBinaries(t *testing.T) {
 	})
 }
 
+func TestKprobeMatchBinariesPrefixLargePath(t *testing.T) {
+	if !kernels.EnableLargeProgs() {
+		t.Skip()
+	}
+
+	// create a large temporary directory path
+	tmpDir := t.TempDir()
+	targetBinLargePath := tmpDir
+	// add (255 + 1) * 15 = 3840 chars to the path
+	// max is 4096 and we want to leave some space for the tmpdir + others
+	for range 15 {
+		targetBinLargePath += "/" + strings.Repeat("a", unix.NAME_MAX)
+	}
+	err := os.MkdirAll(targetBinLargePath, 0755)
+	require.NoError(t, err)
+
+	// copy the binary into it
+	targetBinLargePath += "/true"
+	fileExec, err := exec.LookPath("true")
+	require.NoError(t, err)
+	err = exec.Command("cp", fileExec, targetBinLargePath).Run()
+	require.NoError(t, err)
+
+	var doneWG, readyWG sync.WaitGroup
+	defer doneWG.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	createCrdFile(t, getMatchBinariesCrd("Prefix", []string{tmpDir}))
+
+	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
+	if err != nil {
+		t.Fatalf("GetDefaultObserverWithFile error: %s", err)
+	}
+	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
+	readyWG.Wait()
+
+	if err := exec.Command(targetBinLargePath).Run(); err != nil {
+		t.Fatalf("failed to run true: %s", err)
+	}
+
+	checker := ec.NewUnorderedEventChecker(ec.NewProcessKprobeChecker("").
+		WithProcess(ec.NewProcessChecker().WithBinary(sm.Full(targetBinLargePath))).
+		WithFunctionName(sm.Full("fd_install")))
+	err = jsonchecker.JsonTestCheck(t, checker)
+	assert.NoError(t, err)
+}
+
 // matchBinariesPerfringTest checks that the matchBinaries do correctly
 // filter the events i.e. it checks that no other events appear.
 func matchBinariesPerfringTest(t *testing.T, operator string, values []string) {
@@ -5844,15 +5897,13 @@ spec:
 	// Generate 5 datagrams
 	socket, err := net.Dial("udp", "127.0.0.1:9468")
 	if err != nil {
-		fmt.Printf("ERROR dialing socket\n")
-		panic(err)
+		t.Fatalf("failed dialing socket: %s", err)
 	}
 
 	for i := 0; i < 5; i++ {
 		_, err := socket.Write([]byte("data"))
 		if err != nil {
-			fmt.Printf("ERROR writing to socket\n")
-			panic(err)
+			t.Fatalf("failed writing to socket: %s", err)
 		}
 	}
 
@@ -6809,4 +6860,69 @@ spec:
 	checker := ec.NewUnorderedEventChecker(kpCheckers1, kpCheckers2)
 	err = jsonchecker.JsonTestCheck(t, checker)
 	assert.NoError(t, err)
+}
+
+func TestMissedProgStatsKprobeMulti(t *testing.T) {
+	var doneWG, readyWG sync.WaitGroup
+	defer doneWG.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	// we need kernel support to count the prog's missed count added in:
+	// f915fcb38553 ("bpf: Count stats for kprobe_multi programs")
+	// which was added in v6.7, adding also the kprobe-multi check
+	// just to be sure we have that
+	if !kernels.MinKernelVersion("6.7") || !bpf.HasKprobeMulti() {
+		t.Skip("Test requires kprobe multi and kernel version 6.7")
+	}
+
+	testNop := testutils.RepoRootPath("contrib/tester-progs/nop")
+
+	tracingPolicy := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "syswritefollowfdpsswd"
+spec:
+  kprobes:
+  - call: "sys_read"
+    syscall: true
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "` + testNop + `"
+      matchActions:
+      - action: Signal
+        argSig: 10
+  - call: "group_send_sig_info"
+    syscall: false
+`
+
+	createCrdFile(t, tracingPolicy)
+
+	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib)
+	if err != nil {
+		t.Fatalf("GetDefaultObserverWithFile error: %s", err)
+	}
+	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
+	readyWG.Wait()
+
+	if err := exec.Command(testNop).Run(); err != nil {
+		fmt.Printf("Failed to execute test binary: %s\n", err)
+	}
+
+	expected := strings.NewReader(` # HELP tetragon_missed_prog_probes_total The total number of Tetragon probe missed by program.
+# TYPE tetragon_missed_prog_probes_total counter
+tetragon_missed_prog_probes_total{attach="acct_process",policy="__base__"} 0
+tetragon_missed_prog_probes_total{attach="kprobe_multi (2 functions)",policy="syswritefollowfdpsswd"} 1
+tetragon_missed_prog_probes_total{attach="sched/sched_process_exec",policy="__base__"} 0
+tetragon_missed_prog_probes_total{attach="security_bprm_committing_creds",policy="__base__"} 0
+tetragon_missed_prog_probes_total{attach="wake_up_new_task",policy="__base__"} 0
+`)
+
+	assert.NoError(t, testutil.GatherAndCompare(metricsconfig.GetRegistry(), expected,
+		prometheus.BuildFQName(consts.MetricsNamespace, "", "missed_prog_probes_total")))
+
 }

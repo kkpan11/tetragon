@@ -45,6 +45,7 @@
     - [ProcessExit](#tetragon-ProcessExit)
     - [ProcessKprobe](#tetragon-ProcessKprobe)
     - [ProcessLoader](#tetragon-ProcessLoader)
+    - [ProcessLsm](#tetragon-ProcessLsm)
     - [ProcessTracepoint](#tetragon-ProcessTracepoint)
     - [ProcessUprobe](#tetragon-ProcessUprobe)
     - [RuntimeHookRequest](#tetragon-RuntimeHookRequest)
@@ -811,9 +812,7 @@ https://github.com/opencontainers/runtime-spec/blob/main/config.md#createcontain
 | tid | [google.protobuf.UInt32Value](#google-protobuf-UInt32Value) |  | Thread ID, note that for the thread group leader, tid is equal to pid. |
 | process_credentials | [ProcessCredentials](#tetragon-ProcessCredentials) |  | Process credentials, disabled by default, can be enabled by the `--enable-process-cred` flag. |
 | binary_properties | [BinaryProperties](#tetragon-BinaryProperties) |  | Executed binary properties. This field is only available on ProcessExec events. |
-| user | [UserRecord](#tetragon-UserRecord) |  | UserRecord contains user information about the event.
-
-UserRecord is only supported when i) Tetragon is running as a systemd service or directly on the host, and ii) when `--username-metadata` is set to &#34;unix&#34;. In this case, the information is retrieved from the traditional user database `/etc/passwd` and no name services lookups are performed. The resolution will only be attempted for processes in the host namespace. Note that this resolution happens in user-space, which means that mapping might have changed between the in-kernel BPF hook being executed and the username resolution. |
+| user | [UserRecord](#tetragon-UserRecord) |  | UserRecord contains user information about the event. It is only supported when i) Tetragon is running as a systemd service or directly on the host, and ii) when the flag `--username-metadata` is set to &#34;unix&#34;. In this case, the information is retrieved from the traditional user database `/etc/passwd` and no name services lookups are performed. The resolution will only be attempted for processes in the host namespace. Note that this resolution happens in user-space, which means that mapping might have changed between the in-kernel BPF hook being executed and the username resolution. |
 
 
 
@@ -918,6 +917,28 @@ loader sensor event triggered for loaded binary/library
 | process | [Process](#tetragon-Process) |  |  |
 | path | [string](#string) |  |  |
 | buildid | [bytes](#bytes) |  |  |
+
+
+
+
+
+
+<a name="tetragon-ProcessLsm"></a>
+
+### ProcessLsm
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| process | [Process](#tetragon-Process) |  |  |
+| parent | [Process](#tetragon-Process) |  |  |
+| function_name | [string](#string) |  | LSM hook name. |
+| policy_name | [string](#string) |  | Name of the policy that created that LSM hook. |
+| message | [string](#string) |  | Short message of the Tracing Policy to inform users what is going on. |
+| args | [KprobeArgument](#tetragon-KprobeArgument) | repeated | Arguments definition of the observed LSM hook. |
+| action | [KprobeAction](#tetragon-KprobeAction) |  | Action performed when the LSM hook matched. |
+| tags | [string](#string) | repeated | Tags of the Tracing Policy to categorize the event. |
 
 
 
@@ -1294,6 +1315,7 @@ Capability set to filter over. NOTE: you may specify only ONE set here.
 | process_loader | [ProcessLoader](#tetragon-ProcessLoader) |  |  |
 | process_uprobe | [ProcessUprobe](#tetragon-ProcessUprobe) |  |  |
 | process_throttle | [ProcessThrottle](#tetragon-ProcessThrottle) |  |  |
+| process_lsm | [ProcessLsm](#tetragon-ProcessLsm) |  |  |
 | test | [Test](#tetragon-Test) |  |  |
 | rate_limit_info | [RateLimitInfo](#tetragon-RateLimitInfo) |  |  |
 | node_name | [string](#string) |  | Name of the node where this event was observed. |
@@ -1373,6 +1395,7 @@ GetEventsResponse event oneof.
 | PROCESS_LOADER | 11 |  |
 | PROCESS_UPROBE | 12 |  |
 | PROCESS_THROTTLE | 27 |  |
+| PROCESS_LSM | 28 |  |
 | TEST | 40000 |  |
 | RATE_LIMIT_INFO | 40001 |  |
 

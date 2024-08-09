@@ -270,9 +270,8 @@ message Process {
     // Executed binary properties. This field is only available on ProcessExec events.
     BinaryProperties binary_properties = 18;
     // UserRecord contains user information about the event.
-    //
-    // UserRecord is only supported when i) Tetragon is running as a systemd service or directly on the host, and
-    //  ii) when  `--username-metadata` is set to "unix". In this case, the information is retrieved from
+    // It is only supported when i) Tetragon is running as a systemd service or directly on the host, and
+    // ii) when the flag `--username-metadata` is set to "unix". In this case, the information is retrieved from
     // the traditional user database `/etc/passwd` and no name services lookups are performed.
     // The resolution will only be attempted for processes in the host namespace.
     // Note that this resolution happens in user-space, which means that mapping might have changed
@@ -530,6 +529,23 @@ message ProcessUprobe {
     repeated KprobeArgument args = 7;
     // Tags of the Tracing Policy to categorize the event.
     repeated string tags = 8;
+}
+
+message ProcessLsm {
+    Process process = 1;
+    Process parent = 2;
+    // LSM hook name.
+    string function_name = 3;
+    // Name of the policy that created that LSM hook.
+    string policy_name = 5;
+    // Short message of the Tracing Policy to inform users what is going on.
+    string message = 6;
+    // Arguments definition of the observed LSM hook.
+    repeated KprobeArgument args = 7;
+    // Action performed when the LSM hook matched.
+    KprobeAction action = 8;
+    // Tags of the Tracing Policy to categorize the event.
+    repeated string tags = 9;
 }
 
 message KernelModule {

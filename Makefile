@@ -264,8 +264,10 @@ test: tester-progs tetragon-bpf ## Run Go tests.
 tester-progs: ## Compile helper programs for unit testing.
 	$(MAKE) -C $(TESTER_PROGS_DIR)
 
+## bpf-test: ## run BPF tests.
+## bpf-test BPFGOTESTFLAGS="-v": ## run BPF tests with verbose.
 .PHONY: bpf-test
-bpf-test: ## Run BPF tests.
+bpf-test:
 	$(MAKE) -C ./bpf run-test
 
 .PHONY: verify
@@ -339,14 +341,32 @@ cscope: ## Generate cscope for bpf files.
 
 .PHONY: kind
 kind: ## Create a kind cluster for Tetragon development.
-	./contrib/localdev/bootstrap-kind-cluster.sh
+	./contrib/kind/bootstrap-kind-cluster.sh
 
+KIND_BUILD_IMAGES ?= 1
+VALUES ?= 
+
+## kind-install-tetragon: ## Install Tetragon in a kind cluster.
+## kind-install-tetragon KIND_BUILD_IMAGES=0: ## Install Tetragon in a kind cluster without (re-)building images.
+## kind-install-tetragon VALUES=values.yaml: ## Install Tetragon in a kind cluster using additional Helm values.
 .PHONY: kind-install-tetragon
-kind-install-tetragon: ## Install local version of Tetragon in the kind cluster.
-	./contrib/localdev/install-tetragon.sh --image cilium/tetragon:latest --operator cilium/tetragon-operator:latest
+ifneq ($(KIND_BUILD_IMAGES), 0)
+kind-install-tetragon: images
+else
+kind-install-tetragon:
+endif
+ifneq ($(VALUES),)
+	./contrib/kind/install-tetragon.sh -v $(VALUES)
+else
+	./contrib/kind/install-tetragon.sh
+endif
 
 .PHONY: kind-setup
-kind-setup: images kind kind-install-tetragon ## Create a kind cluster and install local version of Tetragon.
+kind-setup: kind kind-install-tetragon ## Create a kind cluster and install local version of Tetragon.
+
+.PHONY: kind-down
+kind-down: ## Delete a kind cluster for Tetragon development.
+	./contrib/kind/delete-kind-cluster.sh
 
 ##@ Chores and generated files
 
@@ -355,9 +375,11 @@ codegen: | protogen
 protogen: protoc-gen-go-tetragon ## Generate code based on .proto files.
 	# Need to call vendor twice here, once before and once after codegen the reason
 	# being we need to grab changes first plus pull in whatever gets generated here.
-	$(MAKE) vendor
+	$(MAKE) -C api vendor
 	$(MAKE) -C api
-	$(MAKE) vendor
+	$(GO) mod tidy
+	$(GO) mod vendor
+	$(GO) mod verify
 
 .PHONY: protoc-gen-go-tetragon
 protoc-gen-go-tetragon:
@@ -368,15 +390,20 @@ generate: | crds
 crds: ## Generate kubebuilder files.
 	# Need to call vendor twice here, once before and once after generate, the reason
 	# being we need to grab changes first plus pull in whatever gets generated here.
-	$(MAKE) vendor
-	$(MAKE) -C pkg/k8s/
-	$(MAKE) vendor
+	$(MAKE) -C pkg/k8s vendor
+	$(MAKE) -C pkg/k8s
+	$(MAKE) -C pkg/k8s vendor
+	$(GO) mod tidy
+	$(GO) mod vendor
+	$(GO) mod verify
+	# YAML CRDs also live in the helm charts, so update them as well.
+	$(MAKE) -C install/kubernetes tetragon/crds-yaml
 
 .PHONY: vendor
 vendor: ## Tidy and vendor Go modules.
-	$(MAKE) -C ./api vendor
-	$(MAKE) -C ./pkg/k8s vendor
-	$(MAKE) -C ./contrib/tetragon-rthooks vendor
+	$(MAKE) -C api vendor
+	$(MAKE) -C pkg/k8s vendor
+	$(MAKE) -C contrib/tetragon-rthooks vendor
 	$(GO) mod tidy
 	$(GO) mod vendor
 	$(GO) mod verify

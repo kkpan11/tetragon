@@ -5,10 +5,60 @@
 #define __GENERIC_CALLS_H__
 
 #include "bpf_tracing.h"
+#include "pfilter.h"
+#include "policy_filter.h"
 #include "types/basic.h"
 #include "vmlinux.h"
 
 #define MAX_TOTAL 9000
+
+FUNC_INLINE int
+generic_start_process_filter(void *ctx, struct generic_maps *maps)
+{
+	struct msg_generic_kprobe *msg;
+	struct event_config *config;
+	struct task_struct *task;
+	int i, zero = 0;
+
+	msg = map_lookup_elem(maps->heap, &zero);
+	if (!msg)
+		return 0;
+
+	/* setup index, check policy filter, and setup function id */
+	msg->idx = get_index(ctx);
+	config = map_lookup_elem(maps->config, &msg->idx);
+	if (!config)
+		return 0;
+	if (!policy_filter_check(config->policy_id))
+		return 0;
+	msg->func_id = config->func_id;
+	msg->retprobe_id = 0;
+
+	/* Initialize selector index to 0 */
+	msg->sel.curr = 0;
+#pragma unroll
+	for (i = 0; i < MAX_CONFIGURED_SELECTORS; i++)
+		msg->sel.active[i] = 0;
+	/* Initialize accept field to reject */
+	msg->sel.pass = false;
+	msg->tailcall_index_process = 0;
+	msg->tailcall_index_selector = 0;
+	task = (struct task_struct *)get_current_task();
+	/* Initialize namespaces to apply filters on them */
+	get_namespaces(&msg->ns, task);
+	/* Initialize capabilities to apply filters on them */
+	get_current_subj_caps(&msg->caps, task);
+#ifdef __NS_CHANGES_FILTER
+	msg->sel.match_ns = 0;
+#endif
+#ifdef __CAP_CHANGES_FILTER
+	msg->sel.match_cap = 0;
+#endif
+
+	/* Tail call into filters. */
+	tail_call(ctx, maps->calls, TAIL_CALL_FILTER);
+	return 0;
+}
 
 FUNC_INLINE int
 generic_process_event(void *ctx, struct bpf_map_def *heap_map,
@@ -44,8 +94,8 @@ generic_process_event(void *ctx, struct bpf_map_def *heap_map,
 		int am;
 
 		am = (&config->arg0m)[index];
-		asm volatile("%[am] &= 0xffff;\n" ::[am] "+r"(am)
-			     :);
+		asm volatile("%[am] &= 0xffff;\n"
+			     : [am] "+r"(am));
 
 		errv = read_call_arg(ctx, e, index, ty, total, a, am, data_heap);
 		if (errv > 0)
@@ -170,6 +220,17 @@ generic_process_event_and_setup(struct pt_regs *ctx,
 	ty = config->argreturn;
 	if (ty > 0)
 		retprobe_map_set(e->func_id, e->retprobe_id, e->common.ktime, 1);
+#endif
+
+#ifdef GENERIC_LSM
+	struct bpf_raw_tracepoint_args *raw_args = (struct bpf_raw_tracepoint_args *)ctx;
+
+	e->a0 = BPF_CORE_READ(raw_args, args[0]);
+	e->a1 = BPF_CORE_READ(raw_args, args[1]);
+	e->a2 = BPF_CORE_READ(raw_args, args[2]);
+	e->a3 = BPF_CORE_READ(raw_args, args[3]);
+	e->a4 = BPF_CORE_READ(raw_args, args[4]);
+	generic_process_init(e, MSG_OP_GENERIC_LSM, config);
 #endif
 
 #ifdef GENERIC_UPROBE

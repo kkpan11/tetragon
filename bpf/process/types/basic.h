@@ -246,8 +246,8 @@ FUNC_INLINE int return_error(int *s, int err)
 FUNC_INLINE char *
 args_off(struct msg_generic_kprobe *e, unsigned long off)
 {
-	asm volatile("%[off] &= 0x3fff;\n" ::[off] "+r"(off)
-		     :);
+	asm volatile("%[off] &= 0x3fff;\n"
+		     : [off] "+r"(off));
 	return e->args + off;
 }
 
@@ -261,8 +261,9 @@ return_stack_error(char *args, int orig, int err)
 	asm volatile("%[orig] &= 0xfff;\n"
 		     "r1 = *(u64 *)%[args];\n"
 		     "r1 += %[orig];\n"
-		     "*(u32 *)(r1 + 0) = %[err];\n" ::[orig] "r+"(orig),
-		     [args] "m+"(args), [err] "r+"(err)
+		     "*(u32 *)(r1 + 0) = %[err];\n"
+		     : [orig] "+r"(orig), [args] "+m"(args), [err] "+r"(err)
+		     :
 		     : "r1");
 	return sizeof(int);
 }
@@ -285,8 +286,8 @@ parse_iovec_array(long off, unsigned long arg, int i, unsigned long max,
 		size = max;
 	if (size > 4094)
 		return char_buf_toolarge;
-	asm volatile("%[size] &= 0xfff;\n" ::[size] "+r"(size)
-		     :);
+	asm volatile("%[size] &= 0xfff;\n"
+		     : [size] "+r"(size));
 	err = probe_read(args_off(e, off), size, (char *)iov.iov_base);
 	if (err < 0)
 		return char_buf_pagefault;
@@ -346,8 +347,8 @@ FUNC_INLINE long copy_path(char *args, const struct path *arg)
 	if (!buffer)
 		return 0;
 
-	asm volatile("%[size] &= 0xff;\n" ::[size] "+r"(size)
-		     :);
+	asm volatile("%[size] &= 0xff;\n"
+		     : [size] "+r"(size));
 	probe_read(curr, size, buffer);
 	*s = size;
 	size += 4;
@@ -373,7 +374,7 @@ FUNC_INLINE long copy_path(char *args, const struct path *arg)
 		"r2 = *(u16 *)%[mode];\n"
 		"*(u16 *)(r1 + 4) = r2;\n"
 		:
-		: [pid] "m"(args), [flags] "m"(flags), [offset] "+m"(size), [mode] "m"(i_mode)
+		: [pid] "m"(args), [flags] "m"(flags), [offset] "m"(size), [mode] "m"(i_mode)
 		: "r0", "r1", "r2", "r7", "memory"
 		: a);
 a:
@@ -583,8 +584,8 @@ __copy_char_buf(void *ctx, long off, unsigned long arg, unsigned long bytes,
 
 	/* Bound bytes <4095 to ensure bytes does not read past end of buffer */
 	rd_bytes = bytes < 0x1000 ? bytes : 0xfff;
-	asm volatile("%[rd_bytes] &= 0xfff;\n" ::[rd_bytes] "+r"(rd_bytes)
-		     :);
+	asm volatile("%[rd_bytes] &= 0xfff;\n"
+		     : [rd_bytes] "+r"(rd_bytes));
 	err = probe_read(&s[2], rd_bytes, (char *)arg);
 	if (err < 0)
 		return return_error(s, char_buf_pagefault);
@@ -1520,6 +1521,7 @@ FUNC_INLINE size_t type_to_min_size(int type, int argm)
 struct match_binaries_sel_opts {
 	__u32 op;
 	__u32 map_id;
+	__u32 mbset_id;
 };
 
 // This map is used by the matchBinaries selectors to retrieve their options
@@ -1529,8 +1531,6 @@ struct {
 	__type(key, __u32); /* selector id */
 	__type(value, struct match_binaries_sel_opts);
 } tg_mb_sel_opts SEC(".maps");
-
-#define MATCH_BINARIES_PATH_MAX_LENGTH 256
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
@@ -1579,6 +1579,14 @@ FUNC_INLINE int match_binaries(__u32 selidx)
 
 		switch (selector_options->op) {
 		case op_filter_in:
+			/* Check if we match the selector's bit in ->mb_bitset, which means that the
+			 * process matches a matchBinaries section with a followChidren:true
+			 * attribute either because the binary matches or because the binary of a
+			 * parent matched.
+			 */
+			if (current->bin.mb_bitset & (1UL << selector_options->mbset_id))
+				return 1;
+			fallthrough;
 		case op_filter_notin:
 			path_map = map_lookup_elem(&tg_mb_paths, &selidx);
 			if (!path_map)
@@ -1660,8 +1668,8 @@ selector_arg_offset(__u8 *f, struct msg_generic_kprobe *e, __u32 selidx,
 		bool set32bit = false;
 
 		argsoff = filters->argoff[i];
-		asm volatile("%[argsoff] &= 0x3ff;\n" ::[argsoff] "+r"(argsoff)
-			     :);
+		asm volatile("%[argsoff] &= 0x3ff;\n"
+			     : [argsoff] "+r"(argsoff));
 
 		if (argsoff <= 0)
 			return pass ? seloff : 0;
@@ -1673,11 +1681,11 @@ selector_arg_offset(__u8 *f, struct msg_generic_kprobe *e, __u32 selidx,
 		if (index > 5)
 			return 0;
 
-		asm volatile("%[index] &= 0x7;\n" ::[index] "+r"(index)
-			     :);
+		asm volatile("%[index] &= 0x7;\n"
+			     : [index] "+r"(index));
 		argoff = e->argsoff[index];
-		asm volatile("%[argoff] &= 0x7ff;\n" ::[argoff] "+r"(argoff)
-			     :);
+		asm volatile("%[argoff] &= 0x7ff;\n"
+			     : [argoff] "+r"(argoff));
 		args = &e->args[argoff];
 
 		switch (filter->type) {
@@ -2376,9 +2384,7 @@ generic_output(void *ctx, struct bpf_map_def *heap, u8 op)
 	asm volatile("%[total] &= 0x7fff;\n"
 		     "if %[total] < 9000 goto +1\n;"
 		     "%[total] = 9000;\n"
-		     :
-		     : [total] "+r"(total)
-		     :);
+		     : [total] "+r"(total));
 	perf_event_output_metric(ctx, op, &tcpmon_map, BPF_F_CURRENT_CPU, e, total);
 	return 0;
 }

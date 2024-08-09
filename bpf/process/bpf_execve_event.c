@@ -31,6 +31,17 @@ struct {
 	__type(value, struct msg_data);
 } data_heap SEC(".maps");
 
+/* tg_mbset_map holds a mapping from (binary) paths to a bitset of ids that it matches. The map is
+ * written by user-space and read in the exec hook to determine the bitset of ids of a binary that
+ * is executed.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __u8[MATCH_BINARIES_PATH_MAX_LENGTH]);
+	__type(value, mbset_t);
+} tg_mbset_map SEC(".maps");
+
 FUNC_INLINE __u32
 read_args(void *ctx, struct msg_execve_event *event)
 {
@@ -169,11 +180,22 @@ read_exe(struct task_struct *task, struct heap_exe *exe)
 	struct file *file = BPF_CORE_READ(task, mm, exe_file);
 	struct path *path = __builtin_preserve_access_index(&file->f_path);
 
-	exe->len = BINARY_PATH_MAX_LEN;
-	exe->off = (char *)&exe->buf;
-	exe->off = __d_path_local(path, exe->off, (int *)&exe->len, (int *)&exe->error);
-	if (exe->len > 0)
-		exe->len = BINARY_PATH_MAX_LEN - exe->len;
+	// we need to walk the complete 4096 len dentry in order to have an accurate
+	// matching on the prefix operators, even if we only keep a subset of that
+	char *buffer;
+
+	buffer = d_path_local(path, (int *)&exe->len, (int *)&exe->error);
+	if (!buffer)
+		return 0;
+
+	// buffer used by d_path_local can contain up to MAX_BUF_LEN i.e. 4096 we
+	// only keep the first 255 chars for our needs (we sacrifice one char to the
+	// verifier for the > 0 check)
+	if (exe->len > 255)
+		exe->len = 255;
+	asm volatile("%[len] &= 0xff;\n"
+		     : [len] "+r"(exe->len));
+	probe_read(exe->buf, exe->len, buffer);
 
 	return exe->len;
 }
@@ -258,6 +280,29 @@ execve_rate(void *ctx)
 	return 0;
 }
 
+/* update bitset mark */
+FUNC_INLINE
+void update_mb_bitset(struct binary *bin)
+{
+	__u64 *bitsetp;
+	struct execve_map_value *parent;
+
+	parent = event_find_parent();
+	if (parent) {
+		/* ->mb_bitset is used to track matchBinary matches to children (followChildren), so
+		 * here we propagate the parent value to the child.
+		 */
+		bin->mb_bitset = parent->bin.mb_bitset;
+	}
+
+	/* check the map and see if the binary path matches a binary
+	 * NB: only the In operator is supported for now
+	 */
+	bitsetp = map_lookup_elem(&tg_mbset_map, bin->path);
+	if (bitsetp)
+		bin->mb_bitset |= *bitsetp;
+}
+
 /**
  * execve_send() sends the collected execve event data.
  *
@@ -330,7 +375,7 @@ execve_send(void *ctx)
 #ifdef __LARGE_BPF_PROG
 		// read from proc exe stored at execve time
 		if (event->exe.len <= BINARY_PATH_MAX_LEN) {
-			curr->bin.path_length = probe_read(curr->bin.path, event->exe.len, event->exe.off);
+			curr->bin.path_length = probe_read(curr->bin.path, event->exe.len, event->exe.buf);
 			if (curr->bin.path_length == 0)
 				curr->bin.path_length = event->exe.len;
 		}
@@ -344,6 +389,8 @@ execve_send(void *ctx)
 			curr->bin.path_length--;
 		}
 #endif
+
+		update_mb_bitset(&curr->bin);
 	}
 
 	event->common.flags = 0;

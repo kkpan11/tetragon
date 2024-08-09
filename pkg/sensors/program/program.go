@@ -8,6 +8,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
+	"github.com/cilium/ebpf/link"
 	"github.com/cilium/tetragon/pkg/sensors/unloader"
 )
 
@@ -29,6 +30,9 @@ func Builder(
 		MapLoad:    nil,
 		unloader:   nil,
 		PinMap:     make(map[string]*Map),
+		Link:       nil,
+		Prog:       nil,
+		Policy:     "",
 	}
 }
 
@@ -116,6 +120,16 @@ type Program struct {
 
 	// Type information used for CO-RE relocations.
 	KernelTypes *btf.Spec
+
+	// Tail call prefix/map
+	TcPrefix string
+	TcMap    *Map
+
+	Link link.Link
+	Prog *ebpf.Program
+
+	// policy name the program belongs to
+	Policy string
 }
 
 func (p *Program) SetRetProbe(ret bool) *Program {
@@ -130,6 +144,17 @@ func (p *Program) SetLoaderData(d interface{}) *Program {
 
 func (p *Program) SetAttachData(d interface{}) *Program {
 	p.AttachData = d
+	return p
+}
+
+func (p *Program) SetTailCall(prefix string, m *Map) *Program {
+	p.TcPrefix = prefix
+	p.TcMap = m
+	return p
+}
+
+func (p *Program) SetPolicy(policy string) *Program {
+	p.Policy = policy
 	return p
 }
 
