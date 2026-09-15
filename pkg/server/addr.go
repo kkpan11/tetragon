@@ -24,9 +24,8 @@ import (
 // Hence, because we want the same string to work the same way both on the client and the server, we
 // only support the two addresses above.
 func SplitListenAddr(arg string) (string, string, error) {
-
-	if strings.HasPrefix(arg, "unix://") {
-		path := strings.TrimPrefix(arg, "unix://")
+	if after, ok := strings.CutPrefix(arg, "unix://"); ok {
+		path := after
 		if !filepath.IsAbs(path) {
 			return "", "", fmt.Errorf("path %s (%s) is not absolute", path, arg)
 		}

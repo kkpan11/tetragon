@@ -4,408 +4,26 @@
 package tracingpolicy
 
 import (
-	"bytes"
 	_ "embed"
-	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
-	"reflect"
-	"runtime"
-	"strings"
 	"testing"
-	"text/template"
 
-	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
-	"github.com/cilium/tetragon/pkg/logger"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"github.com/stretchr/testify/assert"
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
+
+	"github.com/cilium/tetragon/pkg/build"
+	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
+	"github.com/cilium/tetragon/pkg/testutils/tempfile"
 )
-
-var writev = `
-apiVersion: cilium.io/v1alpha1
-kind: TracingPolicy
-metadata:
-  name: "sys-write"
-spec:
-  kprobes:
-  - call: "sys_write"
-    return: false
-    syscall: true
-    args:
-      - index: 0
-        type: "int"
-      - index: 1
-        type: "char_buf"
-        sizeArgIndex: 3
-      - index: 2
-        type: "size_t"
-    selectors:
-      - matchPIDs:
-        - operator: In
-          followForks: true
-          isNamespacePID: false
-          values:
-            - 1
-        matchArgs:
-        - index: 0
-          operator: "Equal"
-          values:
-            - "1"
-        matchNamespaces:
-        - namespace: Net
-          operator: In
-          values:
-            - "4026532024"
-            - "4026532025"
-        - namespace: Mnt
-          operator: NotIn
-          values:
-            - "4026532099"
-        matchNamespaceChanges:
-        - operator: In
-          values:
-          - "Mnt"
-          - "Pid"
-          - "User"
-          - "Uts"
-        matchCapabilities:
-        - type: Effective
-          operator: In
-          isNamespaceCapability: true
-          values:
-            - "CAP_CHOWN"
-            - "CAP_NET_RAW"
-        - type: Inheritable
-          operator: NotIn
-          values:
-            - "CAP_SETPCAP"
-            - "CAP_SYS_ADMIN"
-        matchCapabilityChanges:
-        - type: Effective
-          operator: In
-          isNamespaceCapability: true
-          values:
-            - "CAP_SYS_ADMIN"
-            - "CAP_NET_RAW"
-`
-
-var expectedWrite = GenericTracingPolicy{
-	TypeMeta: v1.TypeMeta{
-		APIVersion: "cilium.io/v1alpha1",
-		Kind:       "TracingPolicy",
-	},
-	Metadata: v1.ObjectMeta{Name: "sys-write"},
-	Spec: v1alpha1.TracingPolicySpec{
-		KProbes: []v1alpha1.KProbeSpec{
-			{
-				Call:    "sys_write",
-				Return:  false,
-				Syscall: true,
-				Args: []v1alpha1.KProbeArg{
-					{
-						Index: 0,
-						Type:  "int",
-					},
-					{
-						Index:        1,
-						Type:         "char_buf",
-						SizeArgIndex: 3,
-					},
-					{
-						Index: 2,
-						Type:  "size_t",
-					},
-				},
-				Selectors: []v1alpha1.KProbeSelector{
-					{
-						MatchPIDs: []v1alpha1.PIDSelector{
-							{
-								Operator:       "In",
-								Values:         []uint32{1},
-								FollowForks:    true,
-								IsNamespacePID: false,
-							},
-						},
-						MatchArgs: []v1alpha1.ArgSelector{
-							{
-								Index:    0,
-								Operator: "Equal",
-								Values:   []string{"1"},
-							},
-						},
-						MatchNamespaces: []v1alpha1.NamespaceSelector{
-							{
-								Namespace: "Net",
-								Operator:  "In",
-								Values:    []string{"4026532024", "4026532025"},
-							},
-							{
-								Namespace: "Mnt",
-								Operator:  "NotIn",
-								Values:    []string{"4026532099"},
-							},
-						},
-						MatchNamespaceChanges: []v1alpha1.NamespaceChangesSelector{
-							{
-								Operator: "In",
-								Values:   []string{"Mnt", "Pid", "User", "Uts"},
-							},
-						},
-						MatchCapabilities: []v1alpha1.CapabilitiesSelector{
-							{
-								Type:                  "Effective",
-								Operator:              "In",
-								IsNamespaceCapability: true,
-								Values:                []string{"CAP_CHOWN", "CAP_NET_RAW"},
-							},
-							{
-								Type:                  "Inheritable",
-								Operator:              "NotIn",
-								IsNamespaceCapability: false,
-								Values:                []string{"CAP_SETPCAP", "CAP_SYS_ADMIN"},
-							},
-						},
-						MatchCapabilityChanges: []v1alpha1.CapabilitiesSelector{
-							{
-								Type:                  "Effective",
-								Operator:              "In",
-								IsNamespaceCapability: true,
-								Values:                []string{"CAP_SYS_ADMIN", "CAP_NET_RAW"},
-							},
-						},
-					},
-				},
-			},
-		},
-	},
-}
-
-var data = `
-apiVersion: cilium.io/v1alpha1
-kind: TracingPolicy
-metadata:
-  name: "sys-write"
-spec:
-  kprobes:
-  - call: "example_func"
-    return: true
-    syscall: true
-    args:
-    - index: 0
-      type: "int"
-    - index: 1
-      type: "int"
-    - index: 2
-      type: "int"
-    - index: 3
-      type: "string"
-    - index: 4
-      type: "skb"
-  - call: "another_func"
-    return: false
-    syscall: false
-    args:
-    - index: 0
-      type: "string"
-    - index: 1
-      type: "string"
-    - index: 2
-      type: "string"
-    - index: 3
-      type: "string"
-    selectors:
-      - matchPIDs:
-        - operator: In
-          followForks: true
-          isNamespacePID: false
-          values:
-            - 1
-            - 2
-        matchArgs:
-        - index: 0
-          operator: "Equal"
-          values:
-            - "1"
-        - index: 1
-          operator: "NotEqual"
-          values:
-            - "world"
-        matchNamespaces:
-        - namespace: Pid
-          operator: In
-          values:
-          - 4026532024
-        matchNamespaceChanges:
-        - operator: In
-          values:
-          - "Mnt"
-          - "Pid"
-          - "Net"
-        matchCapabilities:
-        - type: Effective
-          operator: In
-          isNamespaceCapability: true
-          values:
-            - "CAP_SYS_ADMIN"
-        matchCapabilityChanges:
-        - type: Effective
-          operator: In
-          isNamespaceCapability: true
-          values:
-            - "CAP_SYS_ADMIN"
-`
-
-var expectedData = GenericTracingPolicy{
-	TypeMeta: v1.TypeMeta{
-		APIVersion: "cilium.io/v1alpha1",
-		Kind:       "TracingPolicy",
-	},
-	Metadata: v1.ObjectMeta{Name: "sys-write"},
-	Spec: v1alpha1.TracingPolicySpec{
-		KProbes: []v1alpha1.KProbeSpec{
-			{
-				Call:    "example_func",
-				Return:  true,
-				Syscall: true,
-				Args: []v1alpha1.KProbeArg{
-					{
-						Index: 0,
-						Type:  "int",
-					},
-					{
-						Index: 1,
-						Type:  "int",
-					},
-					{
-						Index: 2,
-						Type:  "int",
-					},
-					{
-						Index: 3,
-						Type:  "string",
-					},
-					{
-						Index: 4,
-						Type:  "skb",
-					},
-				},
-			},
-			{
-				Call:    "another_func",
-				Return:  false,
-				Syscall: false,
-				Args: []v1alpha1.KProbeArg{
-					{
-						Index: 0,
-						Type:  "string",
-					},
-					{
-						Index: 1,
-						Type:  "string",
-					},
-					{
-						Index: 2,
-						Type:  "string",
-					},
-					{
-						Index: 3,
-						Type:  "string",
-					},
-				},
-				Selectors: []v1alpha1.KProbeSelector{
-					{
-						MatchPIDs: []v1alpha1.PIDSelector{
-							{
-								Operator:       "In",
-								Values:         []uint32{1, 2},
-								FollowForks:    true,
-								IsNamespacePID: false,
-							},
-						},
-						MatchArgs: []v1alpha1.ArgSelector{
-							{
-								Index:    0,
-								Operator: "Equal",
-								Values:   []string{"1"},
-							},
-							{
-								Index:    1,
-								Operator: "NotEqual",
-								Values:   []string{"world"},
-							},
-						},
-						MatchNamespaces: []v1alpha1.NamespaceSelector{
-							{
-								Namespace: "Pid",
-								Operator:  "In",
-								Values:    []string{"4026532024"},
-							},
-						},
-						MatchNamespaceChanges: []v1alpha1.NamespaceChangesSelector{
-							{
-								Operator: "In",
-								Values:   []string{"Mnt", "Pid", "Net"},
-							},
-						},
-						MatchCapabilities: []v1alpha1.CapabilitiesSelector{
-							{
-								Type:                  "Effective",
-								Operator:              "In",
-								IsNamespaceCapability: true,
-								Values:                []string{"CAP_SYS_ADMIN"},
-							},
-						},
-						MatchCapabilityChanges: []v1alpha1.CapabilitiesSelector{
-							{
-								Type:                  "Effective",
-								Operator:              "In",
-								IsNamespaceCapability: true,
-								Values:                []string{"CAP_SYS_ADMIN"},
-							},
-						},
-					},
-				},
-			},
-		},
-	},
-}
-
-func TestYamlWritev(t *testing.T) {
-	pol, err := FromYAML(writev)
-	if err != nil {
-		t.Errorf("YamlWritev error %s", err)
-	}
-	k := pol.(*GenericTracingPolicy)
-	if reflect.DeepEqual(*k, expectedWrite) != true {
-		t.Errorf("not equal\nk=%#v\ne= %#v\n", k, expectedWrite)
-	}
-}
-
-func TestYamlData(t *testing.T) {
-	pol, err := FromYAML(data)
-	if err != nil {
-		t.Errorf("YamlData error %s", err)
-	}
-	k := pol.(*GenericTracingPolicy)
-	if reflect.DeepEqual(*k, expectedData) != true {
-		t.Errorf("not equal\nk=%#v\ne=%#v\n", *k, expectedData)
-	}
-}
 
 //go:embed examples/tracepoint-lseek-pid.yaml
 var lseekExample string
 
 func TestYamlLseek(t *testing.T) {
-
+	build.SkipIfK8sDisabled(t)
 	expected := GenericTracingPolicy{
-		TypeMeta: v1.TypeMeta{
-			APIVersion: "cilium.io/v1alpha1",
-			Kind:       "TracingPolicy",
-		},
-		Metadata: v1.ObjectMeta{Name: "tracepoint-lseek"},
+		APIVersion: "cilium.io/v1alpha1",
+		Kind:       "TracingPolicy",
+		Metadata:   ObjectMeta{Name: "tracepoint-lseek"},
 		Spec: v1alpha1.TracingPolicySpec{
 			Tracepoints: []v1alpha1.TracepointSpec{{
 				Subsystem: "syscalls",
@@ -444,70 +62,9 @@ func TestYamlLseek(t *testing.T) {
 		t.Errorf("ReadConfigYaml failed: %s", err)
 	}
 
-	if reflect.DeepEqual(expected, *k) != true {
-		t.Errorf("\ngot:\n%+v\nexpected:\n%+v", *k, expected)
+	if diff := cmp.Diff(expected, *k); diff != "" {
+		t.Errorf("mismatch (-expected, +got): %s", diff)
 	}
-}
-
-// Read a config file and sub in templated values
-func fileConfigWithTemplate(fileName string, data interface{}) (*GenericTracingPolicy, error) {
-	templ, err := template.ParseFiles(fileName)
-	if err != nil {
-		return nil, err
-	}
-
-	var buf bytes.Buffer
-	templ.Execute(&buf, data)
-
-	pol, err := FromYAML(buf.String())
-	if err != nil {
-		return nil, fmt.Errorf("FromYaml error %s", err)
-	}
-	return pol.(*GenericTracingPolicy), nil
-}
-
-func TestExamplesSmoke(t *testing.T) {
-	_, filename, _, _ := runtime.Caller(0)
-	examplesDir := filepath.Join(filepath.Dir(filename), "../../examples/tracingpolicy")
-	err := filepath.Walk(examplesDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip non-directories
-		if info.IsDir() {
-			return nil
-		}
-
-		// Skip non-yaml files with a warning
-		if !strings.HasSuffix(info.Name(), "yaml") || strings.HasSuffix(info.Name(), "yml") {
-			logger.GetLogger().WithField("path", path).Warn("skipping non-yaml file")
-			return nil
-		}
-
-		// Fill this in with template data as needed
-		data := map[string]string{
-			"Pid": fmt.Sprint(os.Getpid()),
-		}
-
-		// Attempt to parse the file
-		_, err = fileConfigWithTemplate(path, data)
-		assert.NoError(t, err, "example %s must parse correctly: %s", info.Name(), err)
-
-		return nil
-	})
-
-	assert.NoError(t, err, "failed to walk examples directory")
-}
-
-const invalidNameYaml = `apiVersion: cilium.io/v1alpha1
-kind: TracingPolicy
-metadata:
-  name: "invalid_name"`
-
-func TestReadConfigYamlInvalidName(t *testing.T) {
-	_, err := FromYAML(invalidNameYaml)
-	assert.Error(t, err)
 }
 
 const tpNamespaced = `
@@ -523,75 +80,113 @@ spec:
 `
 
 func TestYamlNamespaced(t *testing.T) {
+	build.SkipIfK8sDisabled(t)
 	tp, err := FromYAML(tpNamespaced)
 	require.NoError(t, err)
-	_, ok := tp.(TracingPolicyNamespaced)
-	require.True(t, ok)
+	require.Equal(t, "default", tp.TpNamespace())
 }
-
-func createTempFile(t *testing.T, data string) string {
-	file, err := os.CreateTemp(t.TempDir(), "tetragon-")
-	if err != nil {
-		t.Fatalf("cannot create temp. file: %v", err)
-	}
-
-	_, err = file.WriteString(data)
-	if err != nil {
-		t.Fatalf("cannot write to temp. file: %v", err)
-	}
-	err = file.Close()
-	if err != nil {
-		t.Fatalf("cannot close temp. file: %v", err)
-	}
-
-	return file.Name()
-}
-
-const failedLoadingTpFile = "failed loading tracing policy file"
 
 func TestEmptyTracingPolicy(t *testing.T) {
-	path := createTempFile(t, "")
+	path := tempfile.CreateTempFile(t, "")
 	_, err := FromFile(path)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), failedLoadingTpFile, "unexpected error")
-	assert.Contains(t, errors.Unwrap(err).Error(), "could not find validator for: /", "unexpected wrapped error")
+	require.Error(t, err)
 }
 
-func TestInvalidYAMLInTracingPolicy(t *testing.T) {
-	path := createTempFile(t, "<not-quite-yaml>")
-	_, err := FromFile(path)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), failedLoadingTpFile, "unexpected error")
-	assert.Contains(t, errors.Unwrap(err).Error(), "failed to unmarshall policy", "unexpected wrapped error")
-}
-
-const tpWithoutMetadata = `
-apiVersion: cilium.io/v1alpha1
-kind: TracingPolicy
-metadata: {}
-`
-
-func TestTracingPolicyWithoutMetadata(t *testing.T) {
-	path := createTempFile(t, tpWithoutMetadata)
-	_, err := FromFile(path)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), failedLoadingTpFile, "unexpected error")
-	assert.Contains(t, errors.Unwrap(err).Error(), "validation failure list:\nmetadata.name", "unexpected wrapped error")
-}
-
-const tpNotCoveredBySpec = `
+func TestWrongCaseTracingPolicy(t *testing.T) {
+	_, err := FromYAML(`
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: not-covered-by-spec
+  name: "tracepoint-test"
 spec:
-  some_field: some_value
+  Tracepoints: # wrong case
+  - subsystem: "syscalls"
+    event: "sys_enter_lseek"
+`)
+	require.Error(t, err)
+}
+
+const tpNodeSelector = `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "tracepoint-lseek"
+spec:
+  nodeSelector:
+    matchLabels:
+      node-role: gpu
+    matchExpressions:
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+          - amd64
+  tracepoints:
+  - subsystem: "syscalls"
+    event: "sys_enter_lseek"
 `
 
-func TestTracingPolicyNotCoveredBySpec(t *testing.T) {
-	path := createTempFile(t, tpNotCoveredBySpec)
-	_, err := FromFile(path)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), failedLoadingTpFile, "unexpected error")
-	assert.Contains(t, errors.Unwrap(err).Error(), "unknown field \"some_field\"", "unexpected wrapped error")
+func TestYamlNodeSelector(t *testing.T) {
+	build.SkipIfK8sDisabled(t)
+	tp, err := FromYAML(tpNodeSelector)
+	require.NoError(t, err)
+	sel := tp.TpSpec().NodeSelector
+	require.NotNil(t, sel, "nodeSelector should be parsed")
+	require.Equal(t, "gpu", sel.MatchLabels["node-role"])
+	require.Len(t, sel.MatchExpressions, 1)
+	require.Equal(t, "kubernetes.io/arch", sel.MatchExpressions[0].Key)
+}
+
+const tpLabels = `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "tracepoint-lseek"
+  labels:
+    best-food: pizza
+spec:
+  tracepoints:
+  - subsystem: "syscalls"
+    event: "sys_enter_lseek"
+`
+
+func TestYamlLabels(t *testing.T) {
+	tp, err := FromYAML(tpLabels)
+	require.NoError(t, err)
+	gtp, ok := tp.(*GenericTracingPolicy)
+	require.True(t, ok, "FromYAML should return a GenericTracingPolicy")
+	val, ok := gtp.Metadata.Labels["best-food"]
+	require.True(t, ok, "key should exist in labels")
+	require.Equal(t, "pizza", val, "best food should be pizza")
+}
+
+func TestUnknownFieldTracingPolicy(t *testing.T) {
+	for name, policy := range map[string]string{
+		"top level": `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "tracepoint-test"
+unknown: true
+spec:
+  tracepoints:
+  - subsystem: "syscalls"
+    event: "sys_enter_lseek"
+`,
+		"metadata": `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "tracepoint-test"
+  unknown: true
+spec:
+  tracepoints:
+  - subsystem: "syscalls"
+    event: "sys_enter_lseek"
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := FromYAML(policy)
+			require.Error(t, err)
+		})
+	}
 }

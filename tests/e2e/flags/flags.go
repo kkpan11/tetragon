@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package flags
 
 import (
@@ -24,9 +26,8 @@ var Opts = Flags{
 			"tetragon.exportAllowList": "",
 		},
 	},
-	KeepExportData: false,
-	InstallCilium:  true,
-	CiliumVersion:  "v1.15.1",
+	KeepExportData:    false,
+	UninstallTetragon: true,
 }
 
 func init() {
@@ -74,30 +75,31 @@ func init() {
 		Opts.KeepExportData,
 		"Should we keep export files regardless of pass/fail?")
 
-	flag.BoolVar(&Opts.InstallCilium,
-		"tetragon.install-cilium",
-		Opts.InstallCilium,
-		"Should we install Cilium in the test?")
-
 	flag.StringVar(&Opts.Helm.BTF,
 		"tetragon.btf",
 		Opts.Helm.BTF,
 		"A BTF file on the host that should be loaded into the KinD cluster. Will override helm BTF settings. Only makes sense when testing on a KinD cluster.")
 
-	flag.StringVar(&Opts.CiliumVersion,
-		"tetragon.cilium-version",
-		Opts.CiliumVersion,
-		"Version of Cilium to install. Only makes sense if tetragon.install-cilium is true.")
+	flag.BoolVar(&Opts.UninstallTetragon,
+		"tetragon.uninstall-tetragon",
+		Opts.UninstallTetragon,
+		"Uninstall Tetragon after the test run.")
+
+	flag.BoolVar(&Opts.Minikube,
+		"minikube",
+		Opts.Minikube,
+		"Load images into Kubernetes via 'minikube image load' instead of the KinD loader")
 }
 
 type Flags struct {
 	Helm HelmOptions
 	// Should we keep the export file for the tests regardless of pass/fail?
 	KeepExportData bool
-	// Should we install Cilium in the test?
-	InstallCilium bool
-	// Version of Cilium to use
-	CiliumVersion string
+	// UninstallTetragon specifies whether Tetragon should be uninstalled after the test run.
+	UninstallTetragon bool
+	// Minikube, when set, instructs the test framework to load images into Kubernetes
+	// via `minikube image load` instead of the KinD cluster loader.
+	Minikube bool
 }
 
 type HelmOptions struct {
@@ -126,7 +128,7 @@ type HelmValues map[string]string
 func (h *HelmValues) String() string {
 	var vals strings.Builder
 	for k, v := range *h {
-		vals.WriteString(fmt.Sprintf("%s=\"%s\", ", k, v))
+		fmt.Fprintf(&vals, "%s=\"%s\", ", k, v)
 	}
 	return fmt.Sprintf("HelmOptions(%s)", strings.TrimSuffix(vals.String(), ", "))
 }

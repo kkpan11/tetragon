@@ -8,15 +8,15 @@
   // config, for example the regex. See:
   // https://docs.renovatebot.com/self-hosted-configuration/#requireconfig
   "requireConfig": "ignored",
-  "allowedPostUpgradeCommands": [
-    "^/tmp/install-buildx$", 
-    "^make codegen$", 
-    "^make generate$", 
+  "allowShellExecutorForPostUpgradeCommands": true,
+  "allowedCommands": [
+    "^/tmp/install-buildx$",
+    "^make protogen$",
+    "^make crds$",
     "^make vendor$",
     "^make -C install/kubernetes$",
     "^go mod vendor$",
-    "^install-tool golang \\$\\(grep -oP '\\^go \\\\K\\.\\+' go\\.mod\\)$",
-    "^install-tool golang \\$\\(grep -oP '\\^toolchain go\\\\K\\.\\+' go\\.mod\\)$"
+    "^make gen-docs-references$",
   ],
   // repository configuration
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
@@ -25,10 +25,12 @@
     ":gitSignOff",
     "helpers:pinGitHubActionDigests"
   ],
+  "ignorePresets": [":ignoreModulesAndTests"],
   "gitAuthor": "cilium-renovate[bot] <134692979+cilium-renovate[bot]@users.noreply.github.com>",
   "includePaths": [
     ".github/renovate.json5",
     ".github/workflows/**",
+    ".github/actions/**",
     "go.mod",
     "go.sum",
     "api/go.mod",
@@ -37,11 +39,18 @@
     "pkg/k8s/go.sum",
     "contrib/tetragon-rthooks/go.mod",
     "contrib/tetragon-rthooks/go.sum",
+    "tools/go.mod",
+    "tools/go.sum",
     "*Dockerfile*",
     "docs/hugo.toml",
-    "install/kubernetes/tetragon/values.yaml",
+    "install/kubernetes/*/Chart.yaml",
+    "install/kubernetes/*/Chart.lock",
+    "install/kubernetes/*/values.yaml",
     "**/*Makefile*",
     "contrib/update-helm-chart.sh",
+    "cmd/tetragon-metrics-docs/metricsmd/metricsmd.go",
+    "tests/e2e/helpers/cluster.go",
+    "tests/e2e/flags/flags.go",
   ],
   "postUpdateOptions": [
     "gomodTidy"
@@ -52,10 +61,11 @@
   "separateMultipleMajor": true,
   "separateMinorPatch": true,
   "pruneStaleBranches": true,
-  "baseBranches": [
+  "baseBranchPatterns": [
     "main",
-    "v1.0",
-    "v1.1",
+    "v1.5",
+    "v1.6",
+    "v1.7",
   ],
   "vulnerabilityAlerts": {
     "enabled": true
@@ -78,31 +88,11 @@
   //   important rules override settings from earlier rules if needed.
   "packageRules": [
     {
-      "matchPackageNames": [
-        "go", // golang version directive upgrade in go.mod
-      ],
-      "matchPackagePrefixes": [
-        "docker.io/library/", // official Docker images
-        "github.com/golang/", // Golang official org
-        "golang.org/x/", // Golang official experimental org
-        "google.golang.org/", // Google official repo for api/genproto/grpc/protobuf
-        "github.com/google/", // Google official github org
-        "k8s.io/", // Kubernetes official repo
-        "sigs.k8s.io/", // Kubernetes official SIG repo
-        "quay.io/lvh-images/kernel-images", // LVH images
-      ],
-      "matchUpdateTypes": [
-        "patch",
-        "pin",
-        "pinDigest"
-      ],
-      "automerge": true
-    },
-    {
       "groupName": "all github action dependencies",
       "groupSlug": "all-github-action",
       "matchFileNames": [
-        ".github/workflows/**"
+        ".github/workflows/**",
+        ".github/actions/**"
       ],
       "matchManagers": [
         "github-actions"
@@ -121,7 +111,8 @@
     },
     {
       "matchFileNames": [
-        ".github/workflows/**"
+        ".github/workflows/**",
+        ".github/actions/**"
       ],
       "matchManagers": [
         "github-actions"
@@ -136,13 +127,11 @@
         "go.sum"
       ],
       "matchUpdateTypes": [
+        "minor",
         "patch",
         "digest",
         "pin",
         "pinDigest"
-      ],
-      "matchBaseBranches": [
-        "main"
       ],
     },
     {
@@ -161,9 +150,6 @@
         "pin",
         "pinDigest"
       ],
-      "matchBaseBranches": [
-        "main"
-      ],
     },
     {
       "groupName": "all k8s pkg go dependencies main",
@@ -173,13 +159,11 @@
         "pkg/k8s/go.sum"
       ],
       "matchUpdateTypes": [
+        "minor",
         "patch",
         "digest",
         "pin",
         "pinDigest"
-      ],
-      "matchBaseBranches": [
-        "main"
       ],
     },
     {
@@ -187,16 +171,29 @@
       "groupSlug": "all-rthook-go-deps-main",
       "matchFileNames": [
         "contrib/tetragon-rthooks/go.mod",
-        "contrib/tetragon-rthooks/go.mod",
+        "contrib/tetragon-rthooks/go.sum",
       ],
       "matchUpdateTypes": [
+        "minor",
         "patch",
         "digest",
         "pin",
         "pinDigest"
       ],
-      "matchBaseBranches": [
-        "main"
+    },
+    {
+      "groupName": "all tools go dependencies main",
+      "groupSlug": "all-tools-go-deps-main",
+      "matchFileNames": [
+        "tools/go.mod",
+        "tools/go.sum",
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
       ],
     },
     {
@@ -204,10 +201,11 @@
       "matchManagers": ["gomod"],
       "postUpdateOptions": [
         // update source import paths on major updates
+        "gomodVendor",
         "gomodUpdateImportPaths",
       ],
-      postUpgradeTasks: {
-        "commands": ["/tmp/install-buildx", "make codegen", "make generate"],
+      "postUpgradeTasks": {
+        "commands": ["/tmp/install-buildx", "make vendor", "make protogen", "make crds", "make gen-docs-references"],
         "fileFilters": ["**/**"],
         "executionMode": "branch"
       }
@@ -234,9 +232,12 @@
         // We need to trigger a golang install manually here because in some
         // cases it might not be preinstalled, see:
         // https://github.com/renovatebot/renovate/discussions/23485
-        "commands": ["install-tool golang $(grep -oP '^toolchain go\\K.+' go.mod)", "make vendor"],
+        "commands": ["make vendor", "make gen-docs-references"],
         "fileFilters": ["**/**"],
-        "executionMode": "branch"
+        "executionMode": "branch",
+        "installTools": {
+          "golang": {}
+        }
       },
     },
     {
@@ -246,17 +247,21 @@
         "docker.io/library/golang"
       ],
       "matchBaseBranches": [
-        "v1.0",
-        "v1.1",
+        "v1.5",
+        "v1.6",
+        "v1.7",
       ],
       // postUpgradeTasks is only for when the Go module directives are bumped
       "postUpgradeTasks": {
         // We need to trigger a golang install manually here because in some
         // cases it might not be preinstalled, see:
         // https://github.com/renovatebot/renovate/discussions/23485
-        "commands": ["install-tool golang $(grep -oP '^go \\K.+' go.mod)", "make vendor"],
+        "commands": ["make vendor", "make gen-docs-references"],
         "fileFilters": ["**/**"],
-        "executionMode": "branch"
+        "executionMode": "branch",
+        "installTools": {
+          "golang": {}
+        }
       },
     },
     {
@@ -265,7 +270,8 @@
       // GHA files and other usages. This needs to be after the GHA grouping.
       "groupName": "golangci-lint",
       "matchDepNames": [
-        "golangci/golangci-lint"
+        "golangci/golangci-lint",
+        "docker.io/golangci/golangci-lint"
       ]
     },
     {
@@ -273,8 +279,9 @@
       "matchFileNames": [
         "install/kubernetes/tetragon/values.yaml",
         "install/kubernetes/Makefile",
+        "install/kubernetes/tetragon/Chart.yaml"
       ],
-      // lint and generate files for helm chart
+      // Generate files for the Helm chart
       "postUpgradeTasks": {
         "commands": ["make -C install/kubernetes"],
         "fileFilters": ["**/**"],
@@ -288,10 +295,10 @@
       ],
       // LVH uses custom versioning for its images, need to match those kinds of tags:
       // - bpf-next-20230914.012459
-      // - rhel8-20240304.134252
+      // - rhel8.10-20260206.193128
       // - 5.15-20230912.232842
       // - 5.19-20230912.232842@sha256:24abe3fbb8e829fa41a68a3b76cb4df84fd5a87a7d1d6254c1c1fe5effb5bd1b
-      "versioning": "regex:^((?<compatibility>[a-z0-9-]+)|((?<major>\\d+)\\.(?<minor>\\d+)))\\-(?<patch>\\d+)\\.(?<build>\\d+)(@(?<currentDigest>sha256:[a-f0-9]+))?$"
+      "versioning": "regex:^((?<compatibility>[a-z0-9.-]+)|((?<major>\\d+)\\.(?<minor>\\d+)))\\-(?<patch>\\d+)\\.(?<build>\\d+)(@(?<currentDigest>sha256:[a-f0-9]+))?$"
     },
     {
       "groupName": "all lvh-images main",
@@ -307,14 +314,20 @@
         "pinDigest"
       ],
     },
+    {
+      // limit Renovate's own container image updates to once a month.
+      "matchPackageNames": ["ghcr.io/renovatebot/renovate"],
+      "schedule": ["* * 1-7 * *"]
+    },
     // stable branches section
     {
       // no updates into stable branches (apart from security ones)
       "enabled": false,
-      "matchPackagePatterns": ["*"],
+      "matchPackageNames": ["*"],
       "matchBaseBranches": [
-        "v1.0",
-        "v1.1",
+        "v1.5",
+        "v1.6",
+        "v1.7",
       ]
     },
     {
@@ -322,33 +335,40 @@
       "enabled": true,
       "matchPackageNames": ["docker.io/library/alpine"],
       "matchBaseBranches": [
-        "v1.0",
-        "v1.1",
+        "v1.5",
+        "v1.6",
+        "v1.7",
       ]
     },
     {
-      // update go patch for 1.21 for stable branches
+      // update go patch for 1.26 for stable branches
       "enabled": true,
       "matchPackageNames": [
         "go",
         "docker.io/library/golang"
       ],
-      "allowedVersions": "/^1\\.21\\.[0-9]+-?(alpine)?$/",
+      "allowedVersions": "/^1\\.26\\.[0-9]+-?(alpine)?$/",
       "matchBaseBranches": [
-        "v1.0",
+        "v1.5",
+        "v1.6",
+        "v1.7",
       ]
     },
     {
-      // update go patch for 1.22 for stable branches
+      // update lvh-images for stable branches, once a month is enough as we
+      // rarely cut patch releases.
       "enabled": true,
       "matchPackageNames": [
-        "go",
-        "docker.io/library/golang"
+        "quay.io/lvh-images/kernel-images",
+        "quay.io/lvh-images/kind"
       ],
-      "allowedVersions": "/^1\\.22\\.[0-9]+-?(alpine)?$/",
       "matchBaseBranches": [
-        "v1.1",
-      ]
+        "v1.5",
+        "v1.6",
+        "v1.7",
+      ],
+      // Any day in the first week of the month.
+      "schedule": ["* * 1-7 * *"]
     },
     // ignore deps section
     {
@@ -360,6 +380,7 @@
         "api/go.mod",
         "pkg/k8s/go.mod",
         "contrib/tetragon-rthooks/go.mod",
+        "tools/go.mod",
       ],
       "matchPackageNames": [
         "go"
@@ -391,6 +412,13 @@
       "enabled": false
     },
     {
+      // do not update digest versions for these go modules. We frequently need to pin a digest, but don't want to update again until the following release
+      "enabled": false,
+      "matchPackageNames": ["github.com/cilium/ebpf", "github.com/cilium/little-vm-helper"],
+      "matchManagers": ["gomod"],
+      "matchUpdateTypes": ["digest"],
+    },
+    {
       // do not update sigstore/cosign-installer as it breaks CI
       "matchPackageNames": ["sigstore/cosign-installer"],
       "matchManagers": ["github-actions"],
@@ -407,50 +435,77 @@
       "enabled": false
     },
     {
-      // do not update dependencies from the replace directive from cilium/cilium
-      // see go.mod second replace directive comments for more info
+      // These major updates are breaking the build and should be done manually
+      // if needed.
       "enabled": false,
       "matchPackageNames": [
-        // All of these packages are maintained on a Cilium fork. Thus, we don't
-        // want to update them automatically.
-        "go.universe.tf/metallb",
-        "github.com/cilium/metallb",
-        // metallb is still using an old version of "github.com/mdlayher/arp"
-        "github.com/mdlayher/arp",
-        "github.com/miekg/dns",
-        "github.com/cilium/dns",
-        "sigs.k8s.io/controller-tools",
-        "github.com/cilium/controller-tools",
-        "github.com/cilium/client-go",
-      ]
-    },
-    {
-      // not an ignore but almost, please automate this if you have the energy
-      // require manual steps for minor and major cilium/cilium updates
-      "matchPackageNames": [
-        "github.com/cilium/cilium",
+        "github.com/containerd/cgroups",
+        "github.com/pelletier/go-toml",
       ],
       "matchUpdateTypes": [
         "major",
-        "minor",
       ],
-      "draftPR": true,
-      "prBodyNotes": [
-        ":warning: Manual steps need to be performed (explaining why this PR is only a draft). First replace directives must be synchronized with cilium/cilium, see the `go.mod` and `pkg/k8s/go.mod` for more info. Then dependencies ignore in `.github/renovate.json5` for the replace directive must be updated accordingly. Finally, make sure that k8s dependencies were also bumped along Cilium."
-      ]
     },
     {
+      // Disable digest updates on Docker images except for the base image of
+      // our build that needs to have all deps updated
       "enabled": false,
-      "matchPackagePatterns": [
-        // k8s dependencies will be updated manually along cilium updates
-        "k8s\\.io/*",
-        "sigs\\.k8s\\.io/*"
+      "matchDatasources": ["docker"],
+      "matchUpdateTypes": ["digest"],
+      "matchPackageNames": ["!docker.io/library/alpine"],
+    },
+    {
+      // Disable automatic Windows GH runner upgrades
+      "matchDepTypes": ["github-runner"],
+      "matchPackageNames": ["windows"],
+      "enabled": false,
+    },
+    // automerge section
+    {
+      "matchPackageNames": [
+        "go", // golang version directive upgrade in go.mod
+      ],
+      "matchPackageNames": [
+        // Docker deps
+        "docker.io/library/**", // Official Docker images
+        "quay.io/cilium/**", // Cilium quay repo
+        "quay.io/lvh-images/kernel-images", // LVH images
+        "google/**", // Google gops docker image
+        "kindest/**", // kind docker images
+        // Golang deps
+        "github.com/golang/**", // Golang official org
+        "golang.org/x/**", // Golang official experimental org
+        "google.golang.org/**", // Google official repo for api/genproto/grpc/protobuf
+        "github.com/google/**", // Google official github org
+        "k8s.io/**", // Kubernetes official repo
+        "sigs.k8s.io/**", // Kubernetes official SIG repo
+        "github.com/cilium/**", // Cilium org
+        "github.com/prometheus/**", // Prometheus org
+        "github.com/hashicorp/**", // Hashicorp org
+        "go.uber.org/**", // Uber org
+        // Github Releases
+        "cilium/**", // Cilium CLI
+        "helm/**",
+        // Go
+        "go", // The Go package
       ],
       "matchUpdateTypes": [
-        "major",
         "minor",
-        "digest",
+        "patch",
+        "pin",
+        "pinDigest"
       ],
+      "automerge": true
+    },
+    {
+      // Group all yq updates into a single branch. Refresh once every 3 months
+      "groupName": "yq",
+      "groupSlug": "mikefarah-yq",
+      "matchDepNames": [
+        "mikefarah/yq",
+        "docker.io/mikefarah/yq",
+      ],
+      "schedule": ["* * 1 */3 *"],
     }
   ],
   // Those regexes manage version strings in variousfiles, similar to the
@@ -458,9 +513,10 @@
   "customManagers": [
     {
       "customType": "regex",
-      "fileMatch": [
-        "^\\.github/workflows/[^/]+\\.ya?ml$",
-        "^docs/hugo.toml$",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/",
+        "/^\\.github/actions/[^/]+/[^/]+\\.ya?ml$/",
+        "docs/hugo.toml",
       ],
       "matchStrings": [
         // this regex is used to match both:
@@ -476,9 +532,9 @@
     {
       "customType": "regex",
       // explicitely not writing ^Makefile$ to match files with Makefile.extension
-      "fileMatch": [
-        "Makefile",
-        "^contrib/update-helm-chart.sh$",
+      "managerFilePatterns": [
+        "**/Makefile*",
+        "contrib/update-helm-chart.sh",
       ],
       // This regex is for upgrading docker image full reference in Makefiles or scripts, for examples:
       //
@@ -494,8 +550,8 @@
     {
       "customType": "regex",
       // match all go.mod in all subfolders
-      "fileMatch": [
-        "go\\.mod$"
+      "managerFilePatterns": [
+        "**/**go.mod"
       ],
       "matchStrings": [
         "// renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)\\s+go (?<currentValue>.*)"
@@ -503,12 +559,47 @@
     },
     {
       "customType": "regex",
-      "fileMatch": [
-        "^Dockerfile$"
+      "managerFilePatterns": [
+        "Dockerfile"
       ],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)\\s+&& git clone --depth 1 --branch (?<currentValue>v\\d+\\.\\d+\\.\\d+)"
       ]
-    }
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "cmd/tetragon-metrics-docs/metricsmd/metricsmd.go"
+      ],
+      "matchStrings": [
+        "\\/\\/ renovate: datasource=(?<datasource>.*?)\\s+Values: \\[]string{\"(?<depName>go)(?<currentValue>.*?)\""
+      ]
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "tests/e2e/helpers/cluster.go"
+      ],
+      "matchStrings": [
+        "\\/\\/ renovate: datasource=(?<datasource>.*?)\\s+.*\"(?<depName>.*?):(?<currentValue>.*?)\""
+      ]
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "tests/e2e/flags/flags.go"
+      ],
+      "matchStrings": [
+        "\\/\\/ renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)\\s+CiliumVersion:\\s*\"(?<currentValue>.*?)\""
+      ]
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["(^|/)Chart\\.ya?ml$"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)\\s*\\nversion:\\s*(?<currentValue>.*)",
+        "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)\\s*\\nappVersion:\\s*(?<currentValue>.*)"
+      ]
+    },
   ]
 }

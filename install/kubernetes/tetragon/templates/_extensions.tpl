@@ -5,3 +5,13 @@
 {{- define "tetragon.volumemounts.extra" -}}{{- end }}
 
 {{- define "initcontainers.extra" -}}{{- end }}
+
+{{- define "containers.extra" -}}{{- end }}
+
+{{- define "clusterrole.extra" -}}{{- end }}
+
+{{- define "role.extra" -}}{{- end }}
+
+{{- define "operatorconfigmap.extra" -}}{{- end }}
+
+{{- define "operatorclusterrole.extra" -}}{{- end }}

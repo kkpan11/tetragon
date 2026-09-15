@@ -7,9 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cilium/tetragon/pkg/eventcheckertests/yamlhelpers"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/durationpb"
+
+	"github.com/cilium/tetragon/pkg/eventcheckertests/yamlhelpers"
 )
 
 func TestDurationMatcherFullSmoke(t *testing.T) {
@@ -26,12 +28,12 @@ func TestDurationMatcherFullSmoke(t *testing.T) {
 	// Exact match
 	toCheck := 2 * time.Second
 	err := checker.Match(durationpb.New(toCheck))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Bad match
 	toCheck = 2 * time.Minute
 	err = checker.Match(durationpb.New(toCheck))
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	// Make sure a flat duration is the same as a full matcher
 	yamlStr2 := `2s`
@@ -58,27 +60,27 @@ func TestDurationMatcherLessSmoke(t *testing.T) {
 	// Exact match
 	toCheck := 1*time.Minute + 30*time.Second
 	err := checker.Match(durationpb.New(toCheck))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// 1 second less
 	toCheck = 1*time.Minute + 29*time.Second
 	err = checker.Match(durationpb.New(toCheck))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// 1 minute less
 	toCheck = 30 * time.Second
 	err = checker.Match(durationpb.New(toCheck))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// 1 second over
 	toCheck = 1*time.Minute + 31*time.Second
 	err = checker.Match(durationpb.New(toCheck))
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	// 1 minute over
 	toCheck = 2*time.Minute + 30*time.Second
 	err = checker.Match(durationpb.New(toCheck))
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestDurationMatcherGreaterSmoke(t *testing.T) {
@@ -95,27 +97,27 @@ func TestDurationMatcherGreaterSmoke(t *testing.T) {
 	// Exact match
 	toCheck := 1*time.Minute + 30*time.Second
 	err := checker.Match(durationpb.New(toCheck))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// 1 second greater
 	toCheck = 1*time.Minute + 31*time.Second
 	err = checker.Match(durationpb.New(toCheck))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// 1 minute greater
 	toCheck = 2*time.Minute + 30*time.Second
 	err = checker.Match(durationpb.New(toCheck))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// 1 second under
 	toCheck = 1*time.Minute + 29*time.Second
 	err = checker.Match(durationpb.New(toCheck))
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	// 1 minute under
 	toCheck = 30 * time.Second
 	err = checker.Match(durationpb.New(toCheck))
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestDurationMatcherBetweenSmoke(t *testing.T) {
@@ -134,25 +136,25 @@ func TestDurationMatcherBetweenSmoke(t *testing.T) {
 	// Exact match on lower bound
 	toCheck := 1 * time.Minute
 	err := checker.Match(durationpb.New(toCheck))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Exact match on upper bound
 	toCheck = 2 * time.Minute
 	err = checker.Match(durationpb.New(toCheck))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// In between
 	toCheck = 1*time.Minute + 30*time.Second
 	err = checker.Match(durationpb.New(toCheck))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Under
 	toCheck = 59 * time.Second
 	err = checker.Match(durationpb.New(toCheck))
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	// Over
 	toCheck = 2*time.Minute + 1*time.Second
 	err = checker.Match(durationpb.New(toCheck))
-	assert.Error(t, err)
+	require.Error(t, err)
 }

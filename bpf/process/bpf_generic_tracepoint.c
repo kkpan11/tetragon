@@ -4,57 +4,48 @@
 #include "vmlinux.h"
 #include "api.h"
 
+#define GENERIC_TRACEPOINT
+
 #include "compiler.h"
 #include "bpf_event.h"
 #include "bpf_task.h"
 
-#define GENERIC_TRACEPOINT
-
 #include "retprobe_map.h"
 #include "types/operations.h"
 #include "types/basic.h"
-#include "generic_calls.h"
-#include "pfilter.h"
 #include "policy_filter.h"
+#include "syscall64.h"
+#include "errmetrics.h"
+
+int generic_tracepoint_process_event(void *ctx);
+int generic_tracepoint_filter(void *ctx);
+int generic_tracepoint_arg(void *ctx);
+int generic_tracepoint_arg_2(void *ctx);
+int generic_tracepoint_actions(void *ctx);
+int generic_tracepoint_output(void *ctx);
+int generic_tracepoint_process_event_2(void *ctx);
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
 	__uint(max_entries, 13);
-	__uint(key_size, sizeof(__u32));
-	__uint(value_size, sizeof(__u32));
-} tp_calls SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
 	__type(key, __u32);
-	__type(value, struct msg_generic_kprobe);
-} tp_heap SEC(".maps");
-
-struct filter_map_value {
-	unsigned char buf[FILTER_SIZE];
+	__array(values, int(void *));
+} tp_calls SEC(".maps") = {
+	.values = {
+		[TAIL_CALL_PROCESS] = (void *)&generic_tracepoint_process_event,
+		[TAIL_CALL_FILTER] = (void *)&generic_tracepoint_filter,
+		[TAIL_CALL_ARGS] = (void *)&generic_tracepoint_arg,
+		[TAIL_CALL_ACTIONS] = (void *)&generic_tracepoint_actions,
+		[TAIL_CALL_SEND] = (void *)&generic_tracepoint_output,
+#ifndef __LARGE_BPF_PROG
+		[TAIL_CALL_PROCESS_2] = (void *)&generic_tracepoint_process_event_2,
+		[TAIL_CALL_ARGS_2] = (void *)&generic_tracepoint_arg_2,
+#endif
+	},
 };
 
-/* Arrays of size 1 will be rewritten to direct loads in verifier */
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, int);
-	__type(value, struct filter_map_value);
-} filter_map SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct event_config);
-} config_map SEC(".maps");
-
-static struct generic_maps maps = {
-	.heap = (struct bpf_map_def *)&tp_heap,
-	.calls = (struct bpf_map_def *)&tp_calls,
-	.filter = (struct bpf_map_def *)&filter_map,
-};
+#include "generic_maps.h"
+#include "generic_calls.h"
 
 struct generic_tracepoint_event_arg {
 	/* common header */
@@ -75,22 +66,25 @@ FUNC_INLINE unsigned long get_ctx_ul(void *src, int type)
 	case u64_ty: {
 		u64 ret;
 
-		probe_read(&ret, sizeof(u64), src);
+		with_errmetrics(probe_read, &ret, sizeof(u64), src);
+		if (type == syscall64_type)
+			ret = syscall64_set_32bit(ret);
 		return ret;
 	}
 
 	case size_type: {
 		size_t ret;
 
-		probe_read(&ret, sizeof(size_t), src);
+		with_errmetrics(probe_read, &ret, sizeof(size_t), src);
 		return (unsigned long)ret;
 	}
 
 	case nop_s32_ty:
+	case int_type:
 	case s32_ty: {
 		s32 ret;
 
-		probe_read(&ret, sizeof(u32), src);
+		with_errmetrics(probe_read, &ret, sizeof(u32), src);
 		return ret;
 	}
 
@@ -98,21 +92,49 @@ FUNC_INLINE unsigned long get_ctx_ul(void *src, int type)
 	case u32_ty: {
 		u32 ret;
 
-		probe_read(&ret, sizeof(u32), src);
+		with_errmetrics(probe_read, &ret, sizeof(u32), src);
+		return ret;
+	}
+
+	case u16_ty: {
+		u16 ret;
+
+		with_errmetrics(probe_read, &ret, sizeof(u16), src);
+		return ret;
+	}
+
+	case s16_ty: {
+		s16 ret;
+
+		with_errmetrics(probe_read, &ret, sizeof(s16), src);
+		return ret;
+	}
+
+	case u8_ty: {
+		u8 ret;
+
+		with_errmetrics(probe_read, &ret, sizeof(u8), src);
+		return ret;
+	}
+
+	case s8_ty: {
+		s8 ret;
+
+		with_errmetrics(probe_read, &ret, sizeof(s8), src);
 		return ret;
 	}
 
 	case char_buf:
 	case string_type: {
 		char *buff;
-		probe_read(&buff, sizeof(char *), src);
+		with_errmetrics(probe_read, &buff, sizeof(char *), src);
 		return (unsigned long)buff;
 	}
 
 	case data_loc_type: {
 		u32 ret;
 
-		probe_read(&ret, sizeof(ret), src);
+		with_errmetrics(probe_read, &ret, sizeof(ret), src);
 		return ret;
 	}
 
@@ -123,15 +145,29 @@ FUNC_INLINE unsigned long get_ctx_ul(void *src, int type)
 	case skb_type: {
 		struct sk_buff *skb;
 
-		probe_read(&skb, sizeof(struct sk_buff *), src);
+		with_errmetrics(probe_read, &skb, sizeof(struct sk_buff *), src);
 		return (unsigned long)skb;
 	}
 
 	case sock_type: {
 		struct sock *sk;
 
-		probe_read(&sk, sizeof(struct sock *), src);
+		with_errmetrics(probe_read, &sk, sizeof(struct sock *), src);
 		return (unsigned long)sk;
+	}
+
+	case sockaddr_type: {
+		struct sockaddr *address;
+
+		with_errmetrics(probe_read, &address, sizeof(struct sockaddr *), src);
+		return (unsigned long)address;
+	}
+
+	case socket_type: {
+		struct socket *sock;
+
+		with_errmetrics(probe_read, &sock, sizeof(struct socket *), src);
+		return (unsigned long)sock;
 	}
 
 	default:
@@ -148,7 +184,7 @@ generic_tracepoint_event(struct generic_tracepoint_event_arg *ctx)
 	struct event_config *config;
 	int zero = 0, i;
 
-	msg = map_lookup_elem(&tp_heap, &zero);
+	msg = map_lookup_elem(&process_call_heap, &zero);
 	if (!msg)
 		return 0;
 
@@ -166,46 +202,46 @@ generic_tracepoint_event(struct generic_tracepoint_event_arg *ctx)
 	msg->retprobe_id = 0;
 
 	msg->a0 = ({
-		unsigned long ctx_off = config->t_arg0_ctx_off;
-		int ty = config->arg0;
-		asm volatile("%[ctx_off] &= 0xffff;\n" ::[ctx_off] "+r"(ctx_off)
-			     :);
+		unsigned long ctx_off = config->off[0];
+		int ty = config->arg[0];
+		asm volatile("%[ctx_off] &= 0xffff;\n"
+			     : [ctx_off] "+r"(ctx_off));
 		get_ctx_ul((char *)ctx + ctx_off, ty);
 	});
 
 	msg->a1 = ({
-		unsigned long ctx_off = config->t_arg1_ctx_off;
-		int ty = config->arg1;
-		asm volatile("%[ctx_off] &= 0xffff;\n" ::[ctx_off] "+r"(ctx_off)
-			     :);
+		unsigned long ctx_off = config->off[1];
+		int ty = config->arg[1];
+		asm volatile("%[ctx_off] &= 0xffff;\n"
+			     : [ctx_off] "+r"(ctx_off));
 		get_ctx_ul((char *)ctx + ctx_off, ty);
 	});
 
 	msg->a2 = ({
-		unsigned long ctx_off = config->t_arg2_ctx_off;
-		int ty = config->arg2;
-		asm volatile("%[ctx_off] &= 0xffff;\n" ::[ctx_off] "+r"(ctx_off)
-			     :);
+		unsigned long ctx_off = config->off[2];
+		int ty = config->arg[2];
+		asm volatile("%[ctx_off] &= 0xffff;\n"
+			     : [ctx_off] "+r"(ctx_off));
 		get_ctx_ul((char *)ctx + ctx_off, ty);
 	});
 
 	msg->a3 = ({
-		unsigned long ctx_off = config->t_arg3_ctx_off;
-		int ty = config->arg3;
-		asm volatile("%[ctx_off] &= 0xffff;\n" ::[ctx_off] "+r"(ctx_off)
-			     :);
+		unsigned long ctx_off = config->off[3];
+		int ty = config->arg[3];
+		asm volatile("%[ctx_off] &= 0xffff;\n"
+			     : [ctx_off] "+r"(ctx_off));
 		get_ctx_ul((char *)ctx + ctx_off, ty);
 	});
 
 	msg->a4 = ({
-		unsigned long ctx_off = config->t_arg4_ctx_off;
-		int ty = config->arg4;
-		asm volatile("%[ctx_off] &= 0xffff;\n" ::[ctx_off] "+r"(ctx_off)
-			     :);
+		unsigned long ctx_off = config->off[4];
+		int ty = config->arg[4];
+		asm volatile("%[ctx_off] &= 0xffff;\n"
+			     : [ctx_off] "+r"(ctx_off));
 		get_ctx_ul((char *)ctx + ctx_off, ty);
 	});
 
-	generic_process_init(msg, MSG_OP_GENERIC_TRACEPOINT, config);
+	generic_process_init(msg, MSG_OP_GENERIC_TRACEPOINT);
 
 	msg->common.op = MSG_OP_GENERIC_TRACEPOINT;
 	msg->sel.curr = 0;
@@ -226,25 +262,37 @@ generic_tracepoint_event(struct generic_tracepoint_event_arg *ctx)
 #ifdef __CAP_CHANGES_FILTER
 	msg->sel.match_cap = 0;
 #endif
+	msg->common.flags = 0;
 	tail_call(ctx, &tp_calls, TAIL_CALL_FILTER);
 	return 0;
 }
 
-__attribute__((section("tracepoint/1"), used)) int
+#ifdef __LARGE_BPF_PROG
+__attribute__((section("tracepoint"), used)) int
 generic_tracepoint_process_event(void *ctx)
 {
-	return generic_process_event(ctx, (struct bpf_map_def *)&tp_heap,
-				     (struct bpf_map_def *)&tp_calls,
-				     (struct bpf_map_def *)&config_map, 0);
+	return generic_process_event(ctx, (struct bpf_map_def *)&tp_calls, __READ_ARG_ALL);
+}
+#else
+__attribute__((section("tracepoint"), used)) int
+generic_tracepoint_process_event(void *ctx)
+{
+	return generic_process_event(ctx, (struct bpf_map_def *)&tp_calls, __READ_ARG_1);
 }
 
-__attribute__((section("tracepoint/2"), used)) int
+__attribute__((section("tracepoint"), used)) int
+generic_tracepoint_process_event_2(void *ctx)
+{
+	return generic_process_event(ctx, (struct bpf_map_def *)&tp_calls, __READ_ARG_2);
+}
+#endif
+
+__attribute__((section("tracepoint"), used)) int
 generic_tracepoint_filter(void *ctx)
 {
 	int ret;
 
-	ret = generic_process_filter((struct bpf_map_def *)&tp_heap,
-				     (struct bpf_map_def *)&filter_map);
+	ret = generic_process_filter(ctx);
 	if (ret == PFILTER_CONTINUE)
 		tail_call(ctx, &tp_calls, TAIL_CALL_FILTER);
 	else if (ret == PFILTER_ACCEPT)
@@ -255,26 +303,40 @@ generic_tracepoint_filter(void *ctx)
 	return PFILTER_REJECT;
 }
 
-__attribute__((section("tracepoint/3"), used)) int
+#ifdef __LARGE_BPF_PROG
+__attribute__((section("tracepoint"), used)) int
 generic_tracepoint_arg(void *ctx)
 {
-	return filter_read_arg(ctx, (struct bpf_map_def *)&tp_heap,
-			       (struct bpf_map_def *)&filter_map,
-			       (struct bpf_map_def *)&tp_calls,
-			       (struct bpf_map_def *)&config_map,
-			       true);
+	return generic_filter_arg(ctx, (struct bpf_map_def *)&tp_calls, true,
+				  __FILTER_ARG_ALL);
+}
+#else
+__attribute__((section("tracepoint"), used)) int
+generic_tracepoint_arg(void *ctx)
+{
+	return generic_filter_arg(ctx, (struct bpf_map_def *)&tp_calls, true,
+				  __FILTER_ARG_1);
 }
 
-__attribute__((section("tracepoint/4"), used)) int
+__attribute__((section("tracepoint"), used)) int
+generic_tracepoint_arg_2(void *ctx)
+{
+	return generic_filter_arg(ctx, (struct bpf_map_def *)&tp_calls, true,
+				  __FILTER_ARG_2);
+}
+#endif
+
+__attribute__((section("tracepoint"), used)) int
 generic_tracepoint_actions(void *ctx)
 {
-	return generic_actions(ctx, &maps);
+	generic_actions(ctx, (struct bpf_map_def *)&tp_calls);
+	return 0;
 }
 
-__attribute__((section("tracepoint/5"), used)) int
+__attribute__((section("tracepoint"), used)) int
 generic_tracepoint_output(void *ctx)
 {
-	return generic_output(ctx, (struct bpf_map_def *)&tp_heap, MSG_OP_GENERIC_TRACEPOINT);
+	return generic_output(ctx, MSG_OP_GENERIC_TRACEPOINT);
 }
 
 char _license[] __attribute__((section("license"), used)) = "Dual BSD/GPL";

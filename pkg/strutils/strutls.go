@@ -4,6 +4,7 @@
 package strutils
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -27,6 +28,10 @@ func UTF8FromBPFBytes(b []byte) string {
 }
 
 func ParseSize(str string) (int, error) {
+	if str == "" {
+		return 0, nil
+	}
+
 	suffix := str[len(str)-1:]
 
 	if !strings.Contains("KMG", suffix) {
@@ -49,4 +54,16 @@ func ParseSize(str string) (int, error) {
 
 	// never reached
 	return 0, nil
+}
+
+func SizeWithSuffix(size int) string {
+	suffix := [4]string{"", "K", "M", "G"}
+
+	i := 0
+	for size > 1024 && i < 3 {
+		size = size / 1024
+		i++
+	}
+
+	return fmt.Sprintf("%d%s", size, suffix[i])
 }

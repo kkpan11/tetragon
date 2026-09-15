@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
 )
 
 func TestEventFieldFilters(t *testing.T) {
@@ -91,7 +92,7 @@ func TestEventFieldFilters(t *testing.T) {
 	require.NoError(t, err)
 	for _, filter := range filters {
 		ev, err = filter.Filter(ev)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	}
 
 	// These fields should all have been included and so should not be empty
@@ -623,7 +624,7 @@ func TestSlimExecEventsFieldFilterExample(t *testing.T) {
 		}
 	}
 	for i := range evs {
-		if !assert.True(t, proto.Equal(evs[i], expected[i]), fmt.Sprintf("event %d should be equal after filter", i)) {
+		if !assert.True(t, proto.Equal(evs[i], expected[i]), "event %d should be equal after filter", i) {
 			fmt.Println("expected: ", expected[i])
 			fmt.Println("actual: ", evs[i])
 		}

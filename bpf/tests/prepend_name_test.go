@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package bpf
 
 import (
@@ -13,12 +15,13 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
 
 const (
 	// those constants must be synchronized with the BPF code
-	MAX_BUF_LEN                 = 256
+	MAX_BUF_LEN                 = 4096
 	NAME_MAX                    = 255
 	testPrependNameStateMapName = "test_prepend_name_state_map"
 	programName                 = "test_prepend_name"
@@ -113,8 +116,7 @@ func Test_PrependName(t *testing.T) {
 	// load test program
 	coll, err := ebpf.LoadCollection("objs/prepend_name_test.o")
 	if err != nil {
-		var ve *ebpf.VerifierError
-		if errors.As(err, &ve) {
+		if ve, ok := errors.AsType[*ebpf.VerifierError](err); ok {
 			t.Fatalf("verifier error: %+v\n", ve)
 		}
 		t.Fatal(err)
@@ -146,13 +148,13 @@ func Test_PrependName(t *testing.T) {
 	// This part is factorized since it's the setup used in many of the tests below
 	SetupCatBinHelper := func() {
 		err = state.UpdateDentry("cat")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		code := runPrependName()
 		assert.Equal(t, 0, code)
 		assert.Equal(t, "/cat", state.BufferToString())
 
 		err = state.UpdateDentry("bin")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		code = runPrependName()
 		assert.Equal(t, 0, code)
 		assert.Equal(t, "/bin/cat", state.BufferToString())
@@ -164,7 +166,7 @@ func Test_PrependName(t *testing.T) {
 		SetupCatBinHelper()
 
 		err = state.UpdateDentry("usr")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		code := runPrependName()
 		assert.Equal(t, 0, code)
 		assert.Equal(t, "/usr/bin/cat", state.BufferToString())
@@ -176,7 +178,7 @@ func Test_PrependName(t *testing.T) {
 		SetupCatBinHelper()
 
 		err = state.UpdateDentry("usr")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		code := runPrependName()
 		assert.Equal(t, 0, code)
 		assert.NotEqual(t, byte(0), state.Buf()[0])
@@ -189,7 +191,7 @@ func Test_PrependName(t *testing.T) {
 		SetupCatBinHelper()
 
 		err = state.UpdateDentry("usr")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		code := runPrependName()
 		assert.Equal(t, -int(unix.ENAMETOOLONG), code)
 		assert.Equal(t, "usr/bin/cat", state.BufferToString())
@@ -201,7 +203,7 @@ func Test_PrependName(t *testing.T) {
 		SetupCatBinHelper()
 
 		err = state.UpdateDentry("usr")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		code := runPrependName()
 		assert.Equal(t, 0, code)
 		assert.Equal(t, "/usr/bin/cat", state.BufferToString())
@@ -214,7 +216,7 @@ func Test_PrependName(t *testing.T) {
 		SetupCatBinHelper()
 
 		err = state.UpdateDentry("usr")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		code := runPrependName()
 		assert.Equal(t, -int(unix.ENAMETOOLONG), code)
 		assert.Equal(t, "/bin/cat", state.BufferToString())
@@ -226,50 +228,73 @@ func Test_PrependName(t *testing.T) {
 		SetupCatBinHelper()
 
 		err = state.UpdateDentry("usr")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		code := runPrependName()
 		assert.Equal(t, -int(unix.ENAMETOOLONG), code)
 		assert.Equal(t, "sr/bin/cat", state.BufferToString())
 	})
 
-	SetupLongDentry := func() string {
-		// length is 239
-		const longDentry = "pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil"
+	// length is 239
+	const longDentry = "pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil_pizza_tomato_mozzarella_basil"
+
+	t.Run("MaxSizeBufMedium", func(t *testing.T) {
+		const bufsize = 256
+		state.ResetStateWithBuflen(bufsize)
 
 		err = state.UpdateDentry(longDentry)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		code := runPrependName()
 		assert.Equal(t, 0, code)
 		assert.Equal(t, "/"+longDentry, state.BufferToString())
-		return longDentry
-	}
-
-	t.Run("MaxSizeBufFull", func(t *testing.T) {
-		state.ResetStateWithBuflen(MAX_BUF_LEN)
-
-		longDentry := SetupLongDentry()
 
 		// length is 15, so 239 + 15 + 2 slash chars = 256
 		err = state.UpdateDentry("favorite_recipe")
-		assert.NoError(t, err)
-		code := runPrependName()
+		require.NoError(t, err)
+		code = runPrependName()
 		assert.Equal(t, 0, code)
 		assert.Equal(t, "/favorite_recipe"+"/"+longDentry, state.BufferToString())
-		assert.Equal(t, MAX_BUF_LEN, len(state.BufferToString()))
+		assert.Len(t, state.BufferToString(), bufsize)
+	})
+
+	t.Run("MaxSizeBufFull", func(t *testing.T) {
+		maxDentry := strings.Repeat("a", NAME_MAX)
+		state.ResetStateWithBuflen(MAX_BUF_LEN)
+
+		var expectedState strings.Builder
+		// (len("/") + 255) * 16 = 4096
+		for range 16 {
+			err = state.UpdateDentry(maxDentry)
+			require.NoError(t, err)
+			code := runPrependName()
+			assert.Equal(t, 0, code)
+			expectedState.WriteString("/" + maxDentry)
+			assert.Equal(t, expectedState.String(), state.BufferToString())
+		}
 	})
 
 	t.Run("MaxSizeBufTooSmall", func(t *testing.T) {
+		largeDentry := strings.Repeat("a", 240)
 		state.ResetStateWithBuflen(MAX_BUF_LEN)
 
-		longDentry := SetupLongDentry()
-
-		// length is 16 with the "s" of "recipes", so 240 + 15 + 2 slash chars = 257
-		err = state.UpdateDentry("favorite_recipes")
-		assert.NoError(t, err)
+		var expectedState string
+		// (len("/") + 240) * 16 = 3856
+		for range 16 {
+			err = state.UpdateDentry(largeDentry)
+			require.NoError(t, err)
+			code := runPrependName()
+			assert.Equal(t, 0, code)
+			expectedState = "/" + largeDentry + expectedState
+			assert.Equal(t, expectedState, state.BufferToString())
+		}
+		// at this stage, there should be 240 chars left in the buf which leaves
+		// no space for the remaining root slash character
+		err = state.UpdateDentry(largeDentry)
+		require.NoError(t, err)
 		code := runPrependName()
 		assert.Equal(t, -int(unix.ENAMETOOLONG), code)
-		assert.Equal(t, "favorite_recipes"+"/"+longDentry, state.BufferToString())
-		assert.Equal(t, MAX_BUF_LEN, len(state.BufferToString()))
+		// note that I intentionally don't add the '/' char
+		expectedState = largeDentry + expectedState
+		assert.Equal(t, expectedState, state.BufferToString())
 	})
 
 	t.Run("MaxSizeBufNormalUse", func(t *testing.T) {

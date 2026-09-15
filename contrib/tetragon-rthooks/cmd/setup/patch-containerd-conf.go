@@ -5,26 +5,18 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 
-	srvconf "github.com/containerd/containerd/services/server/config"
+	srvconf "github.com/containerd/containerd/v2/cmd/containerd/server/config"
 	"github.com/pelletier/go-toml"
 )
 
 // NB(kkourt): this started as a simple hack, but grew larger than expected. I think a better
 // solution would be to modify the config object and just marshall it instead of just doing text
 // replacements. TBD.
-
-const appendAtEndLine = -10
-
-type addLine struct {
-	pos         toml.Position
-	line        string
-	replaceLine bool
-}
 
 type addOCIHookState struct {
 	cnf *addOCIHookCmd
@@ -112,9 +104,13 @@ func addOciHook(log *slog.Logger, cnf *addOCIHookCmd) ([]addLine, error) {
 		cnf: cnf,
 		log: log,
 	}
-	for name, plugin := range srvConfig.Plugins {
+	for name := range srvConfig.Plugins {
 		if name == "io.containerd.grpc.v1.cri" {
-			err := p.parseCri(&plugin)
+			plugin, ok := file.GetPath([]string{"plugins", name}).(*toml.Tree)
+			if !ok {
+				continue
+			}
+			err := p.parseCri(plugin)
 			if err != nil {
 				return nil, err
 			}
@@ -139,65 +135,6 @@ func usesCR(f *os.File) bool {
 	}
 
 	return false
-}
-
-func applyChanges(fnameIn, fnameOut string, changes []addLine) error {
-	fIn, err := os.Open(fnameIn)
-	if err != nil {
-		return err
-	}
-	defer fIn.Close()
-	cr := "\n"
-	if usesCR(fIn) {
-		cr = "\r\n"
-	}
-
-	fOut, err := os.Create(fnameOut)
-	if err != nil {
-		return err
-	}
-	defer fOut.Close()
-
-	inLine := 0
-	inSc := bufio.NewScanner(fIn)
-	out := bufio.NewWriter(fOut)
-	defer out.Flush()
-	for inSc.Scan() {
-		inLine++
-		lines := []string{}
-		replaceLine := false
-		for i := range changes {
-			ch := &changes[i]
-			if ch.pos.Line == inLine {
-				line := strings.Repeat(" ", ch.pos.Col-1) + ch.line + cr
-				lines = append(lines, line)
-				if ch.replaceLine {
-					replaceLine = true
-				}
-			}
-		}
-		if !replaceLine {
-			out.WriteString(inSc.Text())
-			out.WriteString(cr)
-		}
-		for _, line := range lines {
-			out.WriteString(line)
-		}
-	}
-
-	for i := range changes {
-		ch := &changes[i]
-		if ch.pos.Line == appendAtEndLine {
-			indent := ""
-			if ch.pos.Col > 0 {
-				indent = strings.Repeat(" ", ch.pos.Col-1)
-			}
-			line := indent + ch.line + cr
-			out.WriteString(line)
-		}
-	}
-
-	return nil
 }
 
 func (c *addOCIHookCmd) Run(log *slog.Logger) error {
@@ -298,9 +235,13 @@ func enableNRI(log *slog.Logger, cnf *enableNRICmd) ([]addLine, error) {
 		return nil, err
 	}
 
-	for name, plugin := range srvConfig.Plugins {
+	for name := range srvConfig.Plugins {
 		if name == "io.containerd.nri.v1.nri" {
-			return parseNRI(&plugin)
+			plugin, ok := file.GetPath([]string{"plugins", name}).(*toml.Tree)
+			if !ok {
+				return nil, fmt.Errorf("plugin %q is not a TOML table", name)
+			}
+			return parseNRI(plugin)
 		}
 	}
 
@@ -309,23 +250,34 @@ func enableNRI(log *slog.Logger, cnf *enableNRICmd) ([]addLine, error) {
 	// first find the last position of all plugins
 	pos := toml.Position{appendAtEndLine, 0}
 	elemPos := toml.Position{appendAtEndLine, 3}
-	for _, v := range srvConfig.Plugins {
-		pPos := v.Position()
-		if pos.Line < pPos.Line {
-			pos = pPos
-			lastLine := -1
-			elemCol := pPos.Col + 3 // by default, indent by 3
-			// find the last line for this plugin by iterating all of its elements
-			for _, k := range v.Keys() {
-				kPos := v.GetPosition(k)
-				if kPos.Line > lastLine {
-					lastLine = kPos.Line
-					elemCol = kPos.Col
-				}
+	pluginsValue := file.Get("plugins")
+	if pluginsValue != nil {
+		plugins, ok := pluginsValue.(*toml.Tree)
+		if !ok {
+			return nil, errors.New("plugins is not a TOML table")
+		}
+		for _, name := range plugins.Keys() {
+			v, ok := plugins.GetPath([]string{name}).(*toml.Tree)
+			if !ok {
+				continue
 			}
-			pos.Line = lastLine
-			elemPos = pos
-			elemPos.Col = elemCol
+			pPos := v.Position()
+			if pos.Line < pPos.Line {
+				pos = pPos
+				lastLine := -1
+				elemCol := pPos.Col + 3 // by default, indent by 3
+				// find the last line for this plugin by iterating all of its elements
+				for _, k := range v.Keys() {
+					kPos := v.GetPosition(k)
+					if kPos.Line > lastLine {
+						lastLine = kPos.Line
+						elemCol = kPos.Col
+					}
+				}
+				pos.Line = lastLine
+				elemPos = pos
+				elemPos.Col = elemCol
+			}
 		}
 	}
 

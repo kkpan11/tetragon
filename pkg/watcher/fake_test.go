@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !nok8s
+
 package watcher
 
 import (
@@ -11,7 +13,7 @@ import (
 )
 
 func TestFakeK8sWatcher_AddService(t *testing.T) {
-	services := []interface{}{
+	services := []any{
 		&corev1.Service{},
 		&corev1.Service{},
 		&corev1.Service{},
@@ -23,7 +25,7 @@ func TestFakeK8sWatcher_AddService(t *testing.T) {
 }
 
 func TestFakeK8sWatcher_ClearAllServices(t *testing.T) {
-	services := []interface{}{
+	services := []any{
 		&corev1.Service{},
 		&corev1.Service{},
 		&corev1.Service{},
@@ -32,4 +34,33 @@ func TestFakeK8sWatcher_ClearAllServices(t *testing.T) {
 	assert.Len(t, fakeWatcher.services, 3)
 	fakeWatcher.ClearAllServices()
 	assert.Empty(t, fakeWatcher.services)
+}
+
+func TestFakeK8sWatcher_DeletePod(t *testing.T) {
+	pods := []any{
+		&corev1.Pod{Name: "pod1", Namespace: "default"},
+		&corev1.Pod{Name: "pod2", Namespace: "default"},
+		&corev1.Pod{Name: "pod3", Namespace: "default"},
+	}
+	fakeWatcher := NewFakeK8sWatcherWithPodsAndServices(pods, nil)
+	assert.Len(t, fakeWatcher.pods, 3)
+	fakeWatcher.RemovePod(pods[1].(*corev1.Pod))
+	assert.Len(t, fakeWatcher.pods, 2)
+	for _, p := range fakeWatcher.pods {
+		pod := p.(*corev1.Pod)
+		assert.NotEqual(t, "pod2", pod.Name)
+	}
+}
+
+func TestFakeK8sWatcher_DeletePodNamespaceMismatch(t *testing.T) {
+	pods := []any{
+		&corev1.Pod{Name: "pod1", Namespace: "default"},
+		&corev1.Pod{Name: "pod2", Namespace: "default"},
+		&corev1.Pod{Name: "pod3", Namespace: "default"},
+	}
+	fakeWatcher := NewFakeK8sWatcherWithPodsAndServices(pods, nil)
+	assert.Len(t, fakeWatcher.pods, 3)
+	rem := &corev1.Pod{Name: "pod1", Namespace: "other"}
+	fakeWatcher.RemovePod(rem)
+	assert.Len(t, fakeWatcher.pods, 3)
 }

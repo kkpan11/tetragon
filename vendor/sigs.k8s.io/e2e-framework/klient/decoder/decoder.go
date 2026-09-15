@@ -27,6 +27,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/vladimirvivien/gexe/http"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,7 +35,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes/scheme"
+	klog "k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 )
@@ -72,7 +75,7 @@ func DecodeEachFile(ctx context.Context, fsys fs.FS, pattern string, handlerFn H
 		}
 		defer f.Close()
 		if err := DecodeEach(ctx, f, handlerFn, options...); err != nil {
-			return err
+			return fmt.Errorf("failed to decode file %q: %w", file, err)
 		}
 		if err := f.Close(); err != nil {
 			return err
@@ -81,7 +84,7 @@ func DecodeEachFile(ctx context.Context, fsys fs.FS, pattern string, handlerFn H
 	return nil
 }
 
-// DecodeAllFiles  resolves files at the filesystem matching the pattern, decoding JSON or YAML files. Supports multi-document files.
+// DecodeAllFiles resolves files at the filesystem matching the pattern, decoding JSON or YAML files. Supports multi-document files.
 // Falls back to the unstructured.Unstructured type if a matching type cannot be found for the Kind.
 // Options may be provided to configure the behavior of the decoder.
 func DecodeAllFiles(ctx context.Context, fsys fs.FS, pattern string, options ...DecodeOption) ([]k8s.Object, error) {
@@ -107,7 +110,7 @@ func DeleteWithManifestDir(ctx context.Context, r *resources.Resources, dirPath,
 	return err
 }
 
-// Decode a stream of documents of any Kind using either the innate typing of the scheme.
+// DecodeEach a stream of documents of any Kind using either the innate typing of the scheme.
 // Falls back to the unstructured.Unstructured type if a matching type cannot be found for the Kind.
 //
 // If handlerFn returns an error, decoding is halted.
@@ -123,6 +126,12 @@ func DecodeEach(ctx context.Context, manifest io.Reader, handlerFn HandlerFunc, 
 		}
 		obj, err := DecodeAny(bytes.NewReader(b), options...)
 		if err != nil {
+			// Skip the Missing Kind entries. This will avoid unwanted failures of the yaml apply workflow in cases
+			// if the file has an empty item with just comments in it.
+			if runtime.IsMissingKind(err) {
+				klog.V(2).InfoS("Skipping document with missing Kind", "document", strings.TrimSpace(string(b)))
+				continue
+			}
 			return err
 		}
 		if err := handlerFn(ctx, obj); err != nil {
@@ -132,7 +141,7 @@ func DecodeEach(ctx context.Context, manifest io.Reader, handlerFn HandlerFunc, 
 	return nil
 }
 
-// DecodeAll is a stream of  documents of any Kind using either the innate typing of the scheme.
+// DecodeAll is a stream of documents of any Kind using either the innate typing of the scheme.
 // Falls back to the unstructured.Unstructured type if a matching type cannot be found for the Kind.
 // Options may be provided to configure the behavior of the decoder.
 func DecodeAll(ctx context.Context, manifest io.Reader, options ...DecodeOption) ([]k8s.Object, error) {
@@ -209,6 +218,18 @@ func DecodeFile(fsys fs.FS, manifestPath string, obj k8s.Object, options ...Deco
 	return Decode(f, obj, options...)
 }
 
+// DecodeURL decodes a document from the URL of any Kind using either the innate typing of the scheme.
+// Falls back to the unstructured.Unstructured type if a matching type cannot be found for the Kind.
+func DecodeURL(ctx context.Context, url string, handlerFn HandlerFunc, options ...DecodeOption) error {
+	resp := http.Get(url).Do()
+	if resp.Err() != nil {
+		return resp.Err()
+	}
+	defer resp.Body().Close()
+
+	return DecodeEach(ctx, resp.Body(), handlerFn, options...)
+}
+
 // DecodeString decodes a single-document YAML or JSON string into the provided object. Patches are applied
 // after decoding to the object to update the loaded resource.
 func DecodeString(rawManifest string, obj k8s.Object, options ...DecodeOption) error {
@@ -252,7 +273,7 @@ func MutateAnnotations(overrides map[string]string) DecodeOption {
 		annotations := obj.GetAnnotations()
 		if annotations == nil {
 			annotations = make(map[string]string)
-			obj.SetLabels(annotations)
+			obj.SetAnnotations(annotations)
 		}
 		for key, value := range overrides {
 			annotations[key] = value
@@ -346,4 +367,8 @@ func CreateIgnoreAlreadyExists(r *resources.Resources, opts ...resources.CreateO
 // DeleteIgnoreNotFound returns a HandlerFunc that will delete objects if they do not already exist
 func DeleteIgnoreNotFound(r *resources.Resources, opts ...resources.DeleteOption) HandlerFunc {
 	return IgnoreErrorHandler(DeleteHandler(r, opts...), apierrors.IsNotFound)
+}
+
+func init() {
+	log.SetLogger(klog.NewKlogr())
 }

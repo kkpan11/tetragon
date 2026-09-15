@@ -4,13 +4,15 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 	"time"
 
-	"github.com/cilium/tetragon/cmd/tetra/common"
-	"github.com/cilium/tetragon/pkg/logger"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+
+	"github.com/cilium/tetragon/cmd/tetra/common"
+	"github.com/cilium/tetragon/pkg/defaults"
+	"github.com/cilium/tetragon/pkg/logger"
 )
 
 var (
@@ -33,7 +35,7 @@ func New() *cobra.Command {
 		},
 		PersistentPreRun: func(_ *cobra.Command, _ []string) {
 			if common.Debug {
-				logger.DefaultLogger.SetLevel(logrus.DebugLevel)
+				logger.SetLogLevel(slog.LevelDebug)
 			}
 		},
 	}
@@ -44,7 +46,9 @@ func New() *cobra.Command {
 	flags := rootCmd.PersistentFlags()
 	flags.BoolVarP(&common.Debug, common.KeyDebug, "d", false, "Enable debug messages")
 	flags.StringVar(&common.ServerAddress, common.KeyServerAddress, "", "gRPC server address")
-	flags.DurationVar(&common.Timeout, common.KeyTimeout, 10*time.Second, "Connection timeout")
-	flags.IntVar(&common.Retries, common.KeyRetries, 0, "Connection retries with exponential backoff")
+	flags.DurationVar(&common.Timeout, common.KeyTimeout, 30*time.Second, "Connection timeout")
+	flags.IntVar(&common.Retries, common.KeyRetries, 1, "Connection retries with exponential backoff")
+	flags.IntVar(&common.MaxRecvMsgSize, common.KeyMaxRecvMsgSize, defaults.DefaultMaxGRPCRecvMsgSize, "Maximum gRPC message size in bytes the client can receive")
+	common.AddTLSFlags(rootCmd)
 	return rootCmd
 }

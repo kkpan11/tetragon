@@ -6,27 +6,34 @@ package mapmetrics
 import (
 	"github.com/cilium/tetragon/pkg/metrics"
 	"github.com/cilium/tetragon/pkg/metrics/consts"
-	"github.com/prometheus/client_golang/prometheus"
 )
+
+var MapLabel = metrics.ConstrainedLabel{
+	Name: "map",
+	// These are maps which usage we monitor, not maps from which we read
+	// metrics. Metrics are read from separate maps suffixed with "_stats".
+	Values: []string{"execve_map", "tg_execve_joined_info_map"},
+}
 
 var (
-	MapSize = metrics.NewBPFGauge(prometheus.NewDesc(
-		prometheus.BuildFQName(consts.MetricsNamespace, "", "map_entries"),
+	MapSize = metrics.MustNewCustomGauge(metrics.NewOpts(
+		consts.MetricsNamespace, "", "map_entries",
 		"The total number of in-use entries per map.",
-		[]string{"map"}, nil,
+		nil, []metrics.ConstrainedLabel{MapLabel}, nil,
 	))
-	MapCapacity = metrics.NewBPFGauge(prometheus.NewDesc(
-		prometheus.BuildFQName(consts.MetricsNamespace, "", "map_capacity"),
+	MapCapacity = metrics.MustNewCustomGauge(metrics.NewOpts(
+		consts.MetricsNamespace, "", "map_capacity",
 		"Capacity of a BPF map. Expected to be constant.",
-		[]string{"map"}, nil,
+		nil, []metrics.ConstrainedLabel{MapLabel}, nil,
 	))
-	MapErrors = metrics.NewBPFCounter(prometheus.NewDesc(
-		prometheus.BuildFQName(consts.MetricsNamespace, "", "map_errors_total"),
-		"The number of errors per map.",
-		[]string{"map"}, nil,
+	MapErrorsUpdate = metrics.MustNewCustomGauge(metrics.NewOpts(
+		consts.MetricsNamespace, "", "map_errors_update_total",
+		"The number of failed updates per map.",
+		nil, []metrics.ConstrainedLabel{MapLabel}, nil,
+	))
+	MapErrorsDelete = metrics.MustNewCustomGauge(metrics.NewOpts(
+		consts.MetricsNamespace, "", "map_errors_delete_total",
+		"The number of failed deletes per map.",
+		nil, []metrics.ConstrainedLabel{MapLabel}, nil,
 	))
 )
-
-func InitMetrics(_ *prometheus.Registry) {
-	// custom collectors are registered independently
-}

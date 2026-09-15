@@ -4,7 +4,7 @@
 package runner
 
 import (
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/little-vm-helper/pkg/slogger"
 )
 
 type RunConf struct {
@@ -16,8 +16,8 @@ type RunConf struct {
 	KernelAppendArgs []string
 	// Do not run the qemu command, just print it
 	QemuPrint bool
-	// Do not use KVM acceleration, even if /dev/kvm exists
-	DisableKVM bool
+	// Do not use hardware acceleration, KVM for Linux or HVF for macOS
+	DisableHardwareAccel bool
 	// Daemonize QEMU after initializing
 	Daemonize bool
 	// Log file for virtual console output
@@ -30,7 +30,7 @@ type RunConf struct {
 	DisableNetwork bool
 	ForwardedPorts PortForwards
 
-	Logger *logrus.Logger
+	Logger slogger.Logger
 
 	HostMount string
 
@@ -45,6 +45,8 @@ type RunConf struct {
 	RootDev string
 
 	QemuMonitorPort int
+
+	QemuArch string
 }
 
 func (rc *RunConf) testImageFname() string {

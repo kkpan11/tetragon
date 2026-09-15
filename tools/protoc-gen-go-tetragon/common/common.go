@@ -4,14 +4,18 @@
 package common
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 
-	"github.com/cilium/tetragon/pkg/logger"
 	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/reflect/protoreflect"
+
+	"github.com/cilium/tetragon/pkg/logger"
 )
+
+var TetragonProtoPackageName = "tetragon"
 
 // TetragonPackageName is the import path for the Tetragon package
 var TetragonPackageName = "github.com/cilium/tetragon"
@@ -27,8 +31,8 @@ var TetragonCopyrightHeader = `// SPDX-License-Identifier: Apache-2.0
 func NewFile(gen *protogen.Plugin, file *protogen.File, pkg string, pkgName string, fileName string) *protogen.GeneratedFile {
 	importPath := filepath.Join(string(file.GoImportPath), pkg)
 	pathSuffix := filepath.Base(file.GeneratedFilenamePrefix)
-	fileName = filepath.Join(strings.TrimSuffix(file.GeneratedFilenamePrefix, pathSuffix), pkg, fmt.Sprintf("%s.pb.go", fileName))
-	logger.GetLogger().Infof("%s", fileName)
+	fileName = filepath.Join(strings.TrimSuffix(file.GeneratedFilenamePrefix, pathSuffix), pkg, fileName+".pb.go")
+	logger.GetLogger().Info(fileName)
 
 	g := gen.NewGeneratedFile(fileName, protogen.GoImportPath(importPath))
 	g.P(TetragonCopyrightHeader)
@@ -82,7 +86,7 @@ func GeneratedIdent(g *protogen.GeneratedFile, importPath string, name string) s
 
 // Logger is a convenience helper that generates a call to logger.GetLogger()
 func Logger(g *protogen.GeneratedFile) string {
-	return fmt.Sprintf("%s()", GoIdent(g, "github.com/cilium/tetragon/pkg/logger", "GetLogger"))
+	return GoIdent(g, "github.com/cilium/tetragon/pkg/logger", "GetLogger") + "()"
 }
 
 func ProcessIdent(g *protogen.GeneratedFile) string {
@@ -152,6 +156,11 @@ func IsParentEvent(msg *protogen.Message) bool {
 	return EventFieldCheck(msg, "parent")
 }
 
+// IsAncestorsEvent returns true if the message is a Tetragon event that has an ancestors field
+func IsAncestorsEvent(msg *protogen.Message) bool {
+	return EventFieldCheck(msg, "ancestors")
+}
+
 // StructTag is a convenience helper that formats a struct tag
 func StructTag(tag string) string {
 	return fmt.Sprintf("`%s`", tag)
@@ -176,7 +185,7 @@ func GetEventsResponseOneofs(files []*protogen.File) ([]GetEventsResponseOneofIn
 		}
 	}
 	if getEventsResponse == nil {
-		return nil, fmt.Errorf("Unable to find GetEventsResponse message")
+		return nil, errors.New("unable to find GetEventsResponse message")
 	}
 
 	var eventOneof *protogen.Oneof
@@ -187,7 +196,7 @@ func GetEventsResponseOneofs(files []*protogen.File) ([]GetEventsResponseOneofIn
 		}
 	}
 	if eventOneof == nil {
-		return nil, fmt.Errorf("Unable to find GetEventsResponse.event")
+		return nil, errors.New("unable to find GetEventsResponse.event")
 	}
 
 	var info []GetEventsResponseOneofInfo
@@ -217,7 +226,7 @@ func GetEvents(files []*protogen.File) ([]*protogen.Message, error) {
 		}
 	}
 	if getEventsResponse == nil {
-		return nil, fmt.Errorf("Unable to find GetEventsResponse message")
+		return nil, errors.New("unable to find GetEventsResponse message")
 	}
 
 	var eventOneof *protogen.Oneof
@@ -228,7 +237,7 @@ func GetEvents(files []*protogen.File) ([]*protogen.Message, error) {
 		}
 	}
 	if eventOneof == nil {
-		return nil, fmt.Errorf("Unable to find GetEventsResponse.event")
+		return nil, errors.New("unable to find GetEventsResponse.event")
 	}
 
 	validNames := make(map[string]struct{})
@@ -298,11 +307,11 @@ func GetFields(files []*protogen.File) ([]*protogen.Message, error) {
 // getFieldsForMessage recursively looks up all the fields for a given message
 func getFieldsForMessage(msg *protogen.Message) []*protogen.Field {
 	seen := make(map[string]struct{})
-	return __getFieldsForMessage(msg, seen)
+	return getFieldsForMessageRec(msg, seen)
 }
 
-// __getFieldsForMessage is the underlying recusion logic of getFieldsForMessage
-func __getFieldsForMessage(msg *protogen.Message, seen map[string]struct{}) []*protogen.Field {
+// getFieldsForMessageRec is the underlying recusion logic of getFieldsForMessage
+func getFieldsForMessageRec(msg *protogen.Message, seen map[string]struct{}) []*protogen.Field {
 	var fields []*protogen.Field
 
 	for _, field := range msg.Fields {
@@ -315,7 +324,7 @@ func __getFieldsForMessage(msg *protogen.Message, seen map[string]struct{}) []*p
 		}
 		seen[fieldType] = struct{}{}
 		fields = append(fields, field)
-		fields = append(fields, __getFieldsForMessage(field.Message, seen)...)
+		fields = append(fields, getFieldsForMessageRec(field.Message, seen)...)
 	}
 
 	return fields
@@ -359,4 +368,15 @@ func GetEnums(files []*protogen.File) ([]*protogen.Enum, error) {
 	}
 
 	return enumsCache, nil
+}
+
+// GetFirstTetragonFile returns the first file in the provided files that has a filename prefix
+// starting with TetragonProtoPackageName
+func GetFirstTetragonFile(files []*protogen.File) (*protogen.File, error) {
+	for _, file := range files {
+		if strings.HasPrefix(file.GeneratedFilenamePrefix, TetragonProtoPackageName) {
+			return file, nil
+		}
+	}
+	return nil, errors.New("no Tetragon file found in the provided files")
 }

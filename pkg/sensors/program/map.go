@@ -1,17 +1,82 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+// We allow to define several types of maps:
+//
+//    MapTypeGlobal MapType = iota
+//    MapTypePolicy
+//    MapTypeSensor
+//    MapTypeProgram
+//
+//  Each type defines the maps position in the sysfs hierarchy:
+//
+//    MapTypeGlobal:     /sys/fs/bpf/tetragon/map
+//    MapTypePolicy:     /sys/fs/bpf/tetragon/policy/map
+//    MapTypeSensor:     /sys/fs/bpf/tetragon/policy/sensor/map
+//    MapTypeProgram:    /sys/fs/bpf/tetragon/policy/sensor/program/map
+//
+//  Each type has appropriate helper defined, which sets map's
+//  path to specific level of sysfs hierarchy:
+//
+//    MapTypeGlobal:     MapBuilder
+//    MapTypePolicy:     MapBuilderPolicy
+//    MapTypeSensor:     MapBuilderSensor
+//    MapTypeProgram:    MapBuilderProgram
+//
+//  It's possible to share map between more programs like:
+//
+//     m := MapBuilderSensor("map", prog1, prog2, prog3)
+//
+//  All prog1-3 programs will attach to m1 through:
+//
+//    /sys/fs/bpf/tetragon/policy/sensor/map
+//
+//  The idea is to share map on higher level which denotes to scope
+//  of the map, like:
+//
+//     /sys/fs/bpf/tetragon/map
+//      - map is global shared with all policies/sensors/programs
+//
+//     /sys/fs/bpf/tetragon/policy/map
+//      - map is local for policy, shared by all its sensors/programs
+//
+//     /sys/fs/bpf/tetragon/policy/sensors/map
+//      - map is local for sensor, shared by all its programs
+//
+//     /sys/fs/bpf/tetragon/policy/sensors/program/map
+//      - map is local for program, not shared at all
+//
+//  NOTE Please do not share MapTypeProgram maps, it brings confusion.
+//
+//  Each map declares the ownership of the map. The map can be either
+//  owner of the map (via MapBuilder* helpers) or as an user (MapUser*
+//  helpers.
+//
+//  Map owner object owns the pinned map and when loading it sets (and
+//  potentially overwrite) the map's spec and its max entries value.
+//
+//  Map user object object is just using the pinned map and follows its
+//  setup and will fail if the pinned map differs in spec or configured
+//  max entries value.
+//
+//  MapShared creates a shared map pinned at the global scope
+//  (/sys/fs/bpf/tetragon/<name>). The first sensor to load it creates and
+//  pins the map; subsequent sensors reuse the existing pin. The pin is
+//  removed only when the last sensor using it unloads.
+
 package program
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/cilium/ebpf"
+
 	"github.com/cilium/tetragon/pkg/logger"
-	"github.com/cilium/tetragon/pkg/option"
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
 )
 
 type MaxEntries struct {
@@ -19,15 +84,106 @@ type MaxEntries struct {
 	Set bool
 }
 
+type MapType int
+
+const (
+	MapTypeGlobal MapType = iota
+	MapTypePolicy
+	MapTypeSensor
+	MapTypeProgram
+)
+
+type MapOpts struct {
+	Type  MapType
+	Owner bool
+}
+
 // Map represents BPF maps.
+//
+// Note there are restriction (no dots) on what the bpffs file name can
+// contain, so Map holds two names:
+// Name
+// - ELF name, map's ebpf program handle.
+// PinName
+// - bpffs filename, it may differ from the ELF map name.
 type Map struct {
 	Name         string
 	PinName      string
+	PinPath      string
 	Prog         *Program
 	PinState     State
 	MapHandle    *ebpf.Map
 	Entries      MaxEntries
 	InnerEntries MaxEntries
+	Type         MapType
+	Owner        bool
+	Shared       bool
+
+	// Configure prepares a copied map specification before the pinned map is
+	// opened or created. It must not change fields, load, pin, or unpin maps.
+	Configure func(spec *ebpf.MapSpec) error
+
+	// Validate checks state which isn't covered by MapSpec.Compatible.
+	Validate func(m *ebpf.Map, spec *ebpf.MapSpec) error
+}
+
+func (m *Map) String() string {
+	return fmt.Sprintf("Map{Name:%s PinPath:%s Owner:%t}", m.Name, m.PinPath, m.IsOwner())
+}
+
+// globalMaps keeps a record of all global maps to exclude them from per policy
+// memory map accounting.
+var globalMaps = struct {
+	maps map[string]bool
+	mu   sync.RWMutex
+}{
+	make(map[string]bool),
+	sync.RWMutex{},
+}
+
+func IsGlobalMap(name string) bool {
+	if len(name) > 15 {
+		name = name[:15]
+	}
+	globalMaps.mu.RLock()
+	defer globalMaps.mu.RUnlock()
+	return globalMaps.maps[name]
+}
+
+func AddGlobalMap(name string) {
+	if len(name) > 15 {
+		name = name[:15]
+	}
+	globalMaps.mu.Lock()
+	defer globalMaps.mu.Unlock()
+	globalMaps.maps[name] = true
+}
+
+func DeleteGlobMap(name string) {
+	if len(name) > 15 {
+		name = name[:15]
+	}
+	globalMaps.mu.Lock()
+	defer globalMaps.mu.Unlock()
+	delete(globalMaps.maps, name)
+}
+
+// sharedMapRefs tracks the number of sensors currently using each shared map,
+// without locking because sensor load/unload is serialized by the sensor manager.
+var sharedMapRefs = map[string]int{}
+
+func sharedMapIncRef(pinPath string) int {
+	sharedMapRefs[pinPath]++
+	return sharedMapRefs[pinPath]
+}
+
+func sharedMapDecRef(pinPath string) bool {
+	sharedMapRefs[pinPath]--
+	last := sharedMapRefs[pinPath] <= 0
+	if last {
+		delete(sharedMapRefs, pinPath)
+	}
+	return last
 }
 
 // Map holds pointer to Program object as a source of its ebpf object
@@ -43,8 +199,12 @@ type Map struct {
 //	p.PinMap["map2"] = &map2
 //	...
 //	p.PinMap["mapX"] = &mapX
-func mapBuilder(name, pin string, lds ...*Program) *Map {
-	m := &Map{name, pin, lds[0], Idle(), nil, MaxEntries{0, false}, MaxEntries{0, false}}
+func mapBuilder(name, pinName string, ty MapType, owner bool, shared bool, lds ...*Program) *Map {
+	var prog *Program
+	if len(lds) != 0 {
+		prog = lds[0]
+	}
+	m := &Map{name, pinName, "", prog, Idle(), nil, MaxEntries{0, false}, MaxEntries{0, false}, ty, owner, shared, nil, nil}
 	for _, ld := range lds {
 		ld.PinMap[name] = m
 	}
@@ -52,33 +212,100 @@ func mapBuilder(name, pin string, lds ...*Program) *Map {
 }
 
 func MapBuilder(name string, lds ...*Program) *Map {
-	return mapBuilder(name, name, lds...)
+	return mapBuilder(name, name, MapTypeGlobal, true, false, lds...)
 }
 
-func MapBuilderPin(name, pin string, lds ...*Program) *Map {
-	return mapBuilder(name, pin, lds...)
+// MapBuilderPin creates a global map with distinct ELF and bpffs names.
+func MapBuilderPin(name, pinName string, lds ...*Program) *Map {
+	return mapBuilder(name, pinName, MapTypeGlobal, true, false, lds...)
 }
 
-func (m *Map) Unload() error {
-	log := logger.GetLogger().WithField("map", m.Name).WithField("pin", m.PinName)
+func MapBuilderProgram(name string, lds ...*Program) *Map {
+	return mapBuilder(name, name, MapTypeProgram, true, false, lds...)
+}
+
+func MapBuilderSensor(name string, lds ...*Program) *Map {
+	return mapBuilder(name, name, MapTypeSensor, true, false, lds...)
+}
+
+func MapBuilderPolicy(name string, lds ...*Program) *Map {
+	return mapBuilder(name, name, MapTypePolicy, true, false, lds...)
+}
+
+func MapBuilderType(name string, ty MapType, lds ...*Program) *Map {
+	return mapBuilder(name, name, ty, true, false, lds...)
+}
+
+func MapBuilderOpts(name string, opts MapOpts, lds ...*Program) *Map {
+	return mapBuilder(name, name, opts.Type, opts.Owner, false, lds...)
+}
+
+func MapShared(name string, lds ...*Program) *Map {
+	return mapBuilder(name, name, MapTypeGlobal, false, true, lds...)
+}
+
+func mapUser(name, pinName string, ty MapType, prog *Program) *Map {
+	return &Map{name, pinName, "", prog, Idle(), nil, MaxEntries{0, false}, MaxEntries{0, false}, ty, false, false, nil, nil}
+}
+
+func MapUser(name string, prog *Program) *Map {
+	return mapUser(name, name, MapTypeGlobal, prog)
+}
+
+func MapUserProgram(name string, prog *Program) *Map {
+	return mapUser(name, name, MapTypeProgram, prog)
+}
+
+func MapUserSensor(name string, prog *Program) *Map {
+	return mapUser(name, name, MapTypeSensor, prog)
+}
+
+func MapUserPolicy(name string, prog *Program) *Map {
+	return mapUser(name, name, MapTypePolicy, prog)
+}
+
+func MapUserFrom(m *Map) *Map {
+	return mapUser(m.Name, m.PinName, m.Type, m.Prog)
+}
+
+func PolicyMapPath(mapDir, policy, name string) string {
+	return filepath.Join(mapDir, policy, name)
+}
+
+func (m *Map) IsOwner() bool {
+	return m.Owner
+}
+
+func (m *Map) IsShared() bool {
+	return m.Shared
+}
+
+func (m *Map) Unload(unpin bool) error {
+	log := logger.GetLogger().With("map", m.Name, "pin", m.PinPath)
 	if !m.PinState.IsLoaded() {
-		log.WithField("count", m.PinState.count).Debug("Refusing to unload map as it is not loaded")
+		log.Debug("Refusing to unload map as it is not loaded", "count", m.PinState.count)
 		return nil
 	}
 	if count := m.PinState.RefDec(); count > 0 {
-		log.WithField("count", count).Debug("Reference exists, not unloading map yet")
+		log.Debug("Reference exists, not unloading map yet", "count", count)
 		return nil
 	}
-	log.Info("map was unloaded")
-	if m.MapHandle != nil {
-		if !option.Config.KeepSensorsOnExit {
-			m.MapHandle.Unpin()
-		}
-		err := m.MapHandle.Close()
-		m.MapHandle = nil
-		return err
+	if m.MapHandle == nil {
+		return nil
 	}
-	return nil
+	log.Debug("map was unloaded")
+	if m.IsShared() && sharedMapDecRef(m.PinPath) && unpin {
+		m.MapHandle.Unpin()
+		DeleteGlobMap(m.Name)
+	} else if m.IsOwner() && unpin {
+		m.MapHandle.Unpin()
+		if m.Type == MapTypeGlobal {
+			DeleteGlobMap(m.Name)
+		}
+	}
+	err := m.MapHandle.Close()
+	m.MapHandle = nil
+	return err
 }
 
 func (m *Map) New(spec *ebpf.MapSpec) error {
@@ -97,31 +324,8 @@ func (m *Map) LoadPinnedMap(path string) error {
 	return err
 }
 
-// MapSpec.Compatible will be exported in ebpf v0.9.3,
-// meanwhile steal that and make it our own ;-)
-func compatible(ms *ebpf.MapSpec, m *ebpf.Map) error {
-	switch {
-	case m.Type() != ms.Type:
-		return fmt.Errorf("expected type %v, got %v: %w", ms.Type, m.Type(), ebpf.ErrMapIncompatible)
-
-	case m.KeySize() != ms.KeySize:
-		return fmt.Errorf("expected key size %v, got %v: %w", ms.KeySize, m.KeySize(), ebpf.ErrMapIncompatible)
-
-	case m.ValueSize() != ms.ValueSize:
-		return fmt.Errorf("expected value size %v, got %v: %w", ms.ValueSize, m.ValueSize(), ebpf.ErrMapIncompatible)
-
-	case !(ms.Type == ebpf.PerfEventArray && ms.MaxEntries == 0) &&
-		m.MaxEntries() != ms.MaxEntries:
-		return fmt.Errorf("expected max entries %v, got %v: %w", ms.MaxEntries, m.MaxEntries(), ebpf.ErrMapIncompatible)
-
-	case m.Flags() != ms.Flags:
-		return fmt.Errorf("expected flags %v, got %v: %w", ms.Flags, m.Flags(), ebpf.ErrMapIncompatible)
-	}
-	return nil
-}
-
 func (m *Map) IsCompatibleWith(spec *ebpf.MapSpec) error {
-	return compatible(spec, m.MapHandle)
+	return spec.Compatible(m.MapHandle)
 }
 
 func (m *Map) Close() error {
@@ -136,20 +340,31 @@ func (m *Map) GetFD() (int, error) {
 }
 
 func (m *Map) LoadOrCreatePinnedMap(pinPath string, mapSpec *ebpf.MapSpec) error {
+	mapSpec = mapSpec.Copy()
+	if m.Configure != nil {
+		if err := m.Configure(mapSpec); err != nil {
+			return fmt.Errorf("configuring map '%s': %w", m.Name, err)
+		}
+	}
+
 	if m.MapHandle != nil {
-		logger.GetLogger().WithFields(logrus.Fields{
-			"map-name": m.Name,
-		}).Warn("LoadOrCreatePinnedMap called with non-nil map, will close and continue.")
+		logger.GetLogger().Warn("LoadOrCreatePinnedMap called with non-nil map, will close and continue.", "map-name", m.Name)
 		m.MapHandle.Close()
 	}
 
-	mh, err := LoadOrCreatePinnedMap(pinPath, mapSpec)
+	mh, err := loadOrCreatePinnedMap(pinPath, mapSpec, m.IsOwner() || m.IsShared(), m.Validate)
 	if err != nil {
 		return err
 	}
 
 	m.MapHandle = mh
 	m.PinState.RefInc()
+	if m.Type == MapTypeGlobal {
+		AddGlobalMap(m.Name)
+	}
+	if m.IsShared() {
+		sharedMapIncRef(m.PinPath)
+	}
 	return nil
 }
 
@@ -158,27 +373,55 @@ func isValidSubdir(d string) bool {
 	return dir != "." && dir != ".."
 }
 
-func LoadOrCreatePinnedMap(pinPath string, mapSpec *ebpf.MapSpec) (*ebpf.Map, error) {
+func LoadOrCreatePinnedMap(pinPath string, mapSpec *ebpf.MapSpec, create bool) (*ebpf.Map, error) {
+	return loadOrCreatePinnedMap(pinPath, mapSpec, create, nil)
+}
+
+func loadOrCreatePinnedMap(
+	pinPath string,
+	mapSpec *ebpf.MapSpec,
+	create bool,
+	validate func(*ebpf.Map, *ebpf.MapSpec) error,
+) (*ebpf.Map, error) {
 	// Try to open the pinPath and if it exist use the previously
 	// pinned map otherwise pin the map and next user will find
 	// it here.
-	if _, err := os.Stat(pinPath); err == nil {
-		m, err := ebpf.LoadPinnedMap(pinPath, nil)
+	m, err := ebpf.LoadPinnedMap(pinPath, nil)
+	if err == nil {
+		err = mapSpec.Compatible(m)
+		if err == nil && validate != nil {
+			err = validate(m, mapSpec)
+		}
 		if err != nil {
-			return nil, fmt.Errorf("loading pinned map from path '%s' failed: %w", pinPath, err)
-		}
-		if err := compatible(mapSpec, m); err != nil {
-			logger.GetLogger().WithError(err).WithFields(logrus.Fields{
-				"path":     pinPath,
-				"map-name": mapSpec.Name,
-			}).Warn("tetragon, incompatible map found: will delete and recreate")
+			logger.GetLogger().Warn("incompatible map found", logfields.Error, err,
+				"path", pinPath,
+				"map-name", mapSpec.Name)
 			m.Close()
-			os.Remove(pinPath)
-		} else {
-			return m, nil
+			// If we are creating the map, let's ignore the compatibility error,
+			// remove the pin and create the map with our spec.
+			if create {
+				logger.GetLogger().Warn("will delete and recreate", "map", mapSpec.Name)
+				os.Remove(pinPath)
+				return createPinnedMap(pinPath, mapSpec, validate)
+			}
+			return nil, fmt.Errorf("incompatible map '%s': %w", pinPath, err)
 		}
+		return m, nil
 	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("loading pinned map from path '%s' failed: %w", pinPath, err)
+	}
+	if create {
+		return createPinnedMap(pinPath, mapSpec, validate)
+	}
+	return nil, err
+}
 
+func createPinnedMap(
+	pinPath string,
+	mapSpec *ebpf.MapSpec,
+	validate func(*ebpf.Map, *ebpf.MapSpec) error,
+) (*ebpf.Map, error) {
 	// check if PinName has directory portion and create it,
 	// filepath.Dir returns '.' for filename without dir portion
 	if dir := filepath.Dir(pinPath); isValidSubdir(dir) {
@@ -193,6 +436,12 @@ func LoadOrCreatePinnedMap(pinPath string, mapSpec *ebpf.MapSpec) (*ebpf.Map, er
 		return nil, fmt.Errorf("failed to create map '%s': %w", mapSpec.Name, err)
 	}
 
+	if validate != nil {
+		if err := validate(m, mapSpec); err != nil {
+			m.Close()
+			return nil, fmt.Errorf("validating newly created map '%s': %w", mapSpec.Name, err)
+		}
+	}
 	if err := m.Pin(pinPath); err != nil {
 		m.Close()
 		return nil, fmt.Errorf("failed to pin to %s: %w", pinPath, err)
@@ -201,12 +450,21 @@ func LoadOrCreatePinnedMap(pinPath string, mapSpec *ebpf.MapSpec) (*ebpf.Map, er
 	return m, nil
 }
 
-func (m *Map) SetMaxEntries(max int) {
-	m.Entries = MaxEntries{uint32(max), true}
+func GetMaxEntriesPinnedMap(pinPath string) (uint32, error) {
+	m, err := ebpf.LoadPinnedMap(pinPath, nil)
+	if err != nil {
+		return 0, fmt.Errorf("loading pinned map from path '%s' failed: %w", pinPath, err)
+	}
+	defer m.Close()
+	return m.MaxEntries(), nil
 }
 
-func (m *Map) SetInnerMaxEntries(max int) {
-	m.InnerEntries = MaxEntries{uint32(max), true}
+func (m *Map) SetMaxEntries(maximum int) {
+	m.Entries = MaxEntries{uint32(maximum), true}
+}
+
+func (m *Map) SetInnerMaxEntries(maximum int) {
+	m.InnerEntries = MaxEntries{uint32(maximum), true}
 }
 
 func (m *Map) GetMaxEntries() (uint32, bool) {

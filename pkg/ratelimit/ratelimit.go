@@ -8,20 +8,21 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/time/rate"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/encoder"
 	"github.com/cilium/tetragon/pkg/logger"
-	"github.com/cilium/tetragon/pkg/metrics/ratelimitmetrics"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
 	"github.com/cilium/tetragon/pkg/reader/node"
-	"golang.org/x/time/rate"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type RateLimiter struct {
 	*rate.Limiter
 	ctx            context.Context
 	reportInterval time.Duration
-	dropped        uint64 // accessed atomically
+	dropped        atomic.Uint64
 }
 
 // getLimit converts an numEvents and interval to rate.Limit which is a floating point value
@@ -38,10 +39,9 @@ func NewRateLimiter(ctx context.Context, interval time.Duration, numEvents int, 
 		return nil
 	}
 	r := &RateLimiter{
-		rate.NewLimiter(getLimit(numEvents, interval), numEvents),
-		ctx,
-		interval, // TODO(tk): use a separate interval for reporting?
-		0,
+		Limiter:        rate.NewLimiter(getLimit(numEvents, interval), numEvents),
+		ctx:            ctx,
+		reportInterval: interval, // TODO(tk): use a separate interval for reporting?
 	}
 	go r.reportRateLimitInfo(encoder)
 	return r
@@ -52,22 +52,21 @@ func (r *RateLimiter) reportRateLimitInfo(encoder encoder.EventEncoder) {
 	for {
 		select {
 		case <-ticker.C:
-			dropped := atomic.SwapUint64(&r.dropped, 0)
+			dropped := r.dropped.Swap(0)
 			if dropped > 0 {
-				err := encoder.Encode(&tetragon.GetEventsResponse{
+				ev := tetragon.GetEventsResponse{
 					Event: &tetragon.GetEventsResponse_RateLimitInfo{
 						RateLimitInfo: &tetragon.RateLimitInfo{
 							NumberOfDroppedProcessEvents: dropped,
 						},
 					},
-					NodeName: node.GetNodeNameForExport(),
-					Time:     timestamppb.New(time.Now()),
-				})
+					Time: timestamppb.New(time.Now()),
+				}
+				node.SetCommonFields(&ev)
+				err := encoder.Encode(&ev)
 				if err != nil {
 					logger.GetLogger().
-						WithError(err).
-						WithField("dropped", dropped).
-						Warn("Failed to encode rate_limit_info event")
+						Warn("Failed to encode rate_limit_info event", "dropped", dropped, logfields.Error, err)
 				}
 			}
 		case <-r.ctx.Done():
@@ -77,6 +76,5 @@ func (r *RateLimiter) reportRateLimitInfo(encoder encoder.EventEncoder) {
 }
 
 func (r *RateLimiter) Drop() {
-	atomic.AddUint64(&r.dropped, 1)
-	ratelimitmetrics.RateLimitDropped.Inc()
+	r.dropped.Add(1)
 }

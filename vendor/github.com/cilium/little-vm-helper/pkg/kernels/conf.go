@@ -10,7 +10,7 @@ import (
 	"path"
 	"time"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/little-vm-helper/pkg/slogger"
 )
 
 // ConfigOption are switches passed to scripts/config in a kernel dir
@@ -25,6 +25,9 @@ type KernelConf struct {
 	Opts []ConfigOption `json:"opts,omitempty"`
 	// Extra make args
 	ExtraMakeArgs []string `json:"extra_make_args,omitempty"`
+
+	// parsed URL
+	url KernelURL
 }
 
 type Conf struct {
@@ -134,7 +137,7 @@ func GetConfigGroupNames() []string {
 	return ret
 }
 
-func (cnf *Conf) SaveTo(log logrus.FieldLogger, dir string, backup bool) error {
+func (cnf *Conf) SaveTo(log slogger.Logger, dir string, backup bool) error {
 	fname := path.Join(dir, ConfigFname)
 	confb, err := json.MarshalIndent(cnf, "", "    ")
 	if err != nil {
@@ -164,8 +167,21 @@ func (cnf *Conf) SaveTo(log logrus.FieldLogger, dir string, backup bool) error {
 }
 
 func (kc *KernelConf) Validate() error {
-	_, err := ParseURL(kc.URL)
+	_, err := kc.KernelURL()
 	return err
+}
+
+func (kc *KernelConf) KernelURL() (url KernelURL, err error) {
+	if kc.url != nil {
+		url = kc.url
+		return
+	}
+
+	url, err = ParseURL(kc.URL)
+	if err == nil {
+		kc.url = url
+	}
+	return
 }
 
 func (kc *KernelConf) AddGroupsOpts(gs ...string) error {

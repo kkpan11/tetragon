@@ -4,7 +4,6 @@
 package testutils
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,7 +14,7 @@ import (
 // GetSpecFromTemplate creates a file bsed on the given template
 func GetSpecFromTemplate(
 	tmplname string,
-	data interface{},
+	data any,
 ) (string, error) {
 	_, testFname, _, _ := runtime.Caller(0)
 	fname := filepath.Join(filepath.Dir(testFname), "..", "..", "testdata", "specs", tmplname)
@@ -24,7 +23,7 @@ func GetSpecFromTemplate(
 		return "", err
 	}
 
-	tmpFilePattern := fmt.Sprintf("%s-*.yaml", strings.TrimSuffix(tmplname, ".yaml.tmpl"))
+	tmpFilePattern := strings.TrimSuffix(tmplname, ".yaml.tmpl") + "-*.yaml"
 	tmpF, err := os.CreateTemp("", tmpFilePattern)
 	if err != nil {
 		return "", err

@@ -5,13 +5,10 @@ package procevents
 
 import (
 	"bytes"
-	"fmt"
-	"os"
-	"path/filepath"
+	"encoding/hex"
 	"strings"
 
 	"github.com/cilium/tetragon/pkg/api/processapi"
-	"github.com/cilium/tetragon/pkg/option"
 )
 
 const (
@@ -38,6 +35,16 @@ func ProcsContainerIdOffset(subdir string) (string, int) {
 	s := strings.Split(idStr, "-")
 
 	return s[len(s)-1], off + p
+}
+
+// isHexString checks if a string contains only valid hexadecimal characters
+// using the standard library's hex.DecodeString which validates the input
+func isHexString(s string) bool {
+	if len(s) == 0 || len(s)%2 != 0 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
 }
 
 // LookupContainerId returns the container ID as a 31 character string length from the full cgroup path
@@ -93,6 +100,13 @@ func LookupContainerId(cgroup string, bpfSource bool, walkParent bool) (string, 
 		return container[:BpfContainerIdLength], i
 	}
 
+	// Plain Docker: Check if the last path component is a valid 64-char hex ID
+	// This handles cgroup paths like "/docker/<hex-id>" or cgroup v2 paths
+	// that end with just the container ID without any prefix
+	if len(container) >= ContainerIdLength && isHexString(container[:ContainerIdLength]) {
+		return container[:BpfContainerIdLength], i
+	}
+
 	// Podman may set the last subdir to 'container' so let's walk parent subdir
 	if strings.Contains(cgroup, "libpod") && container == "container" {
 		walkParent = true
@@ -113,6 +127,10 @@ func LookupContainerId(cgroup string, bpfSource bool, walkParent bool) (string, 
 			// will get here.
 			return container[:BpfContainerIdLength], i
 		}
+		// Plain Docker: Check if the parent component is a valid 64-char hex ID
+		if len(container) >= ContainerIdLength && isHexString(container[:ContainerIdLength]) {
+			return container[:BpfContainerIdLength], i
+		}
 	}
 
 	return "", 0
@@ -126,8 +144,8 @@ func procsFilename(args []byte) (string, string) {
 }
 
 func procsFindDockerId(cgroups string) (string, int) {
-	cgrpPaths := strings.Split(cgroups, "\n")
-	for _, s := range cgrpPaths {
+	cgrpPaths := strings.SplitSeq(cgroups, "\n")
+	for s := range cgrpPaths {
 		if strings.Contains(s, "pods") || strings.Contains(s, "docker") ||
 			strings.Contains(s, "libpod") {
 			// Get the container ID and the offset
@@ -136,21 +154,17 @@ func procsFindDockerId(cgroups string) (string, int) {
 				return container, i
 			}
 		}
+		// In some environments, such as the GitHub Ubuntu CI runner, docker cgroups do not contain the docker keyword but do end with a hex ID in their last component. Fall back to a naive approach here to handle that case.
+		components := strings.Split(s, "/")
+		if len(components) > 0 {
+			id := components[len(components)-1]
+			_, err := hex.DecodeString(id)
+			if err == nil {
+				if len(id) >= 31 {
+					return id[:31], len(strings.Join(components[:len(components)-1], "")) + 1
+				}
+			}
+		}
 	}
 	return "", 0
-}
-
-// procDockerId reads the pid cgroup from proc and returns the container ID.
-// pid argument is the pid of the target process
-// Returns the container ID and nil on success, or an empty string if it fails to identify
-// the container ID or if an error happens. If the pid is unavailable, an error will be
-// returned.
-func procsDockerId(pid uint32) (string, error) {
-	pidstr := fmt.Sprint(pid)
-	cgroups, err := os.ReadFile(filepath.Join(option.Config.ProcFS, pidstr, "cgroup"))
-	if err != nil {
-		return "", err
-	}
-	off, _ := procsFindDockerId(string(cgroups))
-	return off, nil
 }

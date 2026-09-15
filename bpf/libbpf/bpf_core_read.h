@@ -163,7 +163,7 @@ enum bpf_type_info_kind {
  * argument.
  */
 #define bpf_core_read_str(dst, sz, src)					    \
-	bpf_probe_read_str(dst, sz,					    \
+	probe_read_str(dst, sz,					    \
 			   (const void *)__builtin_preserve_access_index(src))
 
 #define ___concat(a, b) a ## b
@@ -217,7 +217,13 @@ enum bpf_type_info_kind {
 #define ___arrow10(a, b, c, d, e, f, g, h, i, j) a->b->c->d->e->f->g->h->i->j
 #define ___arrow(...) ___apply(___arrow, ___narg(__VA_ARGS__))(__VA_ARGS__)
 
+#if defined(__clang__) && (__clang_major__ >= 19)
+#define ___type(...) __typeof_unqual__(___arrow(__VA_ARGS__))
+#elif defined(__GNUC__) && (__GNUC__ >= 14)
+#define ___type(...) __typeof_unqual__(___arrow(__VA_ARGS__))
+#else
 #define ___type(...) typeof(___arrow(__VA_ARGS__))
+#endif
 
 #define ___read(read_fn, dst, src_type, src, accessor)			    \
 	read_fn((void *)(dst), sizeof(*(dst)), &((src_type)(src))->accessor)
@@ -297,6 +303,22 @@ enum bpf_type_info_kind {
 		BPF_CORE_READ_INTO(&__r, src, a, ##__VA_ARGS__);	    \
 		__r;							    \
 	})
+
+#if defined(__clang__)
+#define bpf_ksym_exists(sym) ({                                         \
+	_Static_assert(!__builtin_constant_p(!!sym),                    \
+		       #sym " should be marked as __weak");             \
+	!!sym;                                                          \
+})
+#elif __GNUC__ > 8
+#define bpf_ksym_exists(sym) ({                                         \
+	_Static_assert(__builtin_has_attribute(*sym, __weak__),         \
+		       #sym " should be marked as __weak");             \
+	!!sym;                                                          \
+})
+#else
+#define bpf_ksym_exists(sym) !!sym
+#endif
 
 #endif
 

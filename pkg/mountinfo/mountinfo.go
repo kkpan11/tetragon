@@ -17,6 +17,7 @@ const (
 	FilesystemTypeBPFFS   = "bpf"
 	FilesystemTypeCgroup2 = "cgroup2"
 	FilesystemTypeDebugFS = "debugfs"
+	FilesystemTypeTraceFS = "tracefs"
 
 	mountInfoFilepath = "/proc/self/mountinfo"
 )
@@ -108,7 +109,7 @@ func parseMountInfoFile(r io.Reader) ([]*MountInfo, error) {
 func GetMountInfo() ([]*MountInfo, error) {
 	fMounts, err := os.Open(mountInfoFilepath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open mount information at %s: %s", mountInfoFilepath, err)
+		return nil, fmt.Errorf("failed to open mount information at %s: %w", mountInfoFilepath, err)
 	}
 	defer fMounts.Close()
 

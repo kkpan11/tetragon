@@ -11,9 +11,10 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/cilium/tetragon/api/v1/tetragon"
 	fieldmask_utils "github.com/mennanov/fieldmask-utils"
 	"google.golang.org/protobuf/reflect/protoreflect"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
 )
 
 func ParseFieldFilterList(filters string) ([]*tetragon.FieldFilter, error) {
@@ -25,7 +26,10 @@ func ParseFieldFilterList(filters string) ([]*tetragon.FieldFilter, error) {
 	// fields is in snake_case and we don't want to create confusion. So we can use a JSON
 	// marshalling hack to convert the field names to their camelCase representation
 	// before unmarshalling here.
-	filters = fixupFieldFilterString(filters)
+	filters, err := fixupFieldFilterString(filters)
+	if err != nil {
+		return nil, err
+	}
 	dec := json.NewDecoder(strings.NewReader(filters))
 	var results []*tetragon.FieldFilter
 	for {
@@ -63,16 +67,19 @@ func fixupSnakeCaseString(s string, upper bool) string {
 
 // Fixes up a field filter's string representation so that protobuf can unmarshal it from
 // JSON.
-func fixupFieldFilterString(s string) string {
+func fixupFieldFilterString(s string) (string, error) {
 	builder := &strings.Builder{}
 	dec := json.NewDecoder(strings.NewReader(s))
 	enc := json.NewEncoder(builder)
 
 	for {
-		var dat map[string]interface{}
+		var dat map[string]any
 		err := dec.Decode(&dat)
 		if err != nil {
-			break
+			if err == io.EOF {
+				break
+			}
+			return "", err
 		}
 
 		var fields string
@@ -80,14 +87,14 @@ func fixupFieldFilterString(s string) string {
 
 		fields, ok = dat["fields"].(string)
 		if !ok {
-			return s
+			return s, nil
 		}
 
 		dat["fields"] = fixupSnakeCaseString(fields, false)
 		enc.Encode(&dat)
 	}
 
-	return builder.String()
+	return builder.String(), nil
 }
 
 // FieldFilter is a helper for filtering fields in events
@@ -230,7 +237,7 @@ func (f *FieldFilter) Filter(event *tetragon.GetEventsResponse) (*tetragon.GetEv
 	})
 
 	if !src.IsValid() {
-		return nil, fmt.Errorf("invalid event after field filter")
+		return nil, errors.New("invalid event after field filter")
 	}
 
 	return dst.Interface().(*tetragon.GetEventsResponse), errors.Join(filterErrs...)

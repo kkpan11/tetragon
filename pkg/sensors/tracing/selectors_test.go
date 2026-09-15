@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 // NB(kkourt): Function(t *testing.T, ctx context.Context) is the reasonable
@@ -10,11 +12,19 @@ package tracing
 import (
 	"context"
 	"fmt"
+	"os/exec"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/cilium/tetragon/pkg/api/tracingapi"
 	"github.com/cilium/tetragon/pkg/arch"
+	"github.com/cilium/tetragon/pkg/config"
 	"github.com/cilium/tetragon/pkg/grpc/tracing"
 	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
 	"github.com/cilium/tetragon/pkg/logger"
@@ -24,16 +34,11 @@ import (
 	"github.com/cilium/tetragon/pkg/policyfilter"
 	"github.com/cilium/tetragon/pkg/reader/notify"
 	"github.com/cilium/tetragon/pkg/sensors"
-	"github.com/cilium/tetragon/pkg/sensors/base"
 	testsensor "github.com/cilium/tetragon/pkg/sensors/test"
 	"github.com/cilium/tetragon/pkg/testutils"
 	"github.com/cilium/tetragon/pkg/testutils/perfring"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
 	"github.com/cilium/tetragon/pkg/tracingpolicy"
-	"github.com/google/go-cmp/cmp"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // loadGenericSensorTest loads a tracing sensor for testing
@@ -46,6 +51,10 @@ func loadGenericSensorTest(t *testing.T, spec *v1alpha1.TracingPolicySpec) *sens
 		Metadata: v1.ObjectMeta{Name: "name"},
 		Spec:     *spec,
 	}
+
+	tus.LoadInitialSensor(t)
+	tus.LoadSensor(t, testsensor.GetTestSensor())
+
 	ret, err := sensors.SensorsFromPolicy(tp, policyfilter.NoFilterID)
 	if err != nil {
 		t.Fatalf("GetSensorsFromParserPolicy failed: %v", err)
@@ -54,8 +63,6 @@ func loadGenericSensorTest(t *testing.T, spec *v1alpha1.TracingPolicySpec) *sens
 	}
 	tpSensor := ret[0]
 	option.Config.HubbleLib = tus.Conf().TetragonLib
-	tus.LoadSensor(t, base.GetInitialSensor())
-	tus.LoadSensor(t, testsensor.GetTestSensor())
 	tus.LoadSensor(t, tpSensor)
 	return tpSensor.(*sensors.Sensor)
 }
@@ -157,12 +164,12 @@ var testCases = []struct {
 //
 // As other tracepoint tests, it uses the lseek system call with a bogus whence value.
 func TestTracepointSelectors(t *testing.T) {
-	testutils.CaptureLog(t, logger.GetLogger().(*logrus.Logger))
+	testutils.CaptureLog(t, logger.GetLogger())
 	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
 	defer cancel()
 
 	// The whence argument has a 7 index, see:
-	// # cat /sys/kernel/debug/tracing/events/syscalls/sys_enter_lseek/format
+	// # cat /sys/kernel/tracing/events/syscalls/sys_enter_lseek/format
 	// name: sys_enter_lseek
 	// ID: 698
 	// format:
@@ -231,7 +238,7 @@ func TestTracepointSelectors(t *testing.T) {
 	for _, tcs := range testCases {
 		tName := fmt.Sprintf("spec:%s%v", tcs.specOperator, tcs.specFilterVals)
 		t.Run(tName, func(t *testing.T) {
-			testutils.CaptureLog(t, logger.GetLogger().(*logrus.Logger))
+			testutils.CaptureLog(t, logger.GetLogger())
 			t.Logf("Running %s", tName)
 			t0 := time.Now()
 			spec := makeSpec(t, tcs.specFilterVals, tcs.specOperator)
@@ -259,7 +266,7 @@ func selectorsFromWhenceVals(t *testing.T, filterWhenceVals [][]int, whenceIdx u
 	for _, whenceVals := range filterWhenceVals {
 		whences := make([]string, len(whenceVals))
 		for i := range whenceVals {
-			whences[i] = fmt.Sprintf("%d", whenceVals[i])
+			whences[i] = strconv.Itoa(whenceVals[i])
 		}
 		sels = append(sels, v1alpha1.KProbeSelector{
 			MatchPIDs: myPidMatchPIDs,
@@ -283,7 +290,7 @@ func selectorsFromWhenceVals(t *testing.T, filterWhenceVals [][]int, whenceIdx u
 }
 
 func TestKprobeSelectors(t *testing.T) {
-	testutils.CaptureLog(t, logger.GetLogger().(*logrus.Logger))
+	testutils.CaptureLog(t, logger.GetLogger())
 	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
 	defer cancel()
 
@@ -354,7 +361,7 @@ func TestKprobeSelectors(t *testing.T) {
 	for _, tcs := range testCases {
 		tName := fmt.Sprintf("spec:%s%v", tcs.specOperator, tcs.specFilterVals)
 		t.Run(tName, func(t *testing.T) {
-			testutils.CaptureLog(t, logger.GetLogger().(*logrus.Logger))
+			testutils.CaptureLog(t, logger.GetLogger())
 			t.Logf("Running %s", tName)
 
 			t0 := time.Now()
@@ -369,4 +376,146 @@ func TestKprobeSelectors(t *testing.T) {
 		})
 	}
 
+}
+
+func TestMultipleInactiveSelectors(t *testing.T) {
+	testutils.CaptureLog(t, logger.GetLogger())
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	mypid := int(observertesthelper.GetMyPid())
+	t.Logf("filtering for my pid (%d)", mypid)
+	myPidMatchPIDs := []v1alpha1.PIDSelector{{
+		Operator:       "In",
+		IsNamespacePID: false,
+		FollowForks:    true,
+		Values:         []uint32{uint32(mypid)},
+	}}
+
+	unmatchedSelector := v1alpha1.KProbeSelector{
+		MatchPIDs: myPidMatchPIDs,
+		MatchBinaries: []v1alpha1.BinarySelector{{
+			Operator: "In",
+			Values:   []string{"nosuchbinaryexists"},
+		}},
+		MatchActions: []v1alpha1.ActionSelector{{
+			Action: "noPost",
+		}},
+	}
+
+	spec := &v1alpha1.TracingPolicySpec{
+		KProbes: []v1alpha1.KProbeSpec{{
+			Call:    "sys_lseek",
+			Syscall: true,
+			Args: []v1alpha1.KProbeArg{{
+				Index: 2,
+				Type:  "int",
+			}},
+			Selectors: []v1alpha1.KProbeSelector{
+				unmatchedSelector,
+				unmatchedSelector,
+				{MatchPIDs: myPidMatchPIDs},
+			},
+		}},
+	}
+
+	eventCounter := 0
+	loadGenericSensorTest(t, spec)
+	perfring.RunTest(t, ctx,
+		func() {
+			t.Logf("Calling lseek(-1,0,555)")
+			unix.Seek(-1, 0, 5555)
+		},
+		func(ev notify.Message) error {
+			if kpEvent, ok := ev.(*tracing.MsgGenericKprobeUnix); ok {
+				if kpEvent.FuncName != arch.AddSyscallPrefixTestHelper(t, "sys_lseek") {
+					return fmt.Errorf("unexpected kprobe event, func:%s", kpEvent.FuncName)
+				}
+				if len(kpEvent.Args) != 1 {
+					return fmt.Errorf("unexpected kprobe arguments: %+v", kpEvent.Args)
+				}
+				whenceArg, ok := kpEvent.Args[0].(tracingapi.MsgGenericKprobeArgInt)
+				if !ok {
+					return fmt.Errorf("unexpected kprobe arguments %+v", kpEvent.Args[0])
+				}
+
+				whence := uint64(whenceArg.Value)
+				// the test sensor also uses the same trick: an lseek call with a
+				// bogus whence value. Ignore those events
+				if whence == uint64(testsensor.BogusWhenceVal) {
+					return nil
+				}
+
+				eventCounter++
+			}
+			return nil
+		},
+	)
+
+	require.Equal(t, 1, eventCounter)
+
+}
+
+func TestMatchCmdArgs(t *testing.T) {
+	if !config.EnableLargeProgs() {
+		t.Skip("matchCmdArgs requires large BPF programs")
+	}
+
+	testutils.CaptureLog(t, logger.GetLogger())
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	const event = "sys_enter_getcpu"
+	loadGenericSensorTest(t, &v1alpha1.TracingPolicySpec{
+		Tracepoints: []v1alpha1.TracepointSpec{
+			{
+				Subsystem: "syscalls",
+				Event:     event,
+				Selectors: []v1alpha1.KProbeSelector{
+					{
+						MatchCmdArgs: []v1alpha1.CmdArgSelector{
+							{
+								Index:    1,
+								Operator: "Equal",
+								Values:   []string{"download"},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	var matchedPID, wrongIndexPID uint32
+	var matchedEvents, wrongIndexEvents int
+	getcpu := testutils.RepoRootPath("contrib/tester-progs/getcpu")
+	ops := func() {
+		matched := exec.CommandContext(ctx, getcpu, "ignored", "download")
+		require.NoError(t, matched.Start())
+		matchedPID = uint32(matched.Process.Pid)
+		require.NoError(t, matched.Wait())
+
+		wrongIndex := exec.CommandContext(ctx, getcpu, "download", "ignored")
+		require.NoError(t, wrongIndex.Start())
+		wrongIndexPID = uint32(wrongIndex.Process.Pid)
+		require.NoError(t, wrongIndex.Wait())
+	}
+	eventFn := func(msg notify.Message) error {
+		tracepoint, ok := msg.(*tracing.MsgGenericTracepointUnix)
+		if !ok || tracepoint.Event != event {
+			return nil
+		}
+
+		switch tracepoint.Msg.ProcessKey.Pid {
+		case matchedPID:
+			matchedEvents++
+		case wrongIndexPID:
+			wrongIndexEvents++
+		}
+		return nil
+	}
+
+	perfring.RunTest(t, ctx, ops, eventFn)
+	require.Equal(t, 1, matchedEvents)
+	require.Zero(t, wrongIndexEvents)
 }

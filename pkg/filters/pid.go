@@ -5,31 +5,26 @@ package filters
 
 import (
 	"context"
+	"slices"
 
-	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
-	hubbleFilters "github.com/cilium/cilium/pkg/hubble/filters"
 	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/event"
 )
 
-func filterByPid(pids []uint32) hubbleFilters.FilterFunc {
-	return func(ev *v1.Event) bool {
+func filterByPid(pids []uint32) FilterFunc {
+	return func(ev *event.Event) bool {
 		process := GetProcess(ev)
 		if process == nil {
 			return false
 		}
-		for _, pid := range pids {
-			if pid == process.Pid.GetValue() {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(pids, process.Pid.GetValue())
 	}
 }
 
 type PidFilter struct{}
 
-func (f *PidFilter) OnBuildFilter(_ context.Context, ff *tetragon.Filter) ([]hubbleFilters.FilterFunc, error) {
-	var fs []hubbleFilters.FilterFunc
+func (f *PidFilter) OnBuildFilter(_ context.Context, ff *tetragon.Filter) ([]FilterFunc, error) {
+	var fs []FilterFunc
 	if ff.Pid != nil {
 		fs = append(fs, filterByPid(ff.Pid))
 	}

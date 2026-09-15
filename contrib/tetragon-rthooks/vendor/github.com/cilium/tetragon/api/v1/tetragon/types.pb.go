@@ -29,6 +29,12 @@ type ParentEvent interface {
 	SetParent(p *Process)
 }
 
+// AncestorEvent represents a Tetragon event that has an Ancestor field
+type AncestorEvent interface {
+	Event
+	SetAncestors(ps []*Process)
+}
+
 // Encapsulate implements the Event interface.
 // Returns the event wrapped by its GetEventsResponse_* type.
 func (event *ProcessExec) Encapsulate() IsGetEventsResponse_Event {
@@ -47,6 +53,12 @@ func (event *ProcessExec) SetProcess(p *Process) {
 // Sets the Parent field of an event.
 func (event *ProcessExec) SetParent(p *Process) {
 	event.Parent = p
+}
+
+// SetAncestors implements the AncestorEvent interface.
+// Sets the Ancestor field of an event.
+func (event *ProcessExec) SetAncestors(ps []*Process) {
+	event.Ancestors = ps
 }
 
 // Encapsulate implements the Event interface.
@@ -69,6 +81,12 @@ func (event *ProcessExit) SetParent(p *Process) {
 	event.Parent = p
 }
 
+// SetAncestors implements the AncestorEvent interface.
+// Sets the Ancestor field of an event.
+func (event *ProcessExit) SetAncestors(ps []*Process) {
+	event.Ancestors = ps
+}
+
 // Encapsulate implements the Event interface.
 // Returns the event wrapped by its GetEventsResponse_* type.
 func (event *ProcessKprobe) Encapsulate() IsGetEventsResponse_Event {
@@ -87,6 +105,12 @@ func (event *ProcessKprobe) SetProcess(p *Process) {
 // Sets the Parent field of an event.
 func (event *ProcessKprobe) SetParent(p *Process) {
 	event.Parent = p
+}
+
+// SetAncestors implements the AncestorEvent interface.
+// Sets the Ancestor field of an event.
+func (event *ProcessKprobe) SetAncestors(ps []*Process) {
+	event.Ancestors = ps
 }
 
 // Encapsulate implements the Event interface.
@@ -109,6 +133,12 @@ func (event *ProcessTracepoint) SetParent(p *Process) {
 	event.Parent = p
 }
 
+// SetAncestors implements the AncestorEvent interface.
+// Sets the Ancestor field of an event.
+func (event *ProcessTracepoint) SetAncestors(ps []*Process) {
+	event.Ancestors = ps
+}
+
 // Encapsulate implements the Event interface.
 // Returns the event wrapped by its GetEventsResponse_* type.
 func (event *ProcessUprobe) Encapsulate() IsGetEventsResponse_Event {
@@ -127,6 +157,64 @@ func (event *ProcessUprobe) SetProcess(p *Process) {
 // Sets the Parent field of an event.
 func (event *ProcessUprobe) SetParent(p *Process) {
 	event.Parent = p
+}
+
+// SetAncestors implements the AncestorEvent interface.
+// Sets the Ancestor field of an event.
+func (event *ProcessUprobe) SetAncestors(ps []*Process) {
+	event.Ancestors = ps
+}
+
+// Encapsulate implements the Event interface.
+// Returns the event wrapped by its GetEventsResponse_* type.
+func (event *ProcessUsdt) Encapsulate() IsGetEventsResponse_Event {
+	return &GetEventsResponse_ProcessUsdt{
+		ProcessUsdt: event,
+	}
+}
+
+// SetProcess implements the ProcessEvent interface.
+// Sets the Process field of an event.
+func (event *ProcessUsdt) SetProcess(p *Process) {
+	event.Process = p
+}
+
+// SetParent implements the ParentEvent interface.
+// Sets the Parent field of an event.
+func (event *ProcessUsdt) SetParent(p *Process) {
+	event.Parent = p
+}
+
+// SetAncestors implements the AncestorEvent interface.
+// Sets the Ancestor field of an event.
+func (event *ProcessUsdt) SetAncestors(ps []*Process) {
+	event.Ancestors = ps
+}
+
+// Encapsulate implements the Event interface.
+// Returns the event wrapped by its GetEventsResponse_* type.
+func (event *ProcessLsm) Encapsulate() IsGetEventsResponse_Event {
+	return &GetEventsResponse_ProcessLsm{
+		ProcessLsm: event,
+	}
+}
+
+// SetProcess implements the ProcessEvent interface.
+// Sets the Process field of an event.
+func (event *ProcessLsm) SetProcess(p *Process) {
+	event.Process = p
+}
+
+// SetParent implements the ParentEvent interface.
+// Sets the Parent field of an event.
+func (event *ProcessLsm) SetParent(p *Process) {
+	event.Parent = p
+}
+
+// SetAncestors implements the AncestorEvent interface.
+// Sets the Ancestor field of an event.
+func (event *ProcessLsm) SetAncestors(ps []*Process) {
+	event.Ancestors = ps
 }
 
 // Encapsulate implements the Event interface.
@@ -149,6 +237,18 @@ func (event *ProcessLoader) Encapsulate() IsGetEventsResponse_Event {
 // Sets the Process field of an event.
 func (event *ProcessLoader) SetProcess(p *Process) {
 	event.Process = p
+}
+
+// SetParent implements the ParentEvent interface.
+// Sets the Parent field of an event.
+func (event *ProcessLoader) SetParent(p *Process) {
+	event.Parent = p
+}
+
+// SetAncestors implements the AncestorEvent interface.
+// Sets the Ancestor field of an event.
+func (event *ProcessLoader) SetAncestors(ps []*Process) {
+	event.Ancestors = ps
 }
 
 // Encapsulate implements the Event interface.
@@ -184,6 +284,10 @@ func UnwrapGetEventsResponse(response *GetEventsResponse) interface{} {
 		return ev.ProcessTracepoint
 	case *GetEventsResponse_ProcessUprobe:
 		return ev.ProcessUprobe
+	case *GetEventsResponse_ProcessUsdt:
+		return ev.ProcessUsdt
+	case *GetEventsResponse_ProcessLsm:
+		return ev.ProcessLsm
 	case *GetEventsResponse_Test:
 		return ev.Test
 	case *GetEventsResponse_ProcessLoader:

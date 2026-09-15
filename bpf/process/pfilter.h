@@ -1,9 +1,13 @@
 #ifndef __PFILTER_H__
 #define __PFILTER_H__
 
+#include "bpf_process_event.h"
+#include "policy_filter.h"
+#include "types/basic.h"
+#include "caller_filter.h"
+
 /**
- * Process filters
- * see generic_process_filter below
+ * Process filters (see generic_process_filter)
  */
 
 #define FIND_PIDSET(value, isns)                                          \
@@ -135,8 +139,8 @@ process_filter_pid(struct selector_filter *sf, __u32 *f,
 	else {
 		__u64 o = (__u64)off;
 		o = o / 4;
-		asm volatile("%[o] &= 0x3ff;\n" ::[o] "+r"(o)
-			     :);
+		asm volatile("%[o] &= 0x3ff;\n"
+			     : [o] "+r"(o));
 		sel = f[o];
 	}
 	return __process_filter_pid(sf->ty, sf->flags, sel, pid, enter);
@@ -157,8 +161,8 @@ process_filter_namespace(struct selector_filter *sf, __u32 *f,
 	else {
 		__u64 o = (__u64)off;
 		o = o / 4;
-		asm volatile("%[o] &= 0x3ff;\n" ::[o] "+r"(o)
-			     :);
+		asm volatile("%[o] &= 0x3ff;\n"
+			     : [o] "+r"(o));
 		sel = f[o];
 	}
 
@@ -281,6 +285,13 @@ process_filter_capability_change(__u32 ty, __u32 op, __u32 ns, __u64 val,
 		return PFILTER_REJECT;
 
 	icaps = init->caps.c[ty];
+
+	// When compiling bpf_generic_kprobe_v53.o with clang-18 and loading it on
+	// 5.4.278, the verifier complains than ty could be negative while in this
+	// context it's just the capability set type (effective, inheritable, or
+	// permitted), let's blindly remind the verifier it's a u32.
+	asm volatile("%[ty] &= 0xffffffff;\n"
+		     : [ty] "+r"(ty));
 	ccaps = c->c[ty];
 
 	/* we have a change in the capabilities that we care */
@@ -307,22 +318,38 @@ selector_match(__u32 *f, struct selector_filter *sel,
 				     struct execve_map_value *, struct msg_ns *,
 				     struct msg_capabilities *))
 {
-	int res1 = 0, res2 = 0, res3 = 0, res4 = 0;
+	int res[MAX_SELECTOR_VALUES] = { 0 };
 	__u32 index = sel->index;
 	__u64 len = sel->len;
 	__u64 ty = sel->ty;
+	__u64 i;
+
+	if (len > MAX_SELECTOR_VALUES)
+		len = MAX_SELECTOR_VALUES;
 
 	/* For NotIn op we AND results so default to 1 so we fallthru open */
-	if (ty == op_filter_notin)
-		res1 = res2 = res3 = res4 = 1;
+	if (ty == op_filter_notin) {
+#pragma unroll
+		for (i = 0; i < MAX_SELECTOR_VALUES; i++)
+			res[i] = 1;
+	}
 
+	/* Updating the number of iterations below, you should also
+	 * update the function namespaceSelectorValue() in kernel.go
+	 */
+#ifdef __LARGE_BPF_PROG
+	for (i = 0; i < len; i++) {
+		if (i > (MAX_SELECTOR_VALUES - 1)) // we need to make the verifier happy
+			break;
+		res[i] = process_filter(sel, f, enter, &msg->ns, &msg->caps);
+		index = next_pid_value(index, f, ty);
+		sel->index = index;
+	}
+#else
 	/* Unrolling this loop was problematic for clang so rather
 	 * than fight with clang just open code it. Its hard to see
 	 * how many pid values will be used anyways. Having zero
 	 * length values is an input error that CRD should catch.
-	 */
-	/* Updateing the number of iterations below, you should also
-	 * update the function namespaceSelectorValue() in kernel.go
 	 */
 	if (len == 4)
 		goto four;
@@ -333,22 +360,27 @@ selector_match(__u32 *f, struct selector_filter *sel,
 	else if (len == 1)
 		goto one;
 four:
-	res4 = process_filter(sel, f, enter, &msg->ns, &msg->caps);
+	res[3] = process_filter(sel, f, enter, &msg->ns, &msg->caps);
 	index = next_pid_value(index, f, ty);
+	sel->index = index;
 three:
-	res3 = process_filter(sel, f, enter, &msg->ns, &msg->caps);
+	res[2] = process_filter(sel, f, enter, &msg->ns, &msg->caps);
 	index = next_pid_value(index, f, ty);
+	sel->index = index;
 two:
-	res2 = process_filter(sel, f, enter, &msg->ns, &msg->caps);
+	res[1] = process_filter(sel, f, enter, &msg->ns, &msg->caps);
 	index = next_pid_value(index, f, ty);
+	sel->index = index;
 one:
-	res1 = process_filter(sel, f, enter, &msg->ns, &msg->caps);
+	res[0] = process_filter(sel, f, enter, &msg->ns, &msg->caps);
 	index = next_pid_value(index, f, ty);
+	sel->index = index;
+#endif
 
 	if (ty == op_filter_notin)
-		return res1 & res2 & res3 & res4;
+		return res[0] & res[1] & res[2] & res[3];
 	else
-		return res1 | res2 | res3 | res4;
+		return res[0] | res[1] | res[2] | res[3];
 }
 
 struct pid_filter {
@@ -384,8 +416,227 @@ struct nc_filter {
  */
 #define NUM_NS_FILTERS_SMALL 4
 
+#ifdef __LARGE_BPF_PROG
+
+#define CMD_ARGS_MAX 32
+
+#define CMD_ARG_HEAP_OFFSET    (STRING_MAPS_HEAP_MASK + 1)
+#define CMD_ARG_OFFSETS_OFFSET (CMD_ARG_HEAP_OFFSET + 2 * MAXARGLENGTH)
+
+FUNC_INLINE long
+selector_first_filter_offset(__u8 *f, __u32 selidx)
+{
+	long seloff;
+
+	seloff = 4; /* start of the relative offsets */
+	seloff += (selidx * 4); /* relative offset for this selector */
+
+	/* selector section offset by reading the relative offset in the array */
+	asm volatile("%[off] &= 0x3ff;\n" /* INDEX_MASK */
+		     : [off] "+r"(seloff));
+	seloff += *(__u32 *)((__u64)f + seloff);
+
+	/* skip the selector size field */
+	seloff += 4;
+	return seloff;
+}
+
+FUNC_INLINE long
+selector_match_cmd_args_offset(__u8 *f, __u32 selidx)
+{
+	long seloff = selector_first_filter_offset(f, selidx);
+
+	/* skip the process-filter sections preceding matchCmdArgs */
+	/* matchPids */
+	seloff += *(__u32 *)((__u64)f + (seloff & INDEX_MASK));
+	/* matchNamespaces */
+	seloff += *(__u32 *)((__u64)f + (seloff & INDEX_MASK));
+	/* matchCapabilities */
+	seloff += *(__u32 *)((__u64)f + (seloff & INDEX_MASK));
+	/* matchNamespaceChanges */
+	seloff += *(__u32 *)((__u64)f + (seloff & INDEX_MASK));
+	/* matchCapabilityChanges */
+	seloff += *(__u32 *)((__u64)f + (seloff & INDEX_MASK));
+
+	return seloff & INDEX_MASK;
+}
+
+FUNC_INLINE long
+copy_cmd_arg_to_heap(char *src, __u64 remaining, char **dst)
+{
+	char *heap;
+	__u32 zero = 0;
+	long read;
+
+	asm volatile("%[remaining] &= 0x1ff;\n"
+		     : [remaining] "+r"(remaining));
+
+	heap = map_lookup_elem(&string_maps_heap, &zero);
+	if (!heap)
+		return -1;
+	/* We reuse this unused space at the end of the heap */
+	heap += CMD_ARG_HEAP_OFFSET;
+
+	read = probe_read_str(heap, remaining, src);
+	if (read <= 0)
+		return -1;
+
+	*dst = heap;
+	return read - 1;
+}
+
 FUNC_INLINE int
-selector_process_filter(__u32 *f, __u32 index, struct execve_map_value *enter,
+match_cmd_arg(__u8 *f, __u32 section_off, __u32 filter_off, __u8 *arg_offsets,
+	      __u32 argc, struct args *cached_args)
+{
+	struct selector_arg_filter *filter;
+	__u32 key, argsoff;
+	__u64 remaining;
+	char *arg_copy;
+	long read;
+
+	if (!filter_off)
+		return 0;
+
+	filter_off = (section_off + filter_off) & INDEX_MASK;
+	filter = (struct selector_arg_filter *)&f[filter_off];
+
+	if (filter->type != string_type)
+		return -1;
+
+	key = filter->index;
+	if (key >= CMD_ARGS_MAX || key >= argc)
+		return -1;
+
+	argsoff = arg_offsets[key];
+	remaining = sizeof(cached_args->buf) - argsoff;
+
+	/* Ideally we would skip this copy and send the cached argument to
+	 * filter_char_buf_value() but it requires a big buffer of 4096,
+	 * so copy it to the unused half of string_maps_heap first.
+	 */
+	read = copy_cmd_arg_to_heap(&cached_args->buf[argsoff], remaining, &arg_copy);
+	if (read < 0)
+		return -1;
+
+	if (!filter_char_buf_value(filter, arg_copy, read))
+		return -1;
+
+	return 1;
+}
+
+/* Return 1 when all command-argument filters match (or the section is empty),
+ * and 0 when the section is malformed, arguments are unavailable, or any
+ * filter does not match.
+ */
+FUNC_INLINE int
+match_cmd_args(__u8 *f, __u32 selidx, struct args *cached_args)
+{
+	__u32 filter_off, section_off, reloaded_argc, nuloff, key;
+	__u32 max_index = 0, argc = 0, argsoff = 0;
+	struct selector_arg_filters *filters;
+	struct selector_arg_filter *filter;
+	__u8 *arg_offsets;
+	__u64 remaining;
+	char *arg_copy;
+	int i, ret;
+	long read;
+
+	section_off = selector_match_cmd_args_offset(f, selidx);
+	section_off &= INDEX_MASK;
+	filters = (struct selector_arg_filters *)&f[section_off];
+	/* Check for malformed filters */
+	if (filters->arglen < sizeof(struct selector_arg_filters))
+		return 0;
+
+	/* An empty section always matches even without a cached entry */
+	if (!filters->argoff[0])
+		return 1;
+
+	/* Check the max index of the filters to avoid over-parsing args */
+	for (i = 0; i < 5; i++) {
+		filter_off = filters->argoff[i];
+		if (!filter_off)
+			break;
+
+		filter_off = (section_off + filter_off) & INDEX_MASK;
+		filter = (struct selector_arg_filter *)&f[filter_off];
+
+		key = filter->index;
+		if (key >= CMD_ARGS_MAX)
+			return 0;
+		if (key > max_index)
+			max_index = key;
+	}
+
+	key = 0;
+	/* Initially, the BPF stack was used to store these offsets but the
+	 * variable stack reads are supported only from 5.12
+	 */
+	arg_offsets = map_lookup_elem(&string_maps_heap, &key);
+	if (!arg_offsets)
+		return 0;
+	arg_offsets += CMD_ARG_OFFSETS_OFFSET;
+
+	/* Parse the arguments once and remember each starting offset. */
+	remaining = cached_args->len;
+	for (i = 0; i < CMD_ARGS_MAX; i++) {
+		if (i > max_index)
+			break;
+		if (remaining == 0)
+			break;
+
+		arg_offsets[i] = argsoff;
+		read = copy_cmd_arg_to_heap(&cached_args->buf[argsoff], remaining, &arg_copy);
+		if (read < 0 || read + 1 > remaining)
+			return 0;
+
+		nuloff = argsoff + read;
+		asm volatile("%[nuloff] &= 0xff;\n"
+			     : [nuloff] "+r"(nuloff));
+		/* Stop on truncated argument */
+		if (cached_args->buf[nuloff] != '\0')
+			break;
+
+		argsoff += read + 1;
+		remaining -= read + 1;
+		argc++;
+	}
+
+	/* This weird move is to make the verifier forget about argc */
+	if (probe_read_kernel(&reloaded_argc, sizeof(reloaded_argc), &argc) < 0)
+		return 0;
+	argc = reloaded_argc;
+
+	/* Iterate again over the filters to perform filtering */
+
+	if (!CONFIG(ITER_NUM)) {
+		for (i = 0; i < 5; i++) {
+			ret = match_cmd_arg(f, section_off, filters->argoff[i], arg_offsets, argc, cached_args);
+			if (ret < 0)
+				return 0;
+			if (ret == 0)
+				break;
+		}
+
+		return 1;
+	}
+
+	bpf_for(i, 0, 5)
+	{
+		ret = match_cmd_arg(f, section_off, filters->argoff[i], arg_offsets, argc, cached_args);
+		if (ret < 0)
+			return 0;
+		if (ret == 0)
+			break;
+	}
+
+	return 1;
+}
+#endif /* __LARGE_BPF_PROG */
+
+FUNC_INLINE int
+selector_process_filter(void *ctx, __u32 *f, __u32 index, struct execve_map_value *enter,
 			struct msg_generic_kprobe *msg)
 {
 	int res = PFILTER_ACCEPT;
@@ -398,9 +649,26 @@ selector_process_filter(__u32 *f, __u32 index, struct execve_map_value *enter,
 	__u32 len;
 	__u64 i;
 
-	/* Do binary filter first for selector index */
-	if (!match_binaries(index))
+	/* Do workload filter first for selector index */
+	if (!match_workloads(index))
 		return 0;
+
+	if (!match_binaries(index, enter, &enter->bin))
+		return 0;
+
+#ifdef __LARGE_BPF_PROG
+	if (CONFIG(PARENTS_MAP_ENABLED)) {
+		struct binary *parent_bin = map_lookup_elem(&tg_parents_bin, &enter->key.pid);
+
+		if (parent_bin)
+			/* matchParentBinaries key is in range [MAX_SELECTORS; MAX_SELECTORS * 2) */
+			if (!match_binaries(index + MAX_SELECTORS, enter, parent_bin))
+				return 0;
+	}
+
+	if (!match_cmd_args((__u8 *)f, index, &enter->args))
+		return PFILTER_REJECT;
+#endif
 
 	/* Find selector offset byte index */
 	index *= 4;
@@ -408,7 +676,10 @@ selector_process_filter(__u32 *f, __u32 index, struct execve_map_value *enter,
 
 	/* read the start offset of the corresponding selector */
 	/* selector section offset by reading the relative offset in the array */
-	index += *(__u32 *)((__u64)f + (index & INDEX_MASK));
+	i = index;
+	asm volatile("%[i] &= 0x3ff;\n" // INDEX_MASK
+		     : [i] "+r"(i));
+	index += *(__u32 *)((__u64)f + i);
 	index &= INDEX_MASK;
 	index += 4; /* skip selector size field */
 
@@ -419,7 +690,7 @@ selector_process_filter(__u32 *f, __u32 index, struct execve_map_value *enter,
 
 	/* we can have only matchNamespace */
 	if (len > 4) {
-		pid = (struct pid_filter *)((u64)f + index);
+		pid = (struct pid_filter *)((u64)f + (index & INDEX_MASK));
 		/* 12: op, flags, length */
 		index += sizeof(struct pid_filter);
 		struct selector_filter sel = {
@@ -467,6 +738,7 @@ selector_process_filter(__u32 *f, __u32 index, struct execve_map_value *enter,
 		if (res == PFILTER_REJECT)
 			return res;
 	}
+	index &= INDEX_MASK; /* reduce the number of states the verifier must track */
 
 	/* matchCapabilities */
 	/* (sizeof(cap1) + sizeof(cap2) + ... + 4) */
@@ -482,6 +754,7 @@ selector_process_filter(__u32 *f, __u32 index, struct execve_map_value *enter,
 	}
 	if (res == PFILTER_REJECT)
 		return res;
+	index &= INDEX_MASK; /* reduce the number of states the verifier must track */
 
 #ifdef __NS_CHANGES_FILTER
 	/* matchNamespaceChanges */
@@ -499,6 +772,7 @@ selector_process_filter(__u32 *f, __u32 index, struct execve_map_value *enter,
 	}
 	if (res == PFILTER_REJECT)
 		return res;
+	index &= INDEX_MASK; /* reduce the number of states the verifier must track */
 #endif
 
 #ifdef __CAP_CHANGES_FILTER
@@ -517,6 +791,12 @@ selector_process_filter(__u32 *f, __u32 index, struct execve_map_value *enter,
 	}
 	if (res == PFILTER_REJECT)
 		return res;
+	index &= INDEX_MASK; /* reduce the number of states the verifier must track */
+#endif
+
+#ifdef __LARGE_BPF_PROG
+	if (generic_filter_caller(ctx, msg, f, index) == CALLER_FILTER_REJECT)
+		return PFILTER_REJECT;
 #endif
 
 	return res;
@@ -533,72 +813,4 @@ process_filter_done(struct msg_selector_data *sel,
 		return PFILTER_ACCEPT;
 	return PFILTER_REJECT;
 }
-
-// generic_process_filter performs first pass filtering based on pid/nspid.
-// We keep a list of selectors that pass.
-//
-// if filter check was successful, it will return PFILTER_ACCEPT and properly
-// set the values of:
-//    current->pid
-//    current->ktime
-// for the memory located at index 0 of @msg_heap assuming the value follows the
-// msg_generic_hdr structure.
-FUNC_INLINE int
-generic_process_filter(struct bpf_map_def *heap, struct bpf_map_def *fmap)
-{
-	struct execve_map_value *enter;
-	struct msg_generic_kprobe *msg;
-	struct msg_execve_key *current;
-	struct msg_selector_data *sel;
-	int curr, zero = 0;
-	bool walker = 0;
-	__u32 ppid;
-
-	msg = map_lookup_elem(heap, &zero);
-	if (!msg)
-		return 0;
-
-	enter = event_find_curr(&ppid, &walker);
-	if (enter) {
-		int selectors, pass;
-		__u32 *f = map_lookup_elem(fmap, &msg->idx);
-
-		if (!f)
-			return PFILTER_ERROR;
-
-		sel = &msg->sel;
-		current = &msg->current;
-
-		curr = sel->curr;
-		if (curr > MAX_SELECTORS)
-			return process_filter_done(sel, enter, current);
-
-		selectors = f[0];
-		/* If no selectors accept process */
-		if (!selectors) {
-			sel->pass = true;
-			return process_filter_done(sel, enter, current);
-		}
-
-		/* If we get here with reference to uninitialized selector drop */
-		if (selectors <= curr)
-			return process_filter_done(sel, enter, current);
-
-		pass = selector_process_filter(f, curr, enter, msg);
-		if (pass) {
-			/* Verify lost that msg is not null here so recheck */
-			asm volatile("%[curr] &= 0x1f;\n" ::[curr] "r+"(curr)
-				     :);
-			sel->active[curr] = true;
-			sel->active[SELECTORS_ACTIVE] = true;
-			sel->pass |= true;
-		}
-		sel->curr++;
-		if (sel->curr > selectors)
-			return process_filter_done(sel, enter, current);
-		return PFILTER_CONTINUE; /* will iterate to the next selector */
-	}
-	return PFILTER_CURR_NOT_FOUND;
-}
-
 #endif /* __PFILTER_H__ */

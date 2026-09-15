@@ -60,7 +60,7 @@ func copyBugTool(cnf *Conf, res *Result) error {
 	}
 	defer in.Close()
 
-	outPattern := fmt.Sprintf("%s-bugtool-*.tar.gz", res.Name)
+	outPattern := res.Name + "-bugtool-*.tar.gz"
 	out, err := os.CreateTemp(cnf.ResultsDir, outPattern)
 	if err != nil {
 		return err
@@ -84,9 +84,9 @@ func printProgress(f *os.File, done <-chan struct{}) {
 
 		case <-ticker.C:
 			if i%10 == 0 {
-				f.Write([]byte("m"))
+				f.WriteString("m")
 			} else {
-				f.Write([]byte("."))
+				f.WriteString(".")
 			}
 			f.Sync()
 		}
@@ -99,7 +99,6 @@ func printProgress(f *os.File, done <-chan struct{}) {
 // An error is returned only if something unexpected happen and not if the
 // tests failed.
 func Run(cnf *Conf) error {
-
 	testDir := filepath.Join(cnf.TetragonDir, "go-tests")
 
 	if cnf.BTFFile != "" {
@@ -217,7 +216,6 @@ func gatherExportFiles(cnf *Conf) error {
 }
 
 func runTest(cnf *Conf, testName string, cmd string, args ...string) (*Result, error) {
-
 	ctx, cancel := context.WithTimeout(context.Background(), TestTimeout)
 	defer cancel()
 
@@ -233,7 +231,7 @@ func runTest(cnf *Conf, testName string, cmd string, args ...string) (*Result, e
 	testCmd := exec.CommandContext(ctx, cmd, args...)
 
 	// create file for output
-	outF, err := os.CreateTemp(cnf.ResultsDir, fmt.Sprintf("%s.", testName))
+	outF, err := os.CreateTemp(cnf.ResultsDir, testName+".")
 	if err != nil {
 		return nil, err
 	}

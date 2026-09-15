@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package bench
 
 import (
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cilium/lumberjack/v2"
+
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/api/readyapi"
 	"github.com/cilium/tetragon/pkg/bpf"
@@ -25,8 +28,10 @@ import (
 	"github.com/cilium/tetragon/pkg/exporter"
 	"github.com/cilium/tetragon/pkg/grpc"
 	"github.com/cilium/tetragon/pkg/logger"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
 	"github.com/cilium/tetragon/pkg/observer"
 	"github.com/cilium/tetragon/pkg/option"
+	"github.com/cilium/tetragon/pkg/policyfilter"
 	"github.com/cilium/tetragon/pkg/process"
 	"github.com/cilium/tetragon/pkg/reader/notify"
 	"github.com/cilium/tetragon/pkg/rthooks"
@@ -60,11 +65,11 @@ func (args *Arguments) String() string {
 func runTetragon(ctx context.Context, configFile string, args *Arguments, summary *Summary, ready chan bool) {
 	bpf.ConfigureResourceLimits()
 	bpf.CheckOrMountFS("")
-	bpf.CheckOrMountDebugFS()
+	bpf.CheckOrMountTraceFS()
 	bpf.CheckOrMountCgroup2()
 
 	if args.Debug {
-		option.Config.Verbosity = 5
+		option.Config.VerifierLogLevel = 5
 	}
 
 	if _, err := os.Stat("../../bpf/objs"); err == nil {
@@ -87,8 +92,8 @@ func runTetragon(ctx context.Context, configFile string, args *Arguments, summar
 	option.Config.BpfDir = bpf.MapPrefixPath()
 	obs := observer.NewObserver()
 
-	if err := obs.InitSensorManager(nil); err != nil {
-		logger.GetLogger().Fatalf("InitSensorManager failed: %v", err)
+	if err := obs.InitSensorManager(); err != nil {
+		logger.Fatal(logger.GetLogger(), "InitSensorManager failed", logfields.Error, err)
 	}
 
 	if err := btf.InitCachedBTF(option.Config.HubbleLib, ""); err != nil {
@@ -117,9 +122,9 @@ func runTetragon(ctx context.Context, configFile string, args *Arguments, summar
 		log.Fatalf("Tracing Policy FromFile: %v", err)
 	}
 
-	benchSensors, err := sensors.GetMergedSensorFromParserPolicy(tp)
+	benchSensors, err := sensors.SensorsFromPolicy(tp, policyfilter.NoFilterID)
 	if err != nil {
-		log.Fatalf("GetMergedSensorFromParserPolicy error: %v", err)
+		log.Fatalf("SensorsFromPolicy error: %v", err)
 	}
 
 	baseSensors := base.GetInitialSensor()
@@ -128,8 +133,10 @@ func runTetragon(ctx context.Context, configFile string, args *Arguments, summar
 		log.Fatalf("Load base error: %s\n", err)
 	}
 
-	if err := benchSensors.Load(option.Config.BpfDir); err != nil {
-		log.Fatalf("Load sensors error: %s\n", err)
+	for _, s := range benchSensors {
+		if err := s.Load(option.Config.BpfDir); err != nil {
+			logger.GetLogger().Warn("Failed to load sensor", logfields.Error, err)
+		}
 	}
 
 	if err := obs.Start(ctx); err != nil {
@@ -137,7 +144,8 @@ func runTetragon(ctx context.Context, configFile string, args *Arguments, summar
 	}
 
 	<-ctx.Done()
-	sensors.UnloadSensors([]sensors.SensorIface{benchSensors, baseSensors})
+	sensors.UnloadSensors(benchSensors)
+	sensors.UnloadSensors([]sensors.SensorIface{baseSensors})
 }
 
 func sigHandler(ctx context.Context, cancel context.CancelFunc) {
@@ -175,14 +183,14 @@ func (bl *benchmarkListener) Close() error {
 }
 
 type timingEncoder struct {
-	totalDuration uint64
+	totalDuration atomic.Uint64
 	inner         exporter.ExportEncoder
 }
 
-func (te *timingEncoder) Encode(v interface{}) error {
+func (te *timingEncoder) Encode(v any) error {
 	t0 := time.Now()
 	err := te.inner.Encode(v)
-	atomic.AddUint64(&te.totalDuration, uint64(time.Since(t0)))
+	te.totalDuration.Add(uint64(time.Since(t0)))
 	return err
 }
 
@@ -208,7 +216,7 @@ func startBenchmarkExporter(ctx context.Context, obs *observer.Observer, summary
 	dataCacheSize := 1024
 
 	watcher := watcher.NewFakeK8sWatcher(nil)
-	if err := process.InitCache(watcher, processCacheSize); err != nil {
+	if err := process.InitCache(watcher, processCacheSize, defaults.DefaultProcessCacheGCInterval); err != nil {
 		return err
 	}
 
@@ -221,7 +229,8 @@ func startBenchmarkExporter(ctx context.Context, obs *observer.Observer, summary
 		ctx,
 		&wg,
 		observer.GetSensorManager(),
-		hookRunner)
+		hookRunner,
+		nil)
 	if err != nil {
 		return err
 	}
@@ -245,11 +254,14 @@ func startBenchmarkExporter(ctx context.Context, obs *observer.Observer, summary
 		// FIXME I'm racy, someone might read summary before this is written.
 		// Likely not an issue since we wait for slower things to exit.
 		<-ctx.Done()
-		summary.JSONEncodingDurationNanos = time.Duration(timingEncoder.totalDuration)
+		summary.JSONEncodingDurationNanos = time.Duration(timingEncoder.totalDuration.Load())
 	}()
 
 	req := tetragon.GetEventsRequest{AllowList: nil, DenyList: nil, AggregationOptions: nil}
-	exporter := exporter.NewExporter(ctx, &req, processManager.Server, &timingEncoder, writer, nil)
+	exporter, err := exporter.NewExporter(ctx, &req, processManager.Server, &timingEncoder, writer, nil)
+	if err != nil {
+		return err
+	}
 	if err := exporter.Start(); err != nil {
 		return err
 	}

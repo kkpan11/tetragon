@@ -4,12 +4,10 @@
 package version
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/cmd/tetra/common"
-	"github.com/cilium/tetragon/pkg/logger"
 	"github.com/cilium/tetragon/pkg/version"
 
 	"github.com/spf13/cobra"
@@ -32,28 +30,28 @@ func New() *cobra.Command {
 		Short:   "Print version from CLI and server",
 		Example: examples,
 		Args:    cobra.NoArgs,
-		Run: func(_ *cobra.Command, _ []string) {
-			fmt.Printf("CLI version: %s\n", version.Version)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cmd.Printf("CLI version: %s\n", version.Version)
 
 			if server {
-				common.CliRunErr(
-					func(ctx context.Context, cli tetragon.FineGuidanceSensorsClient) {
-						res, err := cli.GetVersion(ctx, &tetragon.GetVersionRequest{})
-						if err != nil {
-							logger.GetLogger().WithError(err).Error("error retrieving server version")
-						}
-						fmt.Printf("Server version: %s\n", res.Version)
-					},
-					func(err error) {
-						logger.GetLogger().WithError(err).Error("error retrieving server version")
-					},
-				)
+				c, err := common.NewClientWithDefaultContextAndAddress()
+				if err != nil {
+					return fmt.Errorf("failed to create gRPC client: %w", err)
+				}
+				defer c.Close()
+
+				res, err := c.Client.GetVersion(c.Ctx, &tetragon.GetVersionRequest{})
+				if err != nil {
+					return fmt.Errorf("failed to retrieve server version: %w", err)
+				}
+				cmd.Printf("Server version: %s\n", res.Version)
 			}
 
 			if build {
 				info := version.ReadBuildInfo()
 				info.Print()
 			}
+			return nil
 		},
 	}
 	flags := cmd.Flags()

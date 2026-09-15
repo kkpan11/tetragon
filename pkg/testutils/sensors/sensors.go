@@ -8,8 +8,9 @@ import (
 	"testing"
 
 	"github.com/cilium/tetragon/pkg/bpf"
-	"github.com/cilium/tetragon/pkg/observer"
 	"github.com/cilium/tetragon/pkg/sensors"
+	"github.com/cilium/tetragon/pkg/sensors/base"
+	"github.com/cilium/tetragon/pkg/sensors/exec/procevents"
 )
 
 // LoadSensor is a helper for loading a sensor in tests
@@ -28,43 +29,21 @@ func LoadSensor(t *testing.T, sensori sensors.SensorIface) {
 	}
 
 	t.Cleanup(func() {
-		sensor.Unload()
+		sensor.Destroy(true)
 	})
+}
+
+func LoadInitialSensor(t *testing.T) {
+	LoadSensor(t, base.GetInitialSensorTest(t))
+
+	if err := procevents.GetRunningProcs(); err != nil {
+		t.Fatalf("procevents.GetRunningProcs: %s", err)
+	}
 }
 
 // TestSensorManager sensor manager used in tests
 type TestSensorManager struct {
 	Manager *sensors.Manager
-}
-
-// GetTestSensorManager returns a new test sensor manager.
-// Some tests require an observer running, some do not. To support both, the function checks if a
-// sensor manager has already been setup in the observer, and uses it if so.
-// Otherwise, it creates a new one. If it creates a new one it will use the test name to create a
-// unqique directory for maps/etc, and will also register the necessary cleanup functions using
-// t.Cleanup()
-func GetTestSensorManager(ctx context.Context, t *testing.T) *TestSensorManager {
-	if mgr := observer.GetSensorManager(); mgr != nil {
-		return &TestSensorManager{
-			Manager: mgr,
-		}
-	}
-
-	path := bpf.MapPrefixPath()
-	mgr, err := sensors.StartSensorManager(path, nil)
-	if err != nil {
-		t.Fatalf("startSensorController failed: %s", err)
-	}
-	t.Cleanup(func() {
-		err := mgr.StopSensorManager(ctx)
-		if err != nil {
-			t.Logf("stopSensorController failed: %s\n", err)
-		}
-	})
-
-	return &TestSensorManager{
-		Manager: mgr,
-	}
 }
 
 // AddAndEnableSensor is a helper function that adds and enables a new sensor
@@ -86,43 +65,4 @@ func (tsm *TestSensorManager) AddAndEnableSensor(
 	t.Cleanup(func() {
 		tsm.Manager.DisableSensor(ctx, sensorName)
 	})
-}
-
-// EnableSensors is a helper function that enables a list of sensors
-func (tsm *TestSensorManager) EnableSensors(
-	ctx context.Context,
-	t *testing.T,
-	targets []*sensors.Sensor,
-) {
-	for _, s := range targets {
-		if err := tsm.Manager.EnableSensor(ctx, s.Name); err != nil {
-			t.Fatalf("EnableSensor error: %s", err)
-		}
-	}
-}
-
-// AddAndEnableSensor is a helper function that adds and enables a new sensor
-func (tsm *TestSensorManager) AddAndEnableSensors(
-	ctx context.Context,
-	t *testing.T,
-	targets []*sensors.Sensor,
-) {
-	for i := range targets {
-		sensor := targets[i]
-		tsm.AddAndEnableSensor(ctx, t, sensor, sensor.Name)
-	}
-}
-
-// EnableSensors is a helper function that enables a list of sensors
-func (tsm *TestSensorManager) DisableSensors(
-	ctx context.Context,
-	t *testing.T,
-	targets []*sensors.Sensor,
-) {
-	for _, s := range targets {
-		err := tsm.Manager.DisableSensor(ctx, s.Name)
-		if err != nil {
-			t.Logf("DisableSensor failed: %s", err)
-		}
-	}
 }

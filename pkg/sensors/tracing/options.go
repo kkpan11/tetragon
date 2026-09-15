@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 import (
@@ -10,6 +12,7 @@ import (
 	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
 	"github.com/cilium/tetragon/pkg/logger"
 	"github.com/cilium/tetragon/pkg/option"
+	"github.com/cilium/tetragon/pkg/policyconf"
 )
 
 type OverrideMethod int
@@ -18,6 +21,7 @@ const (
 	keyOverrideMethod = "override-method"
 	valFmodRet        = "fmod-ret"
 	valOverrideReturn = "override-return"
+	keyPolicyMode     = "policy-mode"
 )
 
 const (
@@ -39,9 +43,12 @@ func overrideMethodParse(s string) OverrideMethod {
 }
 
 type specOptions struct {
-	DisableKprobeMulti bool
-	DisableUprobeMulti bool
-	OverrideMethod     OverrideMethod
+	DisableKprobeMulti   bool
+	DisableUprobeMulti   bool
+	SleepablePreloadSize int
+	SleepableOffloadSize int
+	OverrideMethod       OverrideMethod
+	policyMode           policyconf.Mode
 }
 
 type opt struct {
@@ -57,25 +64,61 @@ func newDefaultSpecOptions() *specOptions {
 
 // Allowed kprobe options
 var opts = map[string]opt{
-	option.KeyDisableKprobeMulti: opt{
+	option.KeyDisableKprobeMulti: {
 		set: func(str string, options *specOptions) (err error) {
 			options.DisableKprobeMulti, err = strconv.ParseBool(str)
 			return err
 		},
 	},
-	option.KeyDisableUprobeMulti: opt{
+	option.KeyDisableUprobeMulti: {
 		set: func(str string, options *specOptions) (err error) {
 			options.DisableUprobeMulti, err = strconv.ParseBool(str)
 			return err
 		},
 	},
-	keyOverrideMethod: opt{
+	keyOverrideMethod: {
 		set: func(str string, options *specOptions) (err error) {
 			m := overrideMethodParse(str)
 			if m == OverrideMethodInvalid {
 				return fmt.Errorf("invalid override method: '%s'", str)
 			}
 			options.OverrideMethod = m
+			return nil
+		},
+	},
+	keyPolicyMode: {
+		set: func(str string, options *specOptions) (err error) {
+			mode, err := policyconf.ParseMode(str)
+			if err != nil {
+				return err
+			}
+			options.policyMode = mode
+			return nil
+		},
+	},
+	option.KeySleepablePreloadSize: {
+		set: func(str string, options *specOptions) (err error) {
+			size, err := strconv.Atoi(str)
+			if err != nil {
+				return err
+			}
+			if size <= 0 {
+				return fmt.Errorf("sleepable-preload-size must be positive, got %d", size)
+			}
+			options.SleepablePreloadSize = size
+			return nil
+		},
+	},
+	option.KeySleepableOffloadSize: {
+		set: func(str string, options *specOptions) (err error) {
+			size, err := strconv.Atoi(str)
+			if err != nil {
+				return err
+			}
+			if size <= 0 {
+				return fmt.Errorf("sleepable-offload-size must be positive, got %d", size)
+			}
+			options.SleepableOffloadSize = size
 			return nil
 		},
 	},
@@ -87,9 +130,9 @@ func getSpecOptions(specs []v1alpha1.OptionSpec) (*specOptions, error) {
 		opt, ok := opts[spec.Name]
 		if ok {
 			if err := opt.set(spec.Value, options); err != nil {
-				return nil, fmt.Errorf("failed to set option %s: %s", spec.Name, err)
+				return nil, fmt.Errorf("failed to set option %s: %w", spec.Name, err)
 			}
-			logger.GetLogger().Infof("Set option %s = %s", spec.Name, spec.Value)
+			logger.GetLogger().Info(fmt.Sprintf("Set option %s = %s", spec.Name, spec.Value))
 		}
 	}
 	return options, nil

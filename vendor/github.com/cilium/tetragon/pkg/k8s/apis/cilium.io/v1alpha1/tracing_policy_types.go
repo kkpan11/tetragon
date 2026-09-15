@@ -6,9 +6,10 @@ package v1alpha1
 import (
 	"fmt"
 
-	slimv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
-	ciliumio "github.com/cilium/tetragon/pkg/k8s/apis/cilium.io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	ciliumio "github.com/cilium/tetragon/pkg/k8s/apis/cilium.io"
+	slimv1 "github.com/cilium/tetragon/pkg/k8s/slim/k8s/apis/meta/v1"
 )
 
 const (
@@ -31,13 +32,15 @@ const (
 
 	// TPKindDefinition is the kind name of Cilium Tracing Policy
 	TPNamespacedKindDefinition = "TracingPolicyNamespaced"
+
+	K8sDomain = "k8s"
 )
 
 // +genclient
 // +genclient:noStatus
 // +genclient:nonNamespaced
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-// +kubebuilder:resource:singular="tracingpolicy",path="tracingpolicies",scope="Cluster",shortName={}
+// +kubebuilder:resource:categories={tetragon},singular="tracingpolicy",path="tracingpolicies",scope="Cluster",shortName={tgtp}
 type TracingPolicy struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata"`
@@ -48,7 +51,8 @@ type TracingPolicy struct {
 // +genclient
 // +genclient:noStatus
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-// +kubebuilder:resource:singular="tracingpolicynamespaced",path="tracingpoliciesnamespaced",scope="Namespaced",shortName={}
+// +kubebuilder:resource:categories={tetragon},singular="tracingpolicynamespaced",path="tracingpoliciesnamespaced",scope="Namespaced",shortName={tgtpn}
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.hostSelector)",message="TracingPolicyNamespaced should have a null spec.hostSelector."
 type TracingPolicyNamespaced struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata"`
@@ -62,6 +66,10 @@ func (tp *TracingPolicyNamespaced) TpSpec() *TracingPolicySpec {
 
 func (tp *TracingPolicyNamespaced) TpInfo() string {
 	return fmt.Sprintf("%s (object:%d/%s) (type:%s/%s)", tp.ObjectMeta.Name, tp.ObjectMeta.Generation, tp.ObjectMeta.UID, tp.TypeMeta.Kind, tp.TypeMeta.APIVersion)
+}
+
+func (tp *TracingPolicyNamespaced) TpDomain() string {
+	return K8sDomain
 }
 
 func (tp *TracingPolicyNamespaced) TpName() string {
@@ -85,6 +93,15 @@ type TracingPolicySpec struct {
 	// +kubebuilder:validation:Optional
 	// A list of uprobe specs.
 	UProbes []UProbeSpec `json:"uprobes,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of uprobe specs.
+	LsmHooks []LsmHookSpec `json:"lsmhooks,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of usdt specs.
+	Usdts []UsdtSpec `json:"usdts,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of fentry specs.
+	Fentries []KProbeSpec `json:"fentries,omitempty"`
 
 	// +kubebuilder:validation:Optional
 	// PodSelector selects pods that this policy applies to
@@ -98,16 +115,40 @@ type TracingPolicySpec struct {
 	ContainerSelector *slimv1.LabelSelector `json:"containerSelector,omitempty"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:XValidation:rule="!has(self.matchLabels) && !has(self.matchExpressions)",message="The hostSelector should be either null or {}."
+	// HostSelector selects hosts that this policy applies to.
+	// For now only ~ (none) and {} (all) is supported.
+	HostSelector *slimv1.LabelSelector `json:"hostSelector,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// NodeSelector selects the nodes, by label, on which Tetragon agents load
+	// this policy. If empty or unset, the policy is loaded on all nodes. This differs in
+	// purpose from hostSelector: nodeSelector controls where a policy is loaded
+	// (on which nodes), whereas hostSelector controls which workloads a loaded
+	// policy applies to (host vs pod workloads) and does not affect whether the
+	// policy is loaded on a node. Use nodeSelector to target a node group such
+	// as GPU nodes, a specific architecture or OS, or a canary pool; use
+	// hostSelector to scope a loaded policy to host workloads. Unlike
+	// hostSelector, nodeSelector supports arbitrary matchLabels and
+	// matchExpressions.
+	NodeSelector *slimv1.LabelSelector `json:"nodeSelector,omitempty"`
+
+	// +kubebuilder:validation:Optional
 	// A list of list specs.
 	Lists []ListSpec `json:"lists,omitempty"`
 
 	// +kubebuilder:validation:Optional
-	// A killer spec.
+	// A enforcer spec.
 	Enforcers []EnforcerSpec `json:"enforcers,omitempty"`
 
 	// +kubebuilder:validation:Optional
 	// A list of overloaded options
 	Options []OptionSpec `json:"options,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// SelectorsMacros is used to define selectors macros, which can be used
+	// in probes/hooks selectors by their names.
+	SelectorsMacros map[string]KProbeSelector `json:"selectorsMacros,omitempty"`
 }
 
 func (tp *TracingPolicy) TpName() string {
@@ -120,6 +161,14 @@ func (tp *TracingPolicy) TpSpec() *TracingPolicySpec {
 
 func (tp *TracingPolicy) TpInfo() string {
 	return fmt.Sprintf("%s (object:%d/%s) (type:%s/%s)", tp.ObjectMeta.Name, tp.ObjectMeta.Generation, tp.ObjectMeta.UID, tp.TypeMeta.Kind, tp.TypeMeta.APIVersion)
+}
+
+func (tp *TracingPolicy) TpNamespace() string {
+	return ""
+}
+
+func (tp *TracingPolicy) TpDomain() string {
+	return K8sDomain
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

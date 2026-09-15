@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package program
 
 import (
@@ -9,6 +11,7 @@ import (
 	"os"
 
 	"github.com/cilium/ebpf"
+
 	"github.com/cilium/tetragon/pkg/logger"
 )
 
@@ -39,12 +42,8 @@ import (
 // This way we have only programs/maps realted to our test and with
 // original long names.
 //
-// All this is happening only when program.KeepCollection is set true,
+// All this is happening only when option.Config.KeepCollection is set true,
 // so it's enabled only for testing code.
-
-var (
-	KeepCollection bool
-)
 
 type LoadedMap struct {
 	ID ebpf.MapID
@@ -69,30 +68,34 @@ func newLoadedCollection() *LoadedCollection {
 }
 
 func printLoadedCollection(str string, lc *LoadedCollection) {
-	logger.GetLogger().Debugf("Programs (%s):", str)
+	logger.GetLogger().Debug(fmt.Sprintf("Programs (%s):", str))
 	for name, lp := range lc.Programs {
-		logger.GetLogger().Debugf(" - %d: %s - %v", lp.ID, name, lp.MapIDs)
+		logger.GetLogger().Debug(fmt.Sprintf(" - %d: %s - %v", lp.ID, name, lp.MapIDs))
 	}
-	logger.GetLogger().Debugf("Maps (%s):", str)
+	logger.GetLogger().Debug(fmt.Sprintf("Maps (%s):", str))
 	for name, lm := range lc.Maps {
-		logger.GetLogger().Debugf(" - %d: %s", lm.ID, name)
+		logger.GetLogger().Debug(fmt.Sprintf(" - %d: %s", lm.ID, name))
 	}
 }
 
-func copyLoadedCollection(coll *ebpf.Collection) (*LoadedCollection, error) {
+func copyLoadedCollection(coll *ebpf.Collection, refMaps map[string]bool) (*LoadedCollection, error) {
 	if coll == nil {
-		return nil, fmt.Errorf("failed to get collection")
+		return nil, errors.New("failed to get collection")
 	}
 	lc := newLoadedCollection()
-	// copy all loaded maps
+	// copy referenced maps
 	for name, m := range coll.Maps {
+		if _, ok := refMaps[name]; !ok {
+			continue
+		}
+
 		info, err := m.Info()
 		if err != nil {
 			return nil, err
 		}
 		id, ok := info.ID()
 		if !ok {
-			return nil, fmt.Errorf("failed to get id")
+			return nil, errors.New("failed to get id")
 		}
 		lm := &LoadedMap{id}
 		lc.Maps[name] = lm
@@ -105,7 +108,7 @@ func copyLoadedCollection(coll *ebpf.Collection) (*LoadedCollection, error) {
 		}
 		id, ok := info.ID()
 		if !ok {
-			return nil, fmt.Errorf("failed to get id")
+			return nil, errors.New("failed to get id")
 		}
 		mapIDs, ok := info.MapIDs()
 

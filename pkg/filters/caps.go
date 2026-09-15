@@ -5,15 +5,16 @@ package filters
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
-	hubbleV1 "github.com/cilium/cilium/pkg/hubble/api/v1"
-	hubbleFilters "github.com/cilium/cilium/pkg/hubble/filters"
-	"github.com/cilium/tetragon/api/v1/tetragon"
-	"github.com/cilium/tetragon/pkg/option"
 	mapset "github.com/deckarep/golang-set/v2"
 	"google.golang.org/protobuf/reflect/protoreflect"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/event"
+	"github.com/cilium/tetragon/pkg/option"
 )
 
 func filterSingleCapSet(caps []tetragon.CapabilitiesType, filters *tetragon.CapFilterSet) bool {
@@ -26,22 +27,22 @@ func filterSingleCapSet(caps []tetragon.CapabilitiesType, filters *tetragon.CapF
 	capset := mapset.NewSet[tetragon.CapabilitiesType]()
 	capset.Append(caps...)
 
-	if filters.Any != nil && len(filters.Any) > 0 {
+	if len(filters.Any) > 0 {
 		filterset.Append(filters.Any...)
 		return capset.ContainsAny(filterset.ToSlice()...)
 	}
 
-	if filters.All != nil && len(filters.All) > 0 {
+	if len(filters.All) > 0 {
 		filterset.Append(filters.All...)
 		return capset.Intersect(filterset).Equal(filterset)
 	}
 
-	if filters.Exactly != nil && len(filters.Exactly) > 0 {
+	if len(filters.Exactly) > 0 {
 		filterset.Append(filters.Exactly...)
 		return capset.Equal(filterset)
 	}
 
-	if filters.None != nil && len(filters.None) > 0 {
+	if len(filters.None) > 0 {
 		filterset.Append(filters.None...)
 		return capset.Intersect(filterset).IsEmpty()
 	}
@@ -49,8 +50,8 @@ func filterSingleCapSet(caps []tetragon.CapabilitiesType, filters *tetragon.CapF
 	return false
 }
 
-func filterByCaps(filter *tetragon.CapFilter) (hubbleFilters.FilterFunc, error) {
-	return func(ev *hubbleV1.Event) bool {
+func filterByCaps(filter *tetragon.CapFilter) (FilterFunc, error) {
+	return func(ev *event.Event) bool {
 		process := GetProcess(ev)
 		if process == nil {
 			return false
@@ -68,7 +69,7 @@ func filterByCaps(filter *tetragon.CapFilter) (hubbleFilters.FilterFunc, error) 
 
 type CapsFilter struct{}
 
-func ensure_single_set_defined(filter *tetragon.CapFilterSet) error {
+func ensureSingleSetDefined(filter *tetragon.CapFilterSet) error {
 	if filter == nil {
 		return nil
 	}
@@ -84,26 +85,26 @@ func ensure_single_set_defined(filter *tetragon.CapFilterSet) error {
 		return fmt.Errorf("capability filter may only define one match set, got: %s", strings.Join(defined[:], ", "))
 	}
 	if len(defined) == 0 {
-		return fmt.Errorf("capability filter must define exactly one match set")
+		return errors.New("capability filter must define exactly one match set")
 	}
 	return nil
 }
 
-func (f *CapsFilter) OnBuildFilter(_ context.Context, ff *tetragon.Filter) ([]hubbleFilters.FilterFunc, error) {
-	var fs []hubbleFilters.FilterFunc
+func (f *CapsFilter) OnBuildFilter(_ context.Context, ff *tetragon.Filter) ([]FilterFunc, error) {
+	var fs []FilterFunc
 	if ff.Capabilities != nil {
 		// Enable caps filter only if processCred is enabled
 		if !option.Config.EnableProcessCred {
-			return nil, fmt.Errorf("capabilities are not enabled in process events, cannot configure capability filter")
+			return nil, errors.New("capabilities are not enabled in process events, cannot configure capability filter")
 		}
 
-		if err := ensure_single_set_defined(ff.Capabilities.Permitted); err != nil {
+		if err := ensureSingleSetDefined(ff.Capabilities.Permitted); err != nil {
 			return nil, err
 		}
-		if err := ensure_single_set_defined(ff.Capabilities.Effective); err != nil {
+		if err := ensureSingleSetDefined(ff.Capabilities.Effective); err != nil {
 			return nil, err
 		}
-		if err := ensure_single_set_defined(ff.Capabilities.Inheritable); err != nil {
+		if err := ensureSingleSetDefined(ff.Capabilities.Inheritable); err != nil {
 			return nil, err
 		}
 

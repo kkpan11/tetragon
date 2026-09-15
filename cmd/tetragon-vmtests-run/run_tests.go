@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package main
 
 import (
@@ -17,8 +19,9 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/cilium/tetragon/pkg/vmtests"
 	"golang.org/x/sys/unix"
+
+	"github.com/cilium/tetragon/pkg/vmtests"
 )
 
 type runTestsResults struct {
@@ -26,10 +29,9 @@ type runTestsResults struct {
 	totalDuration                         time.Duration
 }
 
-func runTests(
-	rcnf *RunConf, qemuBin string, qemuArgs []string,
+func runGoTests(
+	rcnf *GoTestConf, qemuBin string, qemuArgs []string,
 ) (*runTestsResults, error) {
-
 	ctx := context.Background()
 	ctx, cancel := signal.NotifyContext(ctx, unix.SIGINT, unix.SIGTERM)
 	defer cancel()
@@ -51,7 +53,7 @@ func runTests(
 
 	f, err := os.Open(resFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open results file %s: %v", resFile, err)
+		return nil, fmt.Errorf("failed to open results file %s: %w", resFile, err)
 	}
 	defer f.Close()
 
@@ -111,7 +113,6 @@ type TestEvent struct {
 }
 
 func updateResultsDetailed(w io.Writer, res *vmtests.Result, out *runTestsResults) {
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -187,6 +188,13 @@ func updateResultsDetailed(w io.Writer, res *vmtests.Result, out *runTestsResult
 		fmt.Fprintf(os.Stderr, "Scanner failed: %v, bailing out", err)
 		updateResultsSimple(w, res, out)
 		return
+	}
+
+	// In case a panic happens, we will never receive a "fail" TestEvent line.
+	// In that case, force-add the test and set it to a failed one.
+	if nrTests == 0 && res.Error {
+		nrTests++
+		nrFailedTests++
 	}
 
 	out.totalDuration += res.Duration

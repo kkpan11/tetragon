@@ -13,6 +13,7 @@ For local development, you will likely want to build and run bare-metal Tetragon
 - A Go toolchain with the [version specified in the main `go.mod`](https://github.com/cilium/tetragon/blob/main/go.mod#L4);
 - GNU make;
 - A running Docker service (you can use Podman as well);
+- The [docker-buildx-plugin](https://github.com/docker/buildx?tab=readme-ov-file#linux-packages) (you may already have this);
 - For building tests, `libcap` and `libelf` (in Debian systems, e.g., install
   `libelf-dev` and `libcap-dev`).
 
@@ -112,22 +113,82 @@ make kind-setup
 
 Verify that Tetragon is installed by running:
 ```shell
-kubectl get pods -n kube-system
+kubectl get pods -n tetragon
 ```
 
-## Local Development in Vagrant Box
+## Working on the nok8s build
 
-If you are on an intel Mac, use Vagrant to create a dev VM:
+Building the nok8s version of tetragon relies on setting the `nok8s` tag in builds. This means that
+editor or IDE would need to be configured appropriately so that features such as "goto-definition"
+operate in the full build.
+
+You can find some configuration examples below.
+
+{{< tabpane text=true >}}
+{{% tab vim %}}
+
+For neovim lsp, you can use:
+
+```lua
+vim.lsp.config.gopls = {
+  cmd =     { "gopls" },
+  cmd_env = {GOFLAGS = "-tags=nok8s"}
+}
+```
+
+For `fatih/vim-go`, you can use:
+
+```vim
+let g:go_build_tags = 'nok8s'
+```
+
+There is also the `:GoBuildTags` convenience command to change or remove build
+tags.
+
+{{% /tab %}}
+{{< /tabpane >}}
+
+
+## Local Development with Apple Silicon Mac
+
+Use [Lima](https://lima-vm.io/) to create a Linux VM if you are using a Mac with
+Apple silicon. For example:
+
+{{< warning >}}
+The following commands create a VM, and make the mount for your home directory
+on the host writable. Tweak `~/.lima/tetragon/lima.yaml` if you prefer to only
+mount Tetragon directory as writable.
+{{< /warning >}}
+
+{{< note >}}
+The following commands install Golang 1.23. You may want to install a newer
+version if it's available in https://launchpad.net/~longsleep/+archive/ubuntu/golang-backports.
+{{< /note >}}
+
+First create a VM using [Lima](https://lima-vm.io/):
 
 ```shell
-vagrant up
-vagrant ssh
-make
+brew install lima
+limactl create --mount-writable --tty=false --name=tetragon
+limactl start tetragon
+limactl shell tetragon
 ```
 
-If you are getting an error, you can try to run `sudo launchctl load
-/Library/LaunchDaemons/org.virtualbox.startup.plist` (from [a Stackoverflow
-answer](https://stackoverflow.com/questions/18149546/macos-vagrant-up-failed-dev-vboxnetctl-no-such-file-or-directory)).
+Then install needed dependencies inside the VM:
+
+```shell
+sudo add-apt-repository -y ppa:longsleep/golang-backports
+sudo apt update
+sudo apt install -y golang-1.23 libelf-dev libcap-dev make
+export CONTAINER_ENGINE=nerdctl
+export PATH=$PATH:/usr/lib/go-1.23/bin
+```
+
+You can now build Tetragon in your VM:
+
+```shell
+make -j3 tetragon-bpf tetragon tetra
+```
 
 ## What's next
 

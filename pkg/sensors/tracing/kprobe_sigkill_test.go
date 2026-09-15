@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 import (
@@ -10,18 +12,19 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
-	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
 	"github.com/cilium/tetragon/pkg/arch"
 	"github.com/cilium/tetragon/pkg/jsonchecker"
 	"github.com/cilium/tetragon/pkg/kernels"
 	lc "github.com/cilium/tetragon/pkg/matchers/listmatcher"
-	sm "github.com/cilium/tetragon/pkg/matchers/stringmatcher"
+	"github.com/cilium/tetragon/pkg/matchers/stringmatcher"
 	"github.com/cilium/tetragon/pkg/observer/observertesthelper"
+	"github.com/cilium/tetragon/pkg/option"
 	"github.com/cilium/tetragon/pkg/testutils"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
-	"github.com/stretchr/testify/assert"
 
 	_ "github.com/cilium/tetragon/pkg/sensors/exec"
 )
@@ -79,10 +82,41 @@ func testSigkill(t *testing.T, makeSpecFile func(pid string) string, checker *ev
 	}
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestKprobeSigkill(t *testing.T) {
+	if !kernels.MinKernelVersion("5.3.0") {
+		t.Skip("sigkill requires at least 5.3.0 version")
+	}
+
+	// makeSpecFile creates a new spec file based on the template, and the provided arguments
+	makeSpecFile := func(pid string) string {
+		data := map[string]string{
+			"MatchedPID":   pid,
+			"NamespacePID": "false",
+		}
+		specName, err := testutils.GetSpecFromTemplate("sigkill.yaml.tmpl", data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return specName
+	}
+
+	kpChecker := eventchecker.NewProcessKprobeChecker("").
+		WithFunctionName(stringmatcher.Full(arch.AddSyscallPrefixTestHelper(t, "sys_lseek"))).
+		WithArgs(eventchecker.NewKprobeArgumentListMatcher().
+			WithOperator(lc.Ordered).
+			WithValues(
+				eventchecker.NewKprobeArgumentChecker().WithIntArg(5555),
+			)).
+		WithAction(tetragon.KprobeAction_KPROBE_ACTION_SIGKILL)
+	checker := eventchecker.NewUnorderedEventChecker(kpChecker)
+
+	testSigkill(t, makeSpecFile, checker)
+}
+
+func TestKprobeSigkillExecveMap1(t *testing.T) {
 	if !kernels.MinKernelVersion("5.3.0") {
 		t.Skip("sigkill requires at least 5.3.0 version")
 	}
@@ -100,17 +134,57 @@ func TestKprobeSigkill(t *testing.T) {
 		return specName
 	}
 
-	kpChecker := ec.NewProcessKprobeChecker("").
-		WithFunctionName(sm.Full(arch.AddSyscallPrefixTestHelper(t, "sys_lseek"))).
-		WithArgs(ec.NewKprobeArgumentListMatcher().
+	kpChecker := eventchecker.NewProcessKprobeChecker("").
+		WithFunctionName(stringmatcher.Full(arch.AddSyscallPrefixTestHelper(t, "sys_lseek"))).
+		WithArgs(eventchecker.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
-				ec.NewKprobeArgumentChecker().WithIntArg(5555),
+				eventchecker.NewKprobeArgumentChecker().WithIntArg(5555),
 			)).
-		WithAction(tetragon.KprobeAction_KPROBE_ACTION_SIGKILL)
-	checker := ec.NewUnorderedEventChecker(kpChecker)
+		WithAction(tetragon.KprobeAction_KPROBE_ACTION_SIGKILL).
+		WithProcess(eventchecker.NewProcessChecker().WithFlags(stringmatcher.Full("unknown")))
 
+	checker := eventchecker.NewUnorderedEventChecker(kpChecker)
+
+	option.Config.ExecveMapEntries = 1
 	testSigkill(t, makeSpecFile, checker)
+	option.Config.ExecveMapEntries = 0
+}
+
+func TestTracepointSigkillExecveMap1(t *testing.T) {
+	if !kernels.MinKernelVersion("5.3.0") {
+		t.Skip("sigkill requires at least 5.3.0 version")
+	}
+
+	// makeSpecFile creates a new spec file bsed on the template, and the provided arguments
+	makeSpecFile := func(pid string) string {
+		data := map[string]string{
+			"MatchedPID":   pid,
+			"NamespacePID": "false",
+		}
+		specName, err := testutils.GetSpecFromTemplate("sigkill_tracepoint.yaml.tmpl", data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return specName
+	}
+
+	kpChecker := eventchecker.NewProcessTracepointChecker("").
+		WithSubsys(stringmatcher.Full("syscalls")).
+		WithEvent(stringmatcher.Full("sys_enter_lseek")).
+		WithArgs(eventchecker.NewKprobeArgumentListMatcher().
+			WithOperator(lc.Ordered).
+			WithValues(
+				eventchecker.NewKprobeArgumentChecker().WithIntArg(int32(5555)),
+			)).
+		WithAction(tetragon.KprobeAction_KPROBE_ACTION_SIGKILL).
+		WithProcess(eventchecker.NewProcessChecker().WithFlags(stringmatcher.Full("unknown")))
+
+	checker := eventchecker.NewUnorderedEventChecker(kpChecker)
+
+	option.Config.ExecveMapEntries = 1
+	testSigkill(t, makeSpecFile, checker)
+	option.Config.ExecveMapEntries = 0
 }
 
 func TestReturnKprobeSigkill(t *testing.T) {
@@ -131,17 +205,17 @@ func TestReturnKprobeSigkill(t *testing.T) {
 		return specName
 	}
 
-	kpChecker := ec.NewProcessKprobeChecker("").
-		WithFunctionName(sm.Full(arch.AddSyscallPrefixTestHelper(t, "sys_lseek"))).
-		WithArgs(ec.NewKprobeArgumentListMatcher().
+	kpChecker := eventchecker.NewProcessKprobeChecker("").
+		WithFunctionName(stringmatcher.Full(arch.AddSyscallPrefixTestHelper(t, "sys_lseek"))).
+		WithArgs(eventchecker.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
-				ec.NewKprobeArgumentChecker().WithIntArg(5555),
+				eventchecker.NewKprobeArgumentChecker().WithIntArg(5555),
 			)).
-		WithReturn(ec.NewKprobeArgumentChecker().WithIntArg(-9)).
+		WithReturn(eventchecker.NewKprobeArgumentChecker().WithIntArg(-9)).
 		WithAction(tetragon.KprobeAction_KPROBE_ACTION_POST).
 		WithReturnAction(tetragon.KprobeAction_KPROBE_ACTION_SIGKILL)
-	checker := ec.NewUnorderedEventChecker(kpChecker)
+	checker := eventchecker.NewUnorderedEventChecker(kpChecker)
 
 	testSigkill(t, makeSpecFile, checker)
 }
@@ -220,14 +294,14 @@ func testUnprivilegedUsernsKill(t *testing.T, pidns bool) {
 		t.Fatalf("command failed with %s. Context error: %s", err, ctx.Err())
 	}
 
-	kpChecker := ec.NewProcessKprobeChecker("").
-		WithFunctionName(sm.Full("create_user_ns")).
+	kpChecker := eventchecker.NewProcessKprobeChecker("").
+		WithFunctionName(stringmatcher.Full("create_user_ns")).
 		WithAction(tetragon.KprobeAction_KPROBE_ACTION_SIGKILL)
 
-	checker := ec.NewUnorderedEventChecker(kpChecker)
+	checker := eventchecker.NewUnorderedEventChecker(kpChecker)
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestKillUnprivilegedUserns(t *testing.T) {

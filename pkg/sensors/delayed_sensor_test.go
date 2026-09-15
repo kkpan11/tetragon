@@ -4,9 +4,11 @@
 package sensors
 
 import (
-	"fmt"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
 )
 
 // A sensor to test the intermediate policy states (loading / unloading)
@@ -31,6 +33,14 @@ type TestDelayedSensor struct {
 	ch     chan struct{}
 }
 
+func (tds TestDelayedSensor) Overhead() ([]ProgOverhead, bool) {
+	return []ProgOverhead{}, false
+}
+
+func (tds TestDelayedSensor) TotalMemlock() uint64 {
+	return 0
+}
+
 func (tds *TestDelayedSensor) GetName() string {
 	return tds.name
 }
@@ -39,35 +49,48 @@ func (tds *TestDelayedSensor) IsLoaded() bool {
 	return tds.loaded
 }
 
+func (tds *TestDelayedSensor) DisableNotAllowed() string {
+	return ""
+}
+
 func (tds *TestDelayedSensor) Load(_ string) error {
 	select {
 	case <-tds.ch:
 	case <-time.After(10 * time.Second):
-		return fmt.Errorf("TestDelayedSensor/Load timeout when waiting for unblocking")
+		return errors.New("TestDelayedSensor/Load timeout when waiting for unblocking")
 	}
 	tds.loaded = true
 	return nil
 }
 
-func (tds *TestDelayedSensor) Unload() error {
+func (tds *TestDelayedSensor) Unload(_ bool) error {
 	select {
 	case <-tds.ch:
 	case <-time.After(10 * time.Second):
-		return fmt.Errorf("TestDelayedSensor/Unload timeout when waiting for unblocking")
+		return errors.New("TestDelayedSensor/Unload timeout when waiting for unblocking")
 	}
 	tds.loaded = false
 	return nil
 }
 
-func (tds *TestDelayedSensor) Destroy() {
+func (tds *TestDelayedSensor) Destroy(_ bool) error {
 	tds.loaded = false
+	return nil
 }
 
 func (tds *TestDelayedSensor) unblock(t *testing.T) {
 	select {
 	case tds.ch <- struct{}{}:
-	default:
+	case <-time.After(10 * time.Second):
 		t.Fatalf("unblocked failed: channel does not seem to be empty")
 	}
 
+}
+
+func (tds *TestDelayedSensor) HookStatus() []*tetragon.HookStatus {
+	return []*tetragon.HookStatus{}
+}
+
+func (tds *TestDelayedSensor) IsEmpty() bool {
+	return false
 }

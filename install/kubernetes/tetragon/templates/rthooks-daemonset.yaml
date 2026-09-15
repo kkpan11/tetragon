@@ -6,12 +6,12 @@ metadata:
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  labels: 
+  labels:
     {{- include "tetragon-rthooks.labels" . | nindent 4 }}
     {{- with .Values.rthooks.extraLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-  name: {{ .Release.Name }}-rthooks
+  name: {{ include "tetragon-rthooks.name" . }}
   namespace: {{ .Release.Namespace }}
 spec:
   selector:
@@ -37,23 +37,32 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.rthooks.serviceAccount.name }}
+      serviceAccountName: {{ . }}
+      {{- end }}
       {{- with .Values.rthooks.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
       {{- include "container.tetragon-rthooks" . | nindent 6 -}}
+      {{- if .Values.rthooks.exportLogs.enabled }}
+      {{- include "container.tetragon-rthooks-export-logs" . | nindent 6 -}}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with (include "tetragon-rthooks.affinity" . | fromYaml) }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if (semverCompare ">= 1.33-0" .Capabilities.KubeVersion.Version) }}
+      hostUsers: true
       {{- end }}
       volumes:
       - name: oci-hook-install-path

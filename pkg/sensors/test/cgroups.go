@@ -4,13 +4,16 @@
 package test
 
 import (
+	"github.com/cilium/tetragon/pkg/config"
+	"github.com/cilium/tetragon/pkg/option"
 	"github.com/cilium/tetragon/pkg/sensors"
+	"github.com/cilium/tetragon/pkg/sensors/base"
 	"github.com/cilium/tetragon/pkg/sensors/program"
 )
 
 var (
 	CgroupMkdir = program.Builder(
-		"bpf_cgroup_mkdir.o",
+		config.CGroupMkdirObj(),
 		"cgroup/cgroup_mkdir",
 		"raw_tracepoint/cgroup_mkdir",
 		"tg_tp_cgrp_mkdir",
@@ -18,7 +21,7 @@ var (
 	)
 
 	CgroupRmdir = program.Builder(
-		"bpf_cgroup_rmdir.o",
+		config.CGroupRmdirObj(),
 		"cgroup/cgroup_rmdir",
 		"raw_tracepoint/cgroup_rmdir",
 		"tg_tp_cgrp_rmdir",
@@ -26,7 +29,7 @@ var (
 	)
 
 	CgroupRelease = program.Builder(
-		"bpf_cgroup_release.o",
+		config.CGroupReleaseObj(),
 		"cgroup/cgroup_release",
 		"raw_tracepoint/cgroup_release",
 		"tg_tp_cgrp_release",
@@ -53,6 +56,10 @@ func getCgroupPrograms() []*program.Program {
 func getCgroupMaps() []*program.Map {
 	maps := []*program.Map{
 		GetCgroupsTrackingMap(),
+		program.MapUserFrom(base.ExecveMap),
+	}
+	if config.EnableV511Progs() && !option.Config.UsePerfRingBuffer {
+		maps = append(maps, program.MapUserFrom(base.RingBufEvents))
 	}
 	return maps
 }

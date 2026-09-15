@@ -10,10 +10,10 @@ Tetragon is configured via [TracingPolicies]({{< ref "/docs/concepts/tracing-pol
 speaking, TracingPolicies define _what_ situations Tetragon should react to and _how_. The _what_
 can be, for example, specific system calls with specific argument values. The _how_ defines what
 action the Tetragon agent should perform when the specified situation occurs. The most common action
-is generating an event, but there are others (e.g., returning an error without executing the function,
+is generating an event, but there are others (e.g., returning an error without executing the function 
 or killing the corresponding process).
 
-Here we discuss how to apply tracing policies only on a subset of pods running on the system via
+Here, we discuss how to apply tracing policies only on a subset of pods running on the system via
 the followings mechanisms:
 - namespaced policies
 - pod-label filters
@@ -47,32 +47,199 @@ the policy is applied to.
 
 ## Container field filters
 
-For container field filters, we use the `containerSelector` field of tracing policies to select the containers that the policy is applied to. At the moment, the only supported field is `name`.
+For container field filters, we use the `containerSelector` field of tracing policies to select the containers that the policy is applied to. At the moment, the only supported fields are `name` and `repo` which refers to the container repository.
+
+## Host workload filters
+
+To filter host workloads we use the `hostSelector` field of tracing policies to select if a policy
+should be applied to host workloads or not. For now this only supports `{}` to match all host workloads
+and `null` to match none of the host workloads.
+
+{{< note >}}
+Since a `TracingPolicyNamespaced` can only apply to Pods within a specific
+Kubernetes namespace, any non-null `hostSelector` will trigger an error.
+{{< /note >}}
+
+Based on these, the user can choose on which workloads does a policy apply.
+
+## Node filtering
+
+The selectors above (`podSelector`, `containerSelector`, `hostSelector`) filter
+which workloads a policy applies to; the policy is still loaded by the
+Tetragon agent on every node. To restrict policy loading to specific nodes, use
+the `nodeSelector` field.
+
+`nodeSelector` is a standard Kubernetes label selector matched against the
+labels of the node each Tetragon agent runs on. An agent loads the policy only
+when its own node's labels match. This is useful for policies that are
+expensive, noisy, or only relevant on a subset of nodes — for example GPU
+nodes, a specific architecture or OS, or a canary node pool.
+
+Unlike `hostSelector`, arbitrary `matchLabels` and `matchExpressions` are
+supported. If `nodeSelector` is empty (`{}`) or omitted, the policy is loaded on
+all nodes, preserving the default behavior. `nodeSelector` is supported on both
+`TracingPolicy` and `TracingPolicyNamespaced`.
+
+The following example loads the policy only on nodes labeled `nodepool: gpu`
+with an `amd64` architecture:
+
+```yaml
+spec:
+  nodeSelector:
+    matchLabels:
+      nodepool: gpu
+    matchExpressions:
+    - key: kubernetes.io/arch
+      operator: In
+      values:
+      - amd64
+  kprobes:
+```
+
+When a node is relabeled at runtime, each agent re-evaluates its policies and
+loads or unloads them accordingly.
+
+A policy that a node does not load because its `nodeSelector` does not match is
+not silently dropped: it is reported with the `skipped` state (rather than being
+absent) in `tetra tracingpolicy list`, so a gated-out policy is distinguishable
+from a missing one.
+
+{{< note >}}
+`nodeSelector` is evaluated by the Tetragon agent against the Kubernetes node it
+runs on, so it only applies to policies managed through the Kubernetes API
+(`TracingPolicy` and `TracingPolicyNamespaced`). Policies loaded directly from a
+file or through the gRPC API are not subject to `nodeSelector`.
+{{< /note >}}
+
+{{< note >}}
+If the agent cannot evaluate the selector (for example, the node object is
+temporarily unavailable), it loads the policy on that node — `nodeSelector`
+fails open so a transient error never silently drops a policy.
+{{< /note >}}
+
+{{< warning >}}
+Because `nodeSelector` keys are read from the node's labels, any user that
+can edit node labels can change which policies an agent loads — including
+unloading an enforcement policy by relabeling the node. When gating enforcement
+policies (for example `Sigkill`), restrict who can modify the node labels used
+in the selector, and prefer labels that are set at node provisioning time and
+not writable by untrusted workloads.
+{{< /warning >}}
+
+## Filtering semantics
+
+The following table summarizes how different combinations of `hostSelector`, `podSelector`, and `containerSelector` behave.
+
+| `hostSelector`   | `podSelector`    | `containerSelector` | Result                                                                                                                 |
+| ---------------- | ---------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `null` (default) | `null` (default) | `null` (default)    | Select all host, pod, and container workloads.                                                                         |
+| `null` (default) | `null` (default) | `{...}`             | Select all containers that match `containerSelector` across all pods. No host workloads are selected.                  |
+| `null` (default) | `{...}`          | `null` (default)    | Select all containers in pods that match `podSelector`. No host workloads are selected.                                |
+| `null` (default) | `{...}`          | `{...}`             | Select all containers that match `containerSelector` in pods that match `podSelector`. No host workloads are selected. |
+| `{}`             | `null` (default) | `null` (default)    | Select all host workloads.                                                                                             |
+| `{}`             | `null` (default) | `{...}`             | Select all host workloads, plus all containers that match `containerSelector` across all pods.                         |
+| `{}`             | `{...}`          | `null` (default)    | Select all host workloads, plus all containers in pods that match `podSelector`.                                       |
+| `{}`             | `{...}`          | `{...}`             | Select all host workloads, plus all containers that match `containerSelector` in pods that match `podSelector`.        |
+
+{{< note >}}
+When `hostSelector`, `podSelector`, and `containerSelector` are all left at their default
+value of `null` (that is, they are omitted), this is treated as a special case: workload
+filtering is disabled entirely, and all host and pod/container workloads are selected.
+{{< /note >}}
+
+
+## Examples
+
+By default, a policy match on all workloads, similar to the following example:
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "workload-filtering"
+spec:
+  kprobes:
+```
+
+In that case all of `hostSelector`, `podSelector`, and `containerSelector` have the default value `null`.
+
+The following example will match only host workloads.
+
+```yaml
+spec:
+  hostSelector: {}
+  kprobes:
+```
+
+The following example will match only pod workloads.
+
+```yaml
+spec:
+  podSelector: {}
+  kprobes:
+```
+
+`containerSelector` acts as a second level filtering on the `podSelector`. This means that first the
+`podSelector` is evaluated and if pod match we then apply the `containerSelector`. The following example
+will match all pods inside the `kube-system` namespace and all host workloads.
+
+```yaml
+spec:
+  hostSelector: {}
+  podSelector:
+    matchExpressions:
+    - key: "k8s:io.kubernetes.pod.namespace"
+      operator: In
+      values:
+      - "kube-system"
+```
 
 ## Demo
 
 ### Setup
 
-For this demo, we use containerd and configure appropriate run-time hooks using minikube.
+For this demo, we use containerd and configure appropriate run-time hooks.
 
-First, let us start minikube, build and load images, and install Tetragon and OCI hooks:
+First, let us start a cluster, build and load images, and install Tetragon and OCI hooks:
 
-```shell
+{{< tabpane lang=shell >}}
+{{< tab "minikube" >}}
+
 minikube start --container-runtime=containerd
-./contrib/rthooks/minikube-containerd-install-hook.sh
+./contrib/tetragon-rthooks/scripts/minikube-install-hook.sh
 make image image-operator
 minikube image load --daemon=true cilium/tetragon:latest cilium/tetragon-operator:latest
 minikube ssh -- sudo mount bpffs -t bpf /sys/fs/bpf
 helm install --namespace kube-system \
 	--set tetragonOperator.image.override=cilium/tetragon-operator:latest \
 	--set tetragon.image.override=cilium/tetragon:latest  \
-	--set tetragon.grpc.address="unix:///var/run/cilium/tetragon/tetragon.sock" \
+	--set tetragon.grpc.address="unix:///var/run/tetragon/tetragon.sock" \
 	tetragon ./install/kubernetes/tetragon
-```
 
-Once the tetragon pod is up and running, we can get its name.
+{{< /tab >}}
+{{< tab "kind" >}}
+
+kind create cluster
+./contrib/tetragon-rthooks/scripts/kind-hook-setup.sh
+make image image-operator
+kind load docker-image cilium/tetragon:latest cilium/tetragon-operator:latest
+helm install --namespace kube-system \
+	--set tetragonOperator.image.override=cilium/tetragon-operator:latest \
+	--set tetragon.image.override=cilium/tetragon:latest  \
+	--set tetragon.grpc.address="unix:///var/run/tetragon/tetragon.sock" \
+	tetragon ./install/kubernetes/tetragon
+
+{{< /tab >}}
+{{< /tabpane >}}
+
+Once the tetragon pod is up and running, we can get its name and store it in a variable for convenience.
 ```shell
 tetragon_pod=$(kubectl -n kube-system get pods -l app.kubernetes.io/name=tetragon -o custom-columns=NAME:.metadata.name --no-headers)
+```
+
+Once the tetragon operator pod is up and running, we can also get its name and store it in a variable for convenience.
+```shell
+tetragon_operator=$(kubectl -n kube-system get pods -l app.kubernetes.io/name=tetragon-operator -o custom-columns=NAME:.metadata.name --no-headers)
 ```
 
 Next, we check the tetragon-operator logs and tetragon agent logs to ensure
@@ -82,7 +249,7 @@ First, we check if the operator installed the TracingPolicyNamespaced CRD.
 
 
 ```shell
-kubectl -n kube-system logs -c tetragon-operator $tetragon_pod
+kubectl -n kube-system logs -c tetragon-operator $tetragon_operator
 ```
 
 The expected output is:
@@ -94,7 +261,7 @@ level=info msg="CRD (CustomResourceDefinition) is installed and up-to-date" name
 level=info msg="Initialization complete" subsys=tetragon-operator
 ```
 
-Next, we check that policyfilter (the low level mechanism that implements the desired functionality) is indeed enabled.
+Next, we check that policyfilter (the low-level mechanism that implements the desired functionality) is indeed enabled.
 
 ```shell
 kubectl -n kube-system logs -c tetragon $tetragon_pod
@@ -123,8 +290,8 @@ If you don't see a command prompt, try pressing enter.
 >>>
 ```
 
-There is no policy installed so attempting to do the lseek operation will just
-return an error. So using the python shell we can execute an lseek and see the
+There is no policy installed, so attempting to do the lseek operation will just
+return an error. Using the python shell, we can execute an lseek and see the
 returned error.
 ```
 >>> import os
@@ -160,7 +327,7 @@ spec:
 EOF
 ```
 
-The above tracing policy will kill the process that performs an lseek system call with a file
+The above tracing policy will kill the process that performs a lseek system call with a file
 descriptor of `-1`. Note that we use a `SigKill` action only for illustration purposes because it's
 easier to observe its effects.
 
@@ -272,7 +439,7 @@ cat << EOF | kubectl apply -f -
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: "lseek-podfilter"
+  name: "lseek-containerfilter"
 spec:
   containerSelector:
     matchExpressions:

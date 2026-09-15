@@ -15,9 +15,12 @@ import (
 
 	"github.com/cilium/tetragon/pkg/api/ops"
 	api "github.com/cilium/tetragon/pkg/api/testapi"
+	"github.com/cilium/tetragon/pkg/config"
 	"github.com/cilium/tetragon/pkg/grpc/test"
 	"github.com/cilium/tetragon/pkg/observer"
+	"github.com/cilium/tetragon/pkg/option"
 	"github.com/cilium/tetragon/pkg/sensors"
+	"github.com/cilium/tetragon/pkg/sensors/base"
 	"github.com/cilium/tetragon/pkg/sensors/program"
 )
 
@@ -31,7 +34,7 @@ var (
 
 var (
 	// (atomic) counter for sensor names. Initialized at 0 so that first sensor is "1"
-	sensorCounter uint64
+	sensorCounter atomic.Uint64
 )
 
 func init() {
@@ -56,17 +59,33 @@ func handleTest(r *bytes.Reader) ([]observer.Event, error) {
 	return []observer.Event{msgUnix}, nil
 }
 
-// GetTestSensor creates a new test sensor.
-func GetTestSensor() *sensors.Sensor {
-	sensorName := fmt.Sprintf("test-sensor-%d", atomic.AddUint64(&sensorCounter, 1))
-	progs := []*program.Program{program.Builder(
-		"bpf_lseek.o",
+func lseekProg(sensorName string, usePerfRingBuffer bool) *program.Program {
+	obj := "bpf_lseek.o"
+	progName := "test_lseek_prog"
+	if usePerfRingBuffer {
+		obj = "bpf_lseek_v511.o"
+		progName = "test_lseek_prog_v511"
+	}
+	return program.Builder(
+		obj,
 		"syscalls/sys_enter_lseek",
 		"tracepoint/sys_enter_lseek",
-		sensors.PathJoin(sensorName, "test_lseek_prog"),
+		sensors.PathJoin(sensorName, progName),
 		"tracepoint",
-	)}
-	maps := []*program.Map{}
+	)
+}
+
+// GetTestSensor creates a new test sensor.
+func GetTestSensor() *sensors.Sensor {
+	sensorName := fmt.Sprintf("test-sensor-%d", sensorCounter.Add(1))
+	progs := []*program.Program{lseekProg(sensorName, false)}
+	if config.EnableV511Progs() && !option.Config.UsePerfRingBuffer {
+		progs = append(progs, lseekProg(sensorName, true))
+	}
+	var maps []*program.Map
+	if config.EnableV511Progs() && !option.Config.UsePerfRingBuffer {
+		maps = []*program.Map{program.MapUserFrom(base.RingBufEvents)}
+	}
 	sensor := &sensors.Sensor{Name: sensorName, Progs: progs, Maps: maps}
 	return sensor
 }

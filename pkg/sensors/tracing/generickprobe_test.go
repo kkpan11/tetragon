@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 import (
@@ -9,17 +11,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/bpf"
 	"github.com/cilium/tetragon/pkg/idtable"
 	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
+	"github.com/cilium/tetragon/pkg/policyfilter"
 	"github.com/cilium/tetragon/pkg/sensors"
-	"github.com/cilium/tetragon/pkg/sensors/base"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
-	"github.com/stretchr/testify/assert"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func Fuzz_parseString(f *testing.F) {
+	f.Add([]byte{6, 0, 0, 0, 'p', 'i', 'z', 'z', 'a', 0})
+	f.Add([]byte{3, 0, 0, 0, 'p', 'i', 'z', 'z', 'a', 0})
+	f.Add([]byte{0, 0, 0, 1, 'p', 'i', 'z', 'z', 'a', 0})
+	f.Add([]byte{254, 255, 255, 255, 'p', 'i', 'z', 'z', 'a', 0})
+	f.Add([]byte{253, 255, 255, 255, 'p', 'i', 'z', 'z', 'a', 0})
+	f.Add([]byte{1, 0, 0, 0})
+
 	f.Fuzz(func(_ *testing.T, input []byte) {
 		reader := bytes.NewReader(input)
 		parseString(reader)
@@ -62,6 +73,18 @@ func Test_parseString(t *testing.T) {
 	})
 }
 
+// simpleValidateInfo provides kpValidateInfo without any validation
+func simpleValidateInfo(kprobes []v1alpha1.KProbeSpec) []*kpValidateInfo {
+	ret := make([]*kpValidateInfo, 0, len(kprobes))
+	for i := range kprobes {
+		ret = append(ret, &kpValidateInfo{
+			calls:   []string{kprobes[i].Call},
+			syscall: kprobes[i].Syscall,
+		})
+	}
+	return ret
+}
+
 func Test_SensorDestroyHook(t *testing.T) {
 	if genericKprobeTable.Len() != 0 {
 		t.Errorf("genericKprobeTable expected initial length: 0, got: %d", genericKprobeTable.Len())
@@ -81,7 +104,9 @@ func Test_SensorDestroyHook(t *testing.T) {
 	// insertion in the table in AddKprobe, but this is done by the caller to
 	// have just DestroyHook that regroups all the potential multiple kprobes
 	// contained in one sensor.
-	sensor, err := createGenericKprobeSensor(spec, "test_sensor", 0, "test_policy", nil)
+	policyInfo, err := newPolicyInfoFromSpec("", "test_policy", policyfilter.NoFilterID, spec, nil)
+	require.NoError(t, err)
+	sensor, err := createGenericKprobeSensor(spec, "test_sensor", policyInfo, simpleValidateInfo(spec.KProbes), kprobe)
 	if err != nil {
 		t.Errorf("createGenericKprobeSensor err expected: nil, got: %s", err)
 	}
@@ -105,7 +130,7 @@ func Test_SensorDestroyHook(t *testing.T) {
 
 	// Destroy should call the DestroyHook that was set in
 	// createGenericKprobeSensor and do the cleanup
-	sensor.Destroy()
+	sensor.Destroy(true)
 
 	// Table implem detail: the entry still technically exists in the table but
 	// is invalid, thus is not taken into account in the length
@@ -114,64 +139,227 @@ func Test_SensorDestroyHook(t *testing.T) {
 	}
 }
 
-// Test_Kprobe_DisableEnablePolicy tests that disabling and enabling a tracing
+const (
+	tcpConnectPolicyName      = "test"
+	tcpConnectPolicyNamespace = ""
+)
+
+var tcpConnectPolicy = v1alpha1.TracingPolicy{
+	Name: tcpConnectPolicyName,
+	Spec: v1alpha1.TracingPolicySpec{
+		KProbes: []v1alpha1.KProbeSpec{
+			{
+				Call:    "tcp_connect",
+				Syscall: false,
+			},
+		},
+	},
+}
+
+// Test_DisableEnablePolicy_Kprobe tests that disabling and enabling a tracing
 // policy containing a kprobe works. This is following a regression:
 // https://github.com/cilium/tetragon/issues/1489
-func Test_Kprobe_DisableEnablePolicy(t *testing.T) {
+func Test_DisableEnablePolicy_Kprobe(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	tus.LoadSensor(t, base.GetInitialSensor())
+	tus.LoadInitialSensor(t)
 	path := bpf.MapPrefixPath()
-	mgr, err := sensors.StartSensorManager(path, nil)
-	assert.NoError(t, err)
-	t.Cleanup(func() {
-		if err := mgr.StopSensorManager(ctx); err != nil {
-			panic("failed to stop sensor manager")
-		}
-	})
-
-	const policyName = "test"
-	const policyNamespace = ""
-	policy := v1alpha1.TracingPolicy{
-		ObjectMeta: v1.ObjectMeta{
-			Name: policyName,
-		},
-		Spec: v1alpha1.TracingPolicySpec{
-			KProbes: []v1alpha1.KProbeSpec{
-				{
-					Call:    "tcp_connect",
-					Syscall: false,
-				},
-			},
-		},
-	}
-
-	t.Run("sensor", func(t *testing.T) {
-		err = mgr.AddTracingPolicy(ctx, &policy)
-		assert.NoError(t, err)
-		t.Cleanup(func() {
-			err = mgr.DeleteTracingPolicy(ctx, policyName, policyNamespace)
-			assert.NoError(t, err)
-		})
-
-		err = mgr.DisableSensor(ctx, policyName)
-		assert.NoError(t, err)
-		err = mgr.EnableSensor(ctx, policyName)
-		assert.NoError(t, err)
-	})
+	mgr, err := sensors.StartSensorManager(path)
+	require.NoError(t, err)
 
 	t.Run("tracing-policy", func(t *testing.T) {
-		err = mgr.AddTracingPolicy(ctx, &policy)
-		assert.NoError(t, err)
+		err = mgr.AddTracingPolicy(ctx, &tcpConnectPolicy)
+		require.NoError(t, err)
 		t.Cleanup(func() {
-			err = mgr.DeleteTracingPolicy(ctx, policyName, policy.Namespace)
-			assert.NoError(t, err)
+			err = mgr.DeleteTracingPolicy(ctx, tcpConnectPolicyName, tcpConnectPolicyNamespace, tcpConnectPolicy.TpDomain())
+			require.NoError(t, err)
 		})
 
-		err = mgr.DisableTracingPolicy(ctx, policyName, policyNamespace)
-		assert.NoError(t, err)
-		err = mgr.EnableTracingPolicy(ctx, policyName, policyNamespace)
-		assert.NoError(t, err)
+		err = mgr.DisableTracingPolicy(ctx, tcpConnectPolicyName, tcpConnectPolicyNamespace, tcpConnectPolicy.TpDomain())
+		require.NoError(t, err)
+		err = mgr.EnableTracingPolicy(ctx, tcpConnectPolicyName, tcpConnectPolicyNamespace, tcpConnectPolicy.TpDomain())
+		require.NoError(t, err)
 	})
+}
+
+// Test_DisableEnablePolicy_KernelMemoryBytes first check that disabling and
+// enabling a policy works and then verifies that the kernel memory bytes for a
+// loaded policy is non-zero, and that for a disabled policy it's zero.
+func Test_DisableEnablePolicy_KernelMemoryBytes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tus.LoadInitialSensor(t)
+	path := bpf.MapPrefixPath()
+	mgr, err := sensors.StartSensorManager(path)
+	require.NoError(t, err)
+
+	err = mgr.AddTracingPolicy(ctx, &tcpConnectPolicy)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		err = mgr.DeleteTracingPolicy(ctx, tcpConnectPolicyName, tcpConnectPolicyNamespace, tcpConnectPolicy.TpDomain())
+		require.NoError(t, err)
+	})
+
+	list, err := mgr.ListTracingPolicies(ctx, tcpConnectPolicy.TpDomain())
+	require.NoError(t, err)
+	require.Len(t, list.Policies, 1)
+	assert.Equal(t, tetragon.TracingPolicyState_TP_STATE_ENABLED, list.Policies[0].State)
+	assert.NotZero(t, list.Policies[0].KernelMemoryBytes)
+
+	err = mgr.DisableTracingPolicy(ctx, tcpConnectPolicyName, tcpConnectPolicyNamespace, tcpConnectPolicy.TpDomain())
+	require.NoError(t, err)
+
+	list, err = mgr.ListTracingPolicies(ctx, tcpConnectPolicy.TpDomain())
+	require.NoError(t, err)
+	require.Len(t, list.Policies, 1)
+	assert.Equal(t, tetragon.TracingPolicyState_TP_STATE_DISABLED, list.Policies[0].State)
+	assert.Zero(t, list.Policies[0].KernelMemoryBytes)
+
+	err = mgr.EnableTracingPolicy(ctx, tcpConnectPolicyName, tcpConnectPolicyNamespace, tcpConnectPolicy.TpDomain())
+	require.NoError(t, err)
+
+	list, err = mgr.ListTracingPolicies(ctx, tcpConnectPolicy.TpDomain())
+	require.NoError(t, err)
+	require.Len(t, list.Policies, 1)
+	assert.Equal(t, tetragon.TracingPolicyState_TP_STATE_ENABLED, list.Policies[0].State)
+	assert.NotZero(t, list.Policies[0].KernelMemoryBytes)
+}
+
+func Test_validateOverride(t *testing.T) {
+	tests := []struct {
+		name     string
+		f        *v1alpha1.KProbeSpec
+		funcName string
+		useMulti bool
+		wantErr  bool
+	}{
+		{
+			name: "override on syscalls",
+			f: &v1alpha1.KProbeSpec{
+				Call:    "sys_execve",
+				Return:  false,
+				Syscall: true,
+				Message: "",
+				Args: []v1alpha1.KProbeArg{
+					{
+						Index: 0,
+						Type:  "string",
+					},
+				},
+				Selectors: []v1alpha1.KProbeSelector{
+					{
+						MatchActions: []v1alpha1.ActionSelector{
+							{
+								Action:   "Override",
+								ArgError: -1,
+							},
+						},
+					},
+				},
+			},
+			funcName: "sys_execve",
+			useMulti: false,
+			wantErr:  !bpf.HasOverrideHelper(),
+		},
+		{
+			name: "override on lsm funcs",
+			f: &v1alpha1.KProbeSpec{
+				Call:    "security_bprm_creds_for_exec",
+				Return:  false,
+				Syscall: false,
+				Message: "",
+				Args: []v1alpha1.KProbeArg{
+					{
+						Index: 0,
+						Type:  "linux_binprm",
+					},
+				},
+				Selectors: []v1alpha1.KProbeSelector{
+					{
+						MatchActions: []v1alpha1.ActionSelector{
+							{
+								Action:   "Override",
+								ArgError: -1,
+							},
+						},
+					},
+				},
+			},
+			funcName: "security_bprm_creds_for_exec",
+			useMulti: false,
+			wantErr:  !bpf.HasModifyReturn(),
+		},
+		{
+			name: "override on lsm funcs with multi-kprobe enabled should be denied",
+			f: &v1alpha1.KProbeSpec{
+				Call:    "security_bprm_creds_for_exec",
+				Return:  false,
+				Syscall: false,
+				Message: "",
+				Args: []v1alpha1.KProbeArg{
+					{
+						Index: 0,
+						Type:  "linux_binprm",
+					},
+				},
+				Selectors: []v1alpha1.KProbeSelector{
+					{
+						MatchActions: []v1alpha1.ActionSelector{
+							{
+								Action:   "Override",
+								ArgError: -1,
+							},
+						},
+					},
+				},
+			},
+			funcName: "security_bprm_creds_for_exec",
+			useMulti: true,
+			wantErr:  true,
+		},
+		{
+			name: "override on non-lsm and non-syscall functions should be denied",
+			f: &v1alpha1.KProbeSpec{
+				Call:    "dentry_open",
+				Return:  false,
+				Syscall: false,
+				Message: "",
+				Args: []v1alpha1.KProbeArg{
+					{
+						Index: 0,
+						Type:  "linux_binprm",
+					},
+				},
+				Selectors: []v1alpha1.KProbeSelector{
+					{
+						MatchActions: []v1alpha1.ActionSelector{
+							{
+								Action:   "Override",
+								ArgError: -1,
+							},
+						},
+					},
+				},
+			},
+			funcName: "dentry_open",
+			useMulti: true,
+			wantErr:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotErr := validateOverride(tt.f, tt.funcName, tt.useMulti)
+			if gotErr != nil {
+				if !tt.wantErr {
+					t.Errorf("validateOverride() failed: %v", gotErr)
+				}
+				return
+			}
+			if tt.wantErr {
+				t.Fatal("validateOverride() succeeded unexpectedly")
+			}
+		})
+	}
 }

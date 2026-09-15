@@ -5,40 +5,38 @@ package grpc
 
 import (
 	"context"
-	"encoding/base64"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/cilium/tetragon/pkg/grpc/exec"
-	"github.com/cilium/tetragon/pkg/option"
-
-	"github.com/cilium/tetragon/api/v1/tetragon"
-	"github.com/cilium/tetragon/pkg/api/processapi"
-	"github.com/cilium/tetragon/pkg/process"
-	"github.com/cilium/tetragon/pkg/reader/node"
-	"github.com/cilium/tetragon/pkg/rthooks"
-	"github.com/cilium/tetragon/pkg/watcher"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/api/processapi"
+	"github.com/cilium/tetragon/pkg/build"
+	"github.com/cilium/tetragon/pkg/defaults"
+	"github.com/cilium/tetragon/pkg/grpc/exec"
+	"github.com/cilium/tetragon/pkg/option"
+	"github.com/cilium/tetragon/pkg/process"
+	"github.com/cilium/tetragon/pkg/rthooks"
+	"github.com/cilium/tetragon/pkg/watcher"
 )
 
 func TestProcessManager_getPodInfo(t *testing.T) {
-	controller := true
+	build.SkipIfK8sDisabled(t)
 	podA := corev1.Pod{
-		ObjectMeta: v1.ObjectMeta{
-			Name:         "pod-a",
-			Namespace:    "namespace-a",
-			GenerateName: "test-workload-",
-			OwnerReferences: []v1.OwnerReference{
-				{
-					Name:       "test-workload",
-					Controller: &controller,
-				},
+		Name:         "pod-a",
+		Namespace:    "namespace-a",
+		GenerateName: "test-workload-",
+		OwnerReferences: []v1.OwnerReference{
+			{
+				Name:       "test-workload",
+				Controller: new(true),
 			},
 		},
 		Status: corev1.PodStatus{
@@ -60,9 +58,9 @@ func TestProcessManager_getPodInfo(t *testing.T) {
 		},
 	}
 
-	pods := []interface{}{&podA}
-	err := process.InitCache(watcher.NewFakeK8sWatcher(pods), 10)
-	assert.NoError(t, err)
+	pods := []any{&podA}
+	err := process.InitCache(watcher.NewFakeK8sWatcher(pods), 10, defaults.DefaultProcessCacheGCInterval)
+	require.NoError(t, err)
 	defer process.FreeCache()
 	pod := process.GetPodInfo("container-id-not-found", "", "", 0)
 	assert.Nil(t, pod)
@@ -83,23 +81,22 @@ func TestProcessManager_getPodInfo(t *testing.T) {
 					Seconds: int64(podA.Status.ContainerStatuses[0].State.Running.StartedAt.Second()),
 					Nanos:   int32(podA.Status.ContainerStatuses[0].State.Running.StartedAt.Nanosecond()),
 				},
-				Pid: &wrapperspb.UInt32Value{Value: 1234},
+				Pid:             &wrapperspb.UInt32Value{Value: 1234},
+				SecurityContext: &tetragon.SecurityContext{},
 			},
 		}, pod)
 }
 
 func TestProcessManager_getPodInfoMaybeExecProbe(t *testing.T) {
-	controller := true
+	build.SkipIfK8sDisabled(t)
 	var podA = corev1.Pod{
-		ObjectMeta: v1.ObjectMeta{
-			Name:         "pod-a",
-			Namespace:    "namespace-a",
-			GenerateName: "test-workload-",
-			OwnerReferences: []v1.OwnerReference{
-				{
-					Name:       "test-workload",
-					Controller: &controller,
-				},
+		Name:         "pod-a",
+		Namespace:    "namespace-a",
+		GenerateName: "test-workload-",
+		OwnerReferences: []v1.OwnerReference{
+			{
+				Name:       "test-workload",
+				Controller: new(true),
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -107,10 +104,8 @@ func TestProcessManager_getPodInfoMaybeExecProbe(t *testing.T) {
 				{
 					Name: "pod-a-container-a-name",
 					LivenessProbe: &corev1.Probe{
-						ProbeHandler: corev1.ProbeHandler{
-							Exec: &corev1.ExecAction{
-								Command: []string{"command", "arg-a", "arg-b"},
-							},
+						Exec: &corev1.ExecAction{
+							Command: []string{"command", "arg-a", "arg-b"},
 						},
 					},
 				},
@@ -125,9 +120,9 @@ func TestProcessManager_getPodInfoMaybeExecProbe(t *testing.T) {
 			},
 		},
 	}
-	pods := []interface{}{&podA}
-	err := process.InitCache(watcher.NewFakeK8sWatcher(pods), 10)
-	assert.NoError(t, err)
+	pods := []any{&podA}
+	err := process.InitCache(watcher.NewFakeK8sWatcher(pods), 10, defaults.DefaultProcessCacheGCInterval)
+	require.NoError(t, err)
 	defer process.FreeCache()
 	pod := process.GetPodInfo("aaaaaaa", "/bin/command", "arg-a arg-b", 1234)
 	assert.Equal(t,
@@ -136,18 +131,19 @@ func TestProcessManager_getPodInfoMaybeExecProbe(t *testing.T) {
 			Workload:  podA.OwnerReferences[0].Name,
 			Name:      podA.Name,
 			Container: &tetragon.Container{
-				Id:             podA.Status.ContainerStatuses[0].ContainerID,
-				Name:           podA.Status.ContainerStatuses[0].Name,
-				Image:          &tetragon.Image{},
-				Pid:            &wrapperspb.UInt32Value{Value: 1234},
-				MaybeExecProbe: true,
+				Id:              podA.Status.ContainerStatuses[0].ContainerID,
+				Name:            podA.Status.ContainerStatuses[0].Name,
+				Image:           &tetragon.Image{},
+				Pid:             &wrapperspb.UInt32Value{Value: 1234},
+				MaybeExecProbe:  true,
+				SecurityContext: &tetragon.SecurityContext{},
 			},
 		}, pod)
 }
 
 func TestProcessManager_GetProcessExec(t *testing.T) {
-	err := process.InitCache(watcher.NewFakeK8sWatcher(nil), 10)
-	assert.NoError(t, err)
+	err := process.InitCache(watcher.NewFakeK8sWatcher(nil), 10, defaults.DefaultProcessCacheGCInterval)
+	require.NoError(t, err)
 	defer process.FreeCache()
 	var wg sync.WaitGroup
 
@@ -157,8 +153,9 @@ func TestProcessManager_GetProcessExec(t *testing.T) {
 		context.Background(),
 		&wg,
 		nil,
-		&rthooks.Runner{})
-	assert.NoError(t, err)
+		&rthooks.Runner{},
+		nil)
+	require.NoError(t, err)
 	pi := &exec.MsgExecveEventUnix{
 		Unix: &processapi.MsgExecveEventUnix{
 			Msg: &processapi.MsgExecveEvent{
@@ -210,27 +207,4 @@ func TestProcessManager_GetProcessExec(t *testing.T) {
 			Setuid: val10000, Setgid: val10000,
 		},
 		exec.GetProcessExec(pi, false).Process.BinaryProperties)
-}
-
-func Test_getNodeNameForExport(t *testing.T) {
-	assert.NotEqual(t, "", node.GetNodeNameForExport()) // we should get the hostname here
-	assert.NoError(t, os.Setenv("NODE_NAME", "from-node-name"))
-	assert.Equal(t, "from-node-name", node.GetNodeNameForExport())
-	assert.NoError(t, os.Setenv("HUBBLE_NODE_NAME", "from-hubble-node-name"))
-	assert.Equal(t, "from-hubble-node-name", node.GetNodeNameForExport())
-	assert.NoError(t, os.Unsetenv("NODE_NAME"))
-	assert.NoError(t, os.Unsetenv("HUBBLE_NODE_NAME"))
-}
-
-func TestProcessManager_GetProcessID(t *testing.T) {
-	assert.NoError(t, os.Setenv("NODE_NAME", "my-node"))
-
-	err := process.InitCache(watcher.NewFakeK8sWatcher([]interface{}{}), 10)
-	assert.NoError(t, err)
-	defer process.FreeCache()
-	id := process.GetProcessID(1, 2)
-	decoded, err := base64.StdEncoding.DecodeString(id)
-	assert.NoError(t, err)
-	assert.Equal(t, "my-node:2:1", string(decoded))
-	assert.NoError(t, os.Unsetenv("NODE_NAME"))
 }

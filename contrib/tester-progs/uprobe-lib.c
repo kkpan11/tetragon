@@ -26,12 +26,79 @@ int uprobe_test_lib_arg3(unsigned long a1, unsigned int a2, void *a3)
 
 int uprobe_test_lib_arg4(long a1, int a2, char a3, void *a4)
 {
-	printf("uprobe_test_lib_arg3 called\n");
+	printf("uprobe_test_lib_arg4 called\n");
 	return 0;
 }
 
 int uprobe_test_lib_arg5(int a1, char a2, unsigned long a3, short a4, void *a5)
 {
-	printf("uprobe_test_lib_arg3 called\n");
+	printf("uprobe_test_lib_arg5 called\n");
 	return 0;
+}
+
+int uprobe_test_lib_string_arg(char *str)
+{
+	printf("uprobe_test_lib_string_arg called\n");
+	return 0;
+}
+
+// This will be used for Override argNewSymbol test
+int uprobe_test_lib_string_arg__(char *str)
+{
+	printf("uprobe_test_lib_string_arg__ called\n");
+	return 1; // fixed return code to be used by tests
+}
+
+int uprobe_test_lib_string_arg0(char *str, int two, int three, int four, int five)
+{
+	printf("uprobe_test_lib_string_arg0 called\n");
+	return 0;
+}
+
+int uprobe_test_lib_string_arg1(int one, char *str, int three, int four, int five)
+{
+	printf("uprobe_test_lib_string_arg1 called\n");
+	return 0;
+}
+
+int uprobe_test_lib_string_arg2(int one, int two, char *str, int four, int five)
+{
+	printf("uprobe_test_lib_string_arg2 called\n");
+	return 0;
+}
+
+int uprobe_test_lib_string_arg3(int one, int two, int three, char *str, int five)
+{
+	printf("uprobe_test_lib_string_arg3 called\n");
+	return 0;
+}
+
+int uprobe_test_lib_string_arg4(int one, int two, int three, int four, char *str)
+{
+	printf("uprobe_test_lib_string_arg4 called\n");
+	return 0;
+}
+
+int uprobe_test_lib_string_arg_empty(char *str)
+{
+	printf("uprobe_test_lib_string_arg_empty called\n");
+	return 0;
+}
+
+int uprobe_test_lib_string_arg_null(char *str)
+{
+	printf("uprobe_test_lib_string_arg_null called\n");
+	return 0;
+}
+
+int uprobe_test_lib_string_arg_substring(char *str)
+{
+	printf("uprobe_test_lib_string_arg_substring called\n");
+	return 0;
+}
+
+int uprobe_test_lib_callback(int (*callback)(int), int arg)
+{
+	printf("uprobe_test_lib_callback called\n");
+	return callback(arg);
 }

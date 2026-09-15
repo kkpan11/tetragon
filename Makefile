@@ -3,16 +3,14 @@
 
 include Makefile.defs
 
-GO ?= go
 INSTALL = $(QUIET)install
 BINDIR ?= /usr/local/bin
-CONTAINER_ENGINE ?= docker
 DOCKER_IMAGE_TAG ?= latest
 LOCAL_CLANG ?= 0
 LOCAL_CLANG_FORMAT ?= 0
-FORMAT_FIND_FLAGS ?= -name '*.c' -o -name '*.h' -not -path 'bpf/include/vmlinux.h' -not -path 'bpf/include/api.h' -not -path 'bpf/libbpf/*'
+FORMAT_FIND_FLAGS ?= -name '*.c' -o -name '*.h'
 NOOPT ?= 0
-CLANG_IMAGE = quay.io/cilium/clang:aeaada5cf60efe8d0e772d032fe3cc2bc613739c@sha256:b440ae7b3591a80ffef8120b2ac99e802bbd31dee10f5f15a48566832ae0866f
+CLANG_IMAGE = quay.io/cilium/clang:969f95f8ef7923af36bf657ba6d4c65691f56882@sha256:ff83e52d3ea150b3d93e4ae40ae86620003ac3f6d91fe6e939dcc95469f83ff2
 TESTER_PROGS_DIR = "contrib/tester-progs"
 # Extra flags to pass to test binary
 EXTRA_TESTFLAGS ?=
@@ -21,6 +19,7 @@ GO_TEST_TIMEOUT ?= 20m
 E2E_TEST_TIMEOUT ?= 20m
 BUILD_PKG_DIR ?= $(shell pwd)/build/$(TARGET_ARCH)
 VERSION ?= $(shell git describe --tags --always --exclude '*/*')
+CONTAINER_ENGINE_ARGS ?=
 
 # Do a parallel build with multiple jobs, based on the number of CPUs online
 # in this system: 'make -j8' on a 8-CPU system, etc.
@@ -65,6 +64,7 @@ endif
 # GO_BUILD_LDFLAGS is initialized to empty use EXTRA_GO_BUILD_LDFLAGS to add link flags
 GO_BUILD_LDFLAGS =
 GO_BUILD_LDFLAGS += -X 'github.com/cilium/tetragon/pkg/version.Version=$(VERSION)'
+GO_BUILD_LDFLAGS += -X 'github.com/cilium/tetragon/pkg/version.Name=tetragon'
 ifeq ($(NOSTRIP),)
     # Note: these options will not remove annotations needed for stack
     # traces, so panic backtraces will still be readable.
@@ -91,15 +91,18 @@ endif
 GO_BUILD = CGO_ENABLED=0 GOARCH=$(GOARCH) $(GO) build $(GO_BUILD_FLAGS)
 GO_BUILD_HOOK = CGO_ENABLED=0 GOARCH=$(GOARCH) $(GO) -C contrib/tetragon-rthooks build $(GO_BUILD_FLAGS)
 
+GO_BUILD_FLAGS_NOK8S = $(subst version.Name=tetragon,version.Name=tetragon-nok8s,$(GO_BUILD_FLAGS))
+GO_BUILD_NOK8S = CGO_ENABLED=0 GOARCH=$(GOARCH) $(GO) build $(GO_BUILD_FLAGS_NOK8S) -tags nok8s
+
 .PHONY: all
-all: tetragon-bpf tetragon tetra generate-flags test-compile tester-progs protoc-gen-go-tetragon tetragon-bench
+all: tetragon-bpf tetragon tetra test-compile tester-progs protoc-gen-go-tetragon tetragon-bench
 
 -include Makefile.cli
 
 .PHONY: clean
 clean: cli-clean tarball-clean
 	$(MAKE) -C ./bpf clean
-	rm -f go-tests/*.test ./ksyms ./tetragon ./tetragon-operator ./tetra ./alignchecker
+	rm -f go-tests/*.test ./ksyms ./tetragon ./tetragon-operator ./tetra ./alignchecker ./tetragon.exe
 	rm -f contrib/sigkill-tester/sigkill-tester contrib/namespace-tester/test_ns contrib/capabilities-tester/test_caps
 	$(MAKE) -C $(TESTER_PROGS_DIR) clean
 
@@ -109,6 +112,10 @@ clean: cli-clean tarball-clean
 tetragon: ## Compile the Tetragon agent.
 	$(GO_BUILD) ./cmd/tetragon/
 
+.PHONY: tetragon-nok8s
+tetragon-nok8s: ## Compile the Tetragon agent without k8s support.
+	$(GO_BUILD_NOK8S) -o tetragon-nok8s ./cmd/tetragon/
+
 .PHONY: tetragon-operator
 tetragon-operator: ## Compile the Tetragon operator.
 	$(GO_BUILD) -o $@ ./operator
@@ -116,6 +123,10 @@ tetragon-operator: ## Compile the Tetragon operator.
 .PHONY: tetra
 tetra: ## Compile the Tetragon gRPC client.
 	$(GO_BUILD) ./cmd/tetra/
+
+.PHONY: tetra-nok8s
+tetra-nok8s: ## Compile the Tetragon gRPC client.
+	$(GO_BUILD_NOK8S) -o $@ ./cmd/tetra/
 
 .PHONY: tetragon-bpf
 ifeq (1,$(LOCAL_CLANG))
@@ -130,9 +141,9 @@ tetragon-bpf-local:
 
 .PHONY: tetragon-bpf-container
 tetragon-bpf-container:
-	$(CONTAINER_ENGINE) rm tetragon-clang || true
+	$(CONTAINER_ENGINE) rm -f tetragon-clang || true
 	$(CONTAINER_ENGINE) run -v $(CURDIR):/tetragon:Z -u $$(id -u) -e BPF_TARGET_ARCH=$(BPF_TARGET_ARCH) --name tetragon-clang $(CLANG_IMAGE) make -C /tetragon/bpf -j$(JOBS) $(__BPF_DEBUG_FLAGS)
-	$(CONTAINER_ENGINE) rm tetragon-clang
+	$(CONTAINER_ENGINE) rm -f tetragon-clang
 
 .PHONY: tetragon-bench
 tetragon-bench: ## Compile tetragon-bench tool.
@@ -169,7 +180,7 @@ install: ## Install tetragon agent and tetra as standalone binaries.
 
 .PHONY: image
 image: ## Build the Tetragon agent container image.
-	$(CONTAINER_ENGINE) build -t "cilium/tetragon:${DOCKER_IMAGE_TAG}" --target release --build-arg TETRAGON_VERSION=$(VERSION) --platform=linux/${TARGET_ARCH} .
+	$(CONTAINER_ENGINE) build -t "cilium/tetragon:${DOCKER_IMAGE_TAG}" --target release --build-arg TETRAGON_VERSION=$(VERSION) ${CONTAINER_ENGINE_ARGS} --platform=linux/${TARGET_ARCH} .
 	@echo "Push like this when ready:"
 	@echo "${CONTAINER_ENGINE} push cilium/tetragon:$(DOCKER_IMAGE_TAG)"
 
@@ -233,20 +244,26 @@ tarball-release: tarball ## Build Tetragon release tarball.
 tarball-clean:
 	rm -fr $(BUILD_PKG_DIR)
 
+.PHONY: tester-progs-tarball ## Buld Tetragon tester progs tarball
+tester-progs-tarball: tester-progs
+	tar -C contrib/tester-progs -cvzf tester-progs.tar.gz --transform 's:^:tester-progs/:' $(shell make -s -C contrib/tester-progs all-files)
+
+
 ##@ Test
 
 # renovate: datasource=docker
-GOLANGCILINT_IMAGE=docker.io/golangci/golangci-lint:v1.59.1@sha256:b5f8712114561f1e2fbe74d04ed07ddfd992768705033a6251f3c7b848eac38e
+GOLANGCILINT_IMAGE=docker.io/golangci/golangci-lint:v2.13.1@sha256:d371321370bf2907bd13a8f6f8baff0e0ca7438d76fdf636b281eadf7e2305e3
 GOLANGCILINT_WANT_VERSION := $(subst @sha256,,$(patsubst v%,%,$(word 2,$(subst :, ,$(lastword $(subst /, ,$(GOLANGCILINT_IMAGE)))))))
 GOLANGCILINT_VERSION = $(shell golangci-lint version 2>/dev/null)
-.PHONY: check
 ifneq (,$(findstring $(GOLANGCILINT_WANT_VERSION),$(GOLANGCILINT_VERSION)))
-check: ## Run Go linters.
-	golangci-lint run
+GOLANGCILINT_BIN = golangci-lint
 else
-check:
-	$(CONTAINER_ENGINE) run --rm -v `pwd`:/app:Z -w /app --env GOTOOLCHAIN=auto $(GOLANGCILINT_IMAGE) golangci-lint run
+GOLANGCILINT_BIN = $(CONTAINER_ENGINE) run --rm -v `pwd`:/app:Z -w /app --env GOTOOLCHAIN=auto $(GOLANGCILINT_IMAGE) golangci-lint
 endif
+
+.PHONY: check
+check: ## Run Go linters.
+	$(GOLANGCILINT_BIN) run
 
 .PHONY: copy-golangci-lint
 copy-golangci-lint:
@@ -260,17 +277,44 @@ copy-golangci-lint:
 test: tester-progs tetragon-bpf ## Run Go tests.
 	$(GO) test -exec "$(SUDO)" -p 1 -parallel 1 $(GOFLAGS) -gcflags=$(GO_BUILD_GCFLAGS) -timeout $(GO_TEST_TIMEOUT) -failfast -cover ./pkg/... ./cmd/... ./operator/... ${EXTRA_TESTFLAGS}
 
+# Packages exercised by `make test-race`. Override on the command line to
+# expand or narrow the scope.
+RACE_PKGS ?= ./pkg/sensors ./pkg/metrics/... ./pkg/process/... ./pkg/reader/... ./pkg/server/... ./pkg/ratelimit/...
+RACE_TEST_TIMEOUT ?= 30m
+
+.PHONY: test-race
+test-race: tester-progs tetragon-bpf ## Run Go tests with the race detector (use RACE_PKGS=... to override scope).
+	$(GO) test $(GOFLAGS) -gcflags=$(GO_BUILD_GCFLAGS) -timeout $(RACE_TEST_TIMEOUT) -race $(RACE_PKGS) ${EXTRA_TESTFLAGS}
+
+FUZZ_TIME ?= 30s
+
+.PHONY: test-fuzz
+test-fuzz: ## Discover and run all Go fuzz targets
+	@package_tests=$$($(GO) list -f '{{.ImportPath}} {{range .TestGoFiles}}{{$$.Dir}}/{{.}} {{end}}{{range .XTestGoFiles}}{{$$.Dir}}/{{.}} {{end}}' ./...) || exit $$?; \
+	printf '%s\n' "$$package_tests" | \
+	while read -r pkg test_files; do \
+		[ -n "$$test_files" ] || continue; \
+		fuzz_tests=$$(awk '$$1 == "func" && $$2 ~ /^Fuzz/ { sub(/\(.*/, "", $$2); print $$2 }' $$test_files); \
+		for fuzz_test in $$fuzz_tests; do \
+			echo "fuzzing $$pkg/$$fuzz_test"; \
+			$(GO) test -exec "$(SUDO)" $(GOFLAGS) -gcflags=$(GO_BUILD_GCFLAGS) -run '^$$' -fuzz "^$${fuzz_test}$$" -fuzztime $(FUZZ_TIME) "$$pkg" ${EXTRA_TESTFLAGS} || exit $$?; \
+		done; \
+	done
+
 .PHONY: tester-progs
 tester-progs: ## Compile helper programs for unit testing.
 	$(MAKE) -C $(TESTER_PROGS_DIR)
 
+## bpf-test: ## run BPF tests.
+## bpf-test BPFGOTESTFLAGS="-v": ## run BPF tests with verbose.
 .PHONY: bpf-test
-bpf-test: ## Run BPF tests.
+bpf-test:
 	$(MAKE) -C ./bpf run-test
 
 .PHONY: verify
 verify: tetragon-bpf ## Verify BPF programs.
-	sudo contrib/verify/verify.sh bpf/objs
+	$(GO) test ./contrib/verify/ -skip TestVerifyTetragonPrograms
+	$(GO) test -exec 'sudo -E' ./contrib/verify/ -v -run TestVerifyTetragonPrograms -tetragon-dir=$(CURDIR)/bpf/objs $(if $(DEBUG),-debug)
 
 .PHONY: alignchecker
 alignchecker: ## Run alignchecker.
@@ -294,6 +338,11 @@ test-compile: ## Compile unit tests.
 		echo -c ./$$localpkg -o go-tests/$$localtestfile; \
 	done | GOMAXPROCS=1 xargs -P $(JOBS) -L 1 $(GO) test -gcflags=$(GO_BUILD_GCFLAGS)
 
+.PHONY: split-tetragon-gotests
+split-tetragon-gotests:
+	$(GO) -C tools build -o ../bin/split-tetragon-gotests ./split-tetragon-gotests
+	./bin/split-tetragon-gotests -ci-run 1
+
 .PHONY: fetch-testdata
 fetch-testdata:
 	wget -nc -P testdata/btf 'https://github.com/cilium/tetragon-testdata/raw/main/btf/vmlinux-5.4.104+'
@@ -302,6 +351,8 @@ fetch-testdata:
 E2E_AGENT ?= "cilium/tetragon:$(DOCKER_IMAGE_TAG)"
 # Operator image to use for end-to-end tests
 E2E_OPERATOR ?= "cilium/tetragon-operator:$(DOCKER_IMAGE_TAG)"
+# RTHooks image to use for end-to-end tests
+E2E_RTHOOKS ?= "cilium/tetragon-rthooks:$(DOCKER_IMAGE_TAG)"
 # BTF file to use in the E2E test. Set to nothing to use system BTF.
 E2E_BTF ?= ""
 # Actual flags to use for BTF file in e2e test. Use E2E_BTF instead.
@@ -328,7 +379,34 @@ e2e-test: image image-operator
 else
 e2e-test:
 endif
-	$(GO) list $(E2E_TESTS) | xargs -Ipkg $(GO) test $(GOFLAGS) -gcflags=$(GO_BUILD_GCFLAGS) -timeout $(E2E_TEST_TIMEOUT) -failfast -cover pkg ${EXTRA_TESTFLAGS} -fail-fast -tetragon.helm.set tetragon.image.override="$(E2E_AGENT)" -tetragon.helm.set tetragonOperator.image.override="$(E2E_OPERATOR)" -tetragon.helm.url="" -tetragon.helm.chart="$(realpath ./install/kubernetes/tetragon)" $(E2E_BTF_FLAGS)
+	$(GO) list $(E2E_TESTS) | xargs -Ipkg $(GO) test $(GOFLAGS) -gcflags=$(GO_BUILD_GCFLAGS) -timeout $(E2E_TEST_TIMEOUT) -failfast -cover pkg ${EXTRA_TESTFLAGS} -fail-fast \
+	-tetragon.helm.set tetragon.image.override="$(E2E_AGENT)" \
+	-tetragon.helm.set tetragonOperator.image.override="$(E2E_OPERATOR)" \
+	-tetragon.helm.set tetragon.gops.enabled=true \
+	-tetragon.helm.url="" -tetragon.helm.chart="$(realpath ./install/kubernetes/tetragon)" $(E2E_BTF_FLAGS)
+
+
+MINIKUBE_DRIVER ?= docker # docker,kvm2
+MINIKUBE_CONTAINER_RUNTIME ?= containerd # containerd,cri-o
+# Some e2e tests are special because they require a more proper Kubernetes implementation.
+# We use minikube for those and list them here.
+E2E_TESTS_MINIKUBE ?= ./tests/e2e/tests/rthooks
+
+## e2e-test-minikube: ## run e2e tests with minikube
+## e2e-test-minikube E2E_TESTS_MINIKUBE=./tests/e2e/tests/foo: ## run a specific e2e test with minikube
+.PHONY: e2e-test-minikube
+e2e-test-minikube: image-rthooks
+	@if minikube status 2>/dev/null; then \
+		echo "Error: a minikube instance already exists. Delete it first with 'minikube delete'."; \
+		exit 1; \
+	fi
+	minikube start --driver=$(MINIKUBE_DRIVER) --container-runtime=$(MINIKUBE_CONTAINER_RUNTIME)
+	kubectl config set-context minikube
+
+	$(MAKE) e2e-test E2E_TESTS=$(E2E_TESTS_MINIKUBE) EXTRA_TESTFLAGS="$(EXTRA_TESTFLAGS) -minikube -kubeconfig=$$HOME/.kube/config"; \
+	EXIT_CODE=$$?; \
+	minikube delete; \
+	exit $$EXIT_CODE
 
 ##@ Development
 
@@ -337,16 +415,50 @@ cscope: ## Generate cscope for bpf files.
 	find bpf -name "*.[chxsS]" -print > cscope.files
 	cscope -b -q -k
 
+.PHONY: gen-compile-commands
+BEAR_CLI := $(shell which bear 2> /dev/null)
+gen-compile-commands: ## Generates compile_commands.json
+ifeq ($(BEAR_CLI),)
+	@echo "Error: 'bear' must be installed and available in \$\$PATH to generate the compile_commands.json"
+	@exit 1
+else
+	@echo "Generating compile_commands.json using bear..."
+	@$(BEAR_CLI) $(MAKE) tetragon-bpf LOCAL_CLANG=1 LOCAL_CLANG_FORMAT=1
+endif
+
+
+KIND_CONFIG ?= contrib/kind/kind-config.yaml
+
+## kind: ## Create a kind cluster for Tetragon development.
+## kind KIND_CONFIG=custom-config.yaml: ## Create a kind cluster using a custom kind config file.
 .PHONY: kind
 kind: ## Create a kind cluster for Tetragon development.
-	./contrib/localdev/bootstrap-kind-cluster.sh
+	./contrib/kind/bootstrap-kind-cluster.sh --config $(KIND_CONFIG)
 
+KIND_BUILD_IMAGES ?= 1
+VALUES ?=
+
+## kind-install-tetragon: ## Install Tetragon in a kind cluster.
+## kind-install-tetragon KIND_BUILD_IMAGES=0: ## Install Tetragon in a kind cluster without (re-)building images.
+## kind-install-tetragon VALUES=values.yaml: ## Install Tetragon in a kind cluster using additional Helm values.
 .PHONY: kind-install-tetragon
-kind-install-tetragon: ## Install local version of Tetragon in the kind cluster.
-	./contrib/localdev/install-tetragon.sh --image cilium/tetragon:latest --operator cilium/tetragon-operator:latest
+ifneq ($(KIND_BUILD_IMAGES), 0)
+kind-install-tetragon: images
+else
+kind-install-tetragon:
+endif
+ifneq ($(VALUES),)
+	./contrib/kind/install-tetragon.sh -v $(VALUES)
+else
+	./contrib/kind/install-tetragon.sh
+endif
 
 .PHONY: kind-setup
-kind-setup: images kind kind-install-tetragon ## Create a kind cluster and install local version of Tetragon.
+kind-setup: kind kind-install-tetragon ## Create a kind cluster and install local version of Tetragon.
+
+.PHONY: kind-down
+kind-down: ## Delete a kind cluster for Tetragon development.
+	./contrib/kind/delete-kind-cluster.sh
 
 ##@ Chores and generated files
 
@@ -355,31 +467,40 @@ codegen: | protogen
 protogen: protoc-gen-go-tetragon ## Generate code based on .proto files.
 	# Need to call vendor twice here, once before and once after codegen the reason
 	# being we need to grab changes first plus pull in whatever gets generated here.
-	$(MAKE) vendor
+	$(MAKE) -C api vendor
 	$(MAKE) -C api
-	$(MAKE) vendor
+	$(GO) mod tidy
+	$(GO) mod vendor
+	$(GO) mod verify
+	$(MAKE) -C contrib/tetragon-rthooks vendor
 
 .PHONY: protoc-gen-go-tetragon
 protoc-gen-go-tetragon:
-	$(GO_BUILD) -o bin/$@ ./tools/protoc-gen-go-tetragon/
+	CGO_ENABLED=0 GOARCH=$(GOARCH) $(GO) -C tools build -ldflags "$(GO_BUILD_LDFLAGS)" -o ../bin/$@ ./protoc-gen-go-tetragon/
 
 .PHONY: generate crds
 generate: | crds
 crds: ## Generate kubebuilder files.
 	# Need to call vendor twice here, once before and once after generate, the reason
 	# being we need to grab changes first plus pull in whatever gets generated here.
-	$(MAKE) vendor
-	$(MAKE) -C pkg/k8s/
-	$(MAKE) vendor
-
-.PHONY: vendor
-vendor: ## Tidy and vendor Go modules.
-	$(MAKE) -C ./api vendor
-	$(MAKE) -C ./pkg/k8s vendor
-	$(MAKE) -C ./contrib/tetragon-rthooks vendor
+	$(MAKE) -C pkg/k8s vendor
+	$(MAKE) -C pkg/k8s
+	$(MAKE) -C pkg/k8s vendor
 	$(GO) mod tidy
 	$(GO) mod vendor
 	$(GO) mod verify
+	# YAML CRDs also live in the helm charts, so update them as well.
+	$(MAKE) -C install/kubernetes tetragon/crds-yaml tetragon/schemas
+
+.PHONY: vendor
+vendor: ## Tidy and vendor Go modules.
+	$(MAKE) -C api vendor
+	$(MAKE) -C pkg/k8s vendor
+	$(MAKE) -C contrib/tetragon-rthooks vendor
+	$(GO) mod tidy
+	$(GO) mod vendor
+	$(GO) mod verify
+	$(MAKE) -C tools tidy
 
 .PHONY: clang-format
 ifeq (1,$(LOCAL_CLANG_FORMAT))
@@ -394,13 +515,65 @@ endif
 
 .PHONY: go-format
 go-format: ## Run code formatter on Go code.
-	find . -name '*.go' -not -path '**/vendor/*' -not -path './pkg/k8s/vendor/*' -not -path './api/v1/tetragon/*' | xargs goimports -w
+	find . -name '*.go' \
+	-not -path '**/vendor/*' \
+	-not -path './pkg/k8s/vendor/*' \
+	-not -path './api/v1/tetragon/*' \
+	-not -path '**/zz_generated.deepcopy.go' | \
+	  xargs realpath | \
+	  xargs $(GO) -C tools tool goimports -local github.com/cilium/tetragon,github.com/cilium/tetragon/api,github.com/cilium/tetragon/pkg/k8s,github.com/cilium/tetragon/tools -w
+	$(GOLANGCILINT_BIN) run --fix --enable-only wsl_v5
 
 .PHONY: format
 format: go-format clang-format ## Convenience alias for clang-format and go-format.
 
+.PHONY: validate
+validate: check format generate-flags metrics-docs ## Convenience target running linters, formatters and generators across the codebase.
+	# FIXME: add api linting once we fix the lints
+	$(MAKE) -C api vendor format proto
+	$(MAKE) -C pkg/k8s vendor generate
+	# Vendoring includes api and pkg/k8s vendoring. To avoid running vendor
+	# million times, run the global vendor target after api and pkg/k8s builds.
+	$(MAKE) vendor
+	$(MAKE) -C install/kubernetes
+	$(MAKE) -C install/kubernetes validation
+
+.PHONY: checkpatch
+# renovate: datasource=docker
+CHECKPATCH_IMAGE := quay.io/cilium/cilium-checkpatch:1755701578-b97bd7a@sha256:f1332fa6edbbd40882a59ceae4a7843a4095bd62288363740e84b82708624c50
+CHECKPATCH_IGNORE := --ignore PREFER_DEFINED_ATTRIBUTE_MACRO,C99_COMMENTS,OPEN_ENDED_LINE,PREFER_KERNEL_TYPES,REPEATED_WORD,SPDX_LICENSE_TAG,LONG_LINE,LONG_LINE_STRING,LONG_LINE_COMMENT,TRACE_PRINTK,AVOID_EXTERNS,ENOSYS,MACRO_ARG_REUSE
+ifneq ($(CHECKPATCH_DEBUG),)
+  # Run script with "bash -x"
+  CHECKPATCH_IMAGE_AND_ENTRY := \
+	--entrypoint /bin/bash $(CHECKPATCH_IMAGE) -x /checkpatch/checkpatch.sh -- $(CHECKPATCH_IGNORE)
+else
+  # Use default entrypoint
+  CHECKPATCH_IMAGE_AND_ENTRY := \
+	--entrypoint /bin/bash $(CHECKPATCH_IMAGE) /checkpatch/checkpatch.sh -- $(CHECKPATCH_IGNORE)
+endif
+checkpatch: ## Run checkpatch on your current branch commits.
+	$(QUIET) $(CONTAINER_ENGINE) container run --rm \
+		--workdir /workspace \
+		--volume $(CURDIR):/workspace \
+		--user "$(shell id -u):$(shell id -g)" \
+		-e GITHUB_REF=$(GITHUB_REF) -e GITHUB_REPOSITORY=$(GITHUB_REPOSITORY) -e GITHUB_TOKEN=$(GITHUB_TOKEN) \
+		$(CHECKPATCH_IMAGE_AND_ENTRY) $(CHECKPATCH_ARGS)
+
+##@ Documentation
+
+.PHONY: docs
+docs: ## Build and preview documentation website.
+	$(MAKE) -C docs
+
+.PHONY: gen-docs-references
+gen-docs-references: generate-flags metrics-docs tracing-policy-docs ## Convenience alias to generate all docs references.
+
+.PHONY: tracing-policy-docs
+tracing-policy-docs: ## Generate TracingPolicy reference for documentation.
+	$(MAKE) -C docs tracing-policy-docs
+
 .PHONY: generate-flags
-generate-flags: tetragon ## Generate Tetragon daemon flags for documentation.
+generate-flags: tetragon ## Generate daemon flags reference for documentation.
 	echo "$$(./tetragon --generate-docs)" > docs/data/tetragon_flags.yaml
 
 METRICS_DOCS_PATH := docs/content/en/docs/reference/metrics.md
@@ -409,7 +582,7 @@ METRICS_DOCS_PATH := docs/content/en/docs/reference/metrics.md
 tetragon-metrics-docs:
 	$(GO_BUILD) ./cmd/tetragon-metrics-docs/
 
-.PHONY: metrics-docs
+.PHONY: metrics-docs ## Generate metrics reference for documentation.
 metrics-docs: tetragon-metrics-docs ## Generate metrics reference documentation page.
 	echo '---' > $(METRICS_DOCS_PATH)
 	echo 'title: "Metrics"' >> $(METRICS_DOCS_PATH)
@@ -420,18 +593,12 @@ metrics-docs: tetragon-metrics-docs ## Generate metrics reference documentation 
 	echo '{{< comment >}}' >> $(METRICS_DOCS_PATH)
 	echo 'This page is autogenerated via `make metrics-doc` please do not edit directly.' >> $(METRICS_DOCS_PATH)
 	echo '{{< /comment >}}' >> $(METRICS_DOCS_PATH)
-	$(CONTAINER_ENGINE) run --rm -v $(PWD):$(PWD) -w $(PWD) $(GO_IMAGE) ./tetragon-metrics-docs health >> $(METRICS_DOCS_PATH)
-	$(CONTAINER_ENGINE) run --rm -v $(PWD):$(PWD) -w $(PWD) $(GO_IMAGE) ./tetragon-metrics-docs resources >> $(METRICS_DOCS_PATH)
-	$(CONTAINER_ENGINE) run --rm -v $(PWD):$(PWD) -w $(PWD) $(GO_IMAGE) ./tetragon-metrics-docs events >> $(METRICS_DOCS_PATH)
+	$(CONTAINER_ENGINE) run --rm -v $(CURDIR):$(CURDIR) -w $(CURDIR) $(GO_IMAGE) ./tetragon-metrics-docs health >> $(METRICS_DOCS_PATH)
+	$(CONTAINER_ENGINE) run --rm -v $(CURDIR):$(CURDIR) -w $(CURDIR) $(GO_IMAGE) ./tetragon-metrics-docs resources >> $(METRICS_DOCS_PATH)
+	$(CONTAINER_ENGINE) run --rm -v $(CURDIR):$(CURDIR) -w $(CURDIR) $(GO_IMAGE) ./tetragon-metrics-docs events >> $(METRICS_DOCS_PATH)
 
-.PHONY: lint-metrics-md
-lint-metrics-md: metrics-docs ## Check if metrics documentation is up to date.
-	@if [ -n "$$(git status --porcelain $(METRICS_DOCS_PATH))" ]; then \
-		echo "metrics doc out of sync; please run 'make metrics-docs'" > /dev/stderr; \
-		false; \
-	fi
 
-##@ Documentation
+##@ Others
 
 .PHONY: help
 help: ## Display this help, based on https://www.thapaliya.com/en/writings/well-documented-makefiles/
@@ -448,11 +615,14 @@ help: ## Display this help, based on https://www.thapaliya.com/en/writings/well-
 	$(call print_help_option,EXTRA_GO_BUILD_LDFLAGS,extra flags to pass to the Go linker)
 	$(call print_help_option,EXTRA_GO_BUILD_FLAGS,extra flags to pass to the Go builder)
 	$(call print_help_option,EXTRA_TESTFLAGS,extra flags to pass to the test binary)
+	$(call print_help_option,RACE_PKGS,packages exercised by test-race target)
+	$(call print_help_option,RACE_TEST_TIMEOUT,timeout for test-race target)
+	$(call print_help_option,FUZZ_TIME,time to run each fuzz target)
 
-.PHONY: docs
-docs: ## Preview documentation website.
-	$(MAKE) -C docs
-
-.PHONY: version
+.PHONY: version chart-version
 version: ## Print Tetragon version.
 	@echo $(VERSION)
+
+chart-version: ## Print Tetragon OCI Helm chart version.
+	@echo $(VERSION) | sed 's/^v\(.*\)/\1/'
+

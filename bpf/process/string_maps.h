@@ -50,7 +50,7 @@
 #define STRING_MAPS_SIZE_4	 (5 * STRING_MAPS_KEY_INC_SIZE + 1)
 #define STRING_MAPS_SIZE_5	 (6 * STRING_MAPS_KEY_INC_SIZE + 1)
 #define STRING_MAPS_SIZE_6	 (256 + 2)
-#ifdef __LARGE_MAP_KEYS
+#ifdef __V511_BPF_PROG
 #define STRING_MAPS_SIZE_7  (512 + 2)
 #define STRING_MAPS_SIZE_8  (1024 + 2)
 #define STRING_MAPS_SIZE_9  (2048 + 2)
@@ -62,164 +62,41 @@
 #define STRING_MAPS_HEAP_MASK (8192 - 1)
 #define STRING_MAPS_COPY_MASK 4095
 
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
-	__array(
-		values, struct {
-			__uint(type, BPF_MAP_TYPE_HASH);
-			__uint(max_entries, 1);
-			__type(key, __u8[STRING_MAPS_SIZE_0]);
-			__type(value, __u8);
-		});
-} string_maps_0 SEC(".maps");
+#define DEFINE_ARRAY_OF_STRING_MAPS(N)                                   \
+	struct {                                                         \
+		__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);                \
+		__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);      \
+		__type(key, __u32);                                      \
+		__array(                                                 \
+			values, struct {                                 \
+				__uint(type, BPF_MAP_TYPE_HASH);         \
+				__uint(max_entries, 1);                  \
+				__type(key, __u8[STRING_MAPS_SIZE_##N]); \
+				__type(value, __u8);                     \
+			});                                              \
+	} string_maps_##N SEC(".maps");
 
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
-	__array(
-		values, struct {
-			__uint(type, BPF_MAP_TYPE_HASH);
-			__uint(max_entries, 1);
-			__type(key, __u8[STRING_MAPS_SIZE_1]);
-			__type(value, __u8);
-		});
-} string_maps_1 SEC(".maps");
+DEFINE_ARRAY_OF_STRING_MAPS(0)
+DEFINE_ARRAY_OF_STRING_MAPS(1)
+DEFINE_ARRAY_OF_STRING_MAPS(2)
+DEFINE_ARRAY_OF_STRING_MAPS(3)
+DEFINE_ARRAY_OF_STRING_MAPS(4)
+DEFINE_ARRAY_OF_STRING_MAPS(5)
+DEFINE_ARRAY_OF_STRING_MAPS(6)
+DEFINE_ARRAY_OF_STRING_MAPS(7)
 
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
-	__array(
-		values, struct {
-			__uint(type, BPF_MAP_TYPE_HASH);
-			__uint(max_entries, 1);
-			__type(key, __u8[STRING_MAPS_SIZE_2]);
-			__type(value, __u8);
-		});
-} string_maps_2 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
-	__array(
-		values, struct {
-			__uint(type, BPF_MAP_TYPE_HASH);
-			__uint(max_entries, 1);
-			__type(key, __u8[STRING_MAPS_SIZE_3]);
-			__type(value, __u8);
-		});
-} string_maps_3 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
-	__array(
-		values, struct {
-			__uint(type, BPF_MAP_TYPE_HASH);
-			__uint(max_entries, 1);
-			__type(key, __u8[STRING_MAPS_SIZE_4]);
-			__type(value, __u8);
-		});
-} string_maps_4 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
-	__array(
-		values, struct {
-			__uint(type, BPF_MAP_TYPE_HASH);
-			__uint(max_entries, 1);
-			__type(key, __u8[STRING_MAPS_SIZE_5]);
-			__type(value, __u8);
-		});
-} string_maps_5 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
-	__array(
-		values, struct {
-			__uint(type, BPF_MAP_TYPE_HASH);
-			__uint(max_entries, 1);
-			__type(key, __u8[STRING_MAPS_SIZE_6]);
-			__type(value, __u8);
-		});
-} string_maps_6 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
-	__array(
-		values, struct {
-			__uint(type, BPF_MAP_TYPE_HASH);
-			__uint(max_entries, 1);
-			__type(key, __u8[STRING_MAPS_SIZE_7]);
-			__type(value, __u8);
-		});
-} string_maps_7 SEC(".maps");
-
-#ifdef __LARGE_MAP_KEYS
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
-	__array(
-		values, struct {
-			__uint(type, BPF_MAP_TYPE_HASH);
-			__uint(max_entries, 1);
-			__type(key, __u8[STRING_MAPS_SIZE_8]);
-			__type(value, __u8);
-		});
-} string_maps_8 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
-	__array(
-		values, struct {
-			__uint(type, BPF_MAP_TYPE_HASH);
-			__uint(max_entries, 1);
-			__type(key, __u8[STRING_MAPS_SIZE_9]);
-			__type(value, __u8);
-		});
-} string_maps_9 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
-	__array(
-		values, struct {
-			__uint(type, BPF_MAP_TYPE_HASH);
-			__uint(max_entries, 1);
-			__type(key, __u8[STRING_MAPS_SIZE_10]);
-			__type(value, __u8);
-		});
-} string_maps_10 SEC(".maps");
+#ifdef __V511_BPF_PROG
+DEFINE_ARRAY_OF_STRING_MAPS(8)
+DEFINE_ARRAY_OF_STRING_MAPS(9)
+DEFINE_ARRAY_OF_STRING_MAPS(10)
 #endif
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
-	__uint(key_size, sizeof(__u32));
+	__type(key, __u32);
 	__uint(value_size, STRING_MAPS_HEAP_SIZE);
 } string_maps_heap SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
-	__uint(key_size, sizeof(__u32));
-	__uint(value_size, STRING_MAPS_HEAP_SIZE);
-} string_maps_ro_zero SEC(".maps");
 
 #define STRING_PREFIX_MAX_LENGTH 256
 
@@ -231,7 +108,7 @@ struct string_prefix_lpm_trie {
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
 	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
+	__type(key, __u32);
 	__array(
 		values, struct {
 			__uint(type, BPF_MAP_TYPE_LPM_TRIE);
@@ -245,8 +122,8 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
-	__uint(key_size, sizeof(__u32));
-	__uint(value_size, sizeof(struct string_prefix_lpm_trie));
+	__type(key, __u32);
+	__type(value, struct string_prefix_lpm_trie);
 } string_prefix_maps_heap SEC(".maps");
 
 #define STRING_POSTFIX_MAX_LENGTH 128
@@ -254,7 +131,7 @@ struct {
 #ifdef __LARGE_BPF_PROG
 #define STRING_POSTFIX_MAX_MATCH_LENGTH STRING_POSTFIX_MAX_LENGTH
 #else
-#define STRING_POSTFIX_MAX_MATCH_LENGTH 95
+#define STRING_POSTFIX_MAX_MATCH_LENGTH 88
 #endif
 
 struct string_postfix_lpm_trie {
@@ -265,7 +142,7 @@ struct string_postfix_lpm_trie {
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
 	__uint(max_entries, STRING_MAPS_OUTER_MAX_ENTRIES);
-	__uint(key_size, sizeof(__u32));
+	__type(key, __u32);
 	__array(
 		values, struct {
 			__uint(type, BPF_MAP_TYPE_LPM_TRIE);
@@ -279,8 +156,15 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
-	__uint(key_size, sizeof(__u32));
-	__uint(value_size, sizeof(struct string_postfix_lpm_trie));
+	__type(key, __u32);
+	__type(value, struct string_postfix_lpm_trie);
 } string_postfix_maps_heap SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, char[100]);
+} substring_map SEC(".maps");
 
 #endif // STRING_MAPS_H__

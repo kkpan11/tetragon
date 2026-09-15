@@ -1,6 +1,6 @@
 include ../Makefile.defs
 
-TESTS = prepend_name_test.o
+TESTS = prepend_name_test.o pid_match_test.o
 
 OBJSDIR  := objs/
 OBJS := $(addprefix $(OBJSDIR),$(TESTS))
@@ -18,11 +18,8 @@ $(OBJS): | $(OBJSDIR)
 $(OBJSDIR):
 	mkdir $(OBJSDIR)
 
-objs/%.ll: %.c
+objs/%.o: %.c
 	$(CLANG) $(CLANG_FLAGS) -I ../ -c $< -o $@
-
-objs/%.o: objs/%.ll
-	$(LLC) $(LLC_FLAGS) -filetype=obj $< -o $@
 
 .PHONY: clean
 clean:

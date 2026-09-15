@@ -1,8 +1,26 @@
-FROM docker.io/library/ubuntu:22.04@sha256:0bced47fffa3361afa981854fcabcd4577cd43cebbb808cea2b1f33a3dd7f508
-RUN apt-get update && apt-get install -y --no-install-recommends  \
-    clang-15 libclang-common-15-dev libclang-cpp15    	          \
-    libllvm15 llvm-15-linker-tools libclang1-15                   \
-    llvm-15 llvm-15-runtime llvm-15-linker-tools make             \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
-RUN ln -vsnf /usr/lib/llvm-15/bin/clang /usr/bin/clang
-RUN ln -vsnf /usr/lib/llvm-15/bin/llc /usr/bin/llc
+FROM docker.io/library/ubuntu:24.04@sha256:2e863c44b718727c860746568e1d54afd13b2fa71b160f5cd9058fc436217b30
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gnupg \
+        wget \
+    && wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+        | gpg --dearmor -o /usr/share/keyrings/llvm.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
+        > /etc/apt/sources.list.d/llvm.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        clang-22 \
+        libclang-common-22-dev \
+        libclang-cpp22 \
+        libllvm22 \
+        llvm-22-linker-tools \
+        libclang1-22 \
+        llvm-22 \
+        llvm-22-runtime \
+        make \
+    && ln -vsnf /usr/lib/llvm-22/bin/clang /usr/bin/clang \
+    && ln -vsnf /usr/lib/llvm-22/bin/llc /usr/bin/llc \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*

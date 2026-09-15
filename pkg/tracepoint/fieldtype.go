@@ -44,18 +44,18 @@ type VoidTy struct{}
 type DmaAddrTy struct{}
 
 type PointerTy struct {
-	Ty    interface{}
+	Ty    any
 	Const bool
 }
 
 type ArrayTy struct {
-	Ty   interface{}
+	Ty   any
 	Size uint
 }
 
 type Field struct {
 	Name string
-	Type interface{}
+	Type any
 }
 
 type ParseError struct {
@@ -63,11 +63,10 @@ type ParseError struct {
 }
 
 func (e *ParseError) Error() string {
-	return fmt.Sprintf("failed to parse field: %s", e.r)
+	return "failed to parse field: " + e.r
 }
 
-func parseTy(tyFields []string) (interface{}, error) {
-
+func parseTy(tyFields []string) (any, error) {
 	fidx := 0
 	nfields := len(tyFields)
 	isConst := false
@@ -103,7 +102,7 @@ func parseTy(tyFields []string) (interface{}, error) {
 		ty = nextField()
 	}
 
-	var retTy interface{}
+	var retTy any
 	switch {
 	case ty == "char":
 		retTy = IntTy{Base: IntTyChar, Unsigned: unsigned}
@@ -140,7 +139,7 @@ func parseTy(tyFields []string) (interface{}, error) {
 	case ty == "dma_addr_t":
 		retTy = DmaAddrTy{}
 	default:
-		return nil, &ParseError{r: fmt.Sprintf("unknown type:%s", ty)}
+		return nil, &ParseError{r: "unknown type:" + ty}
 	}
 
 	if lastField() {
@@ -167,7 +166,6 @@ func parseTy(tyFields []string) (interface{}, error) {
 }
 
 func parseField(s string) (*Field, error) {
-
 	fields := strings.Fields(s)
 	nfields := len(fields)
 	if nfields < 2 {
@@ -187,8 +185,8 @@ func parseField(s string) (*Field, error) {
 			return nil, &ParseError{r: "could not parse array structure"}
 		}
 		substrings := strings.Split(name, "[")
-		size_s := strings.TrimSuffix(substrings[1], "]")
-		size, err = strconv.ParseUint(size_s, 10, 32)
+		sizeS := strings.TrimSuffix(substrings[1], "]")
+		size, err = strconv.ParseUint(sizeS, 10, 32)
 		if err != nil {
 			return nil, &ParseError{r: fmt.Sprintf("failed to parse size: %s", err)}
 		}

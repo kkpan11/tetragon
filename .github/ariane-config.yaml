@@ -1,0 +1,9 @@
+allowed-teams:
+  - organization-members
+
+triggers:
+  /default\s*:
+    workflows: &test-workflows
+      - mock-ci.yaml
+  /test\s*:
+    workflows: *test-workflows

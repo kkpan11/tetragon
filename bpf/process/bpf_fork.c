@@ -13,6 +13,7 @@
 #include "bpf_process_event.h"
 #include "process.h"
 #include "bpf_rate.h"
+#include "bpf_ktime.h"
 
 char _license[] __attribute__((section("license"), used)) = "Dual BSD/GPL";
 #ifdef VMLINUX_KERNEL_VERSION
@@ -25,9 +26,7 @@ BPF_KPROBE(event_wake_up_new_task, struct task_struct *task)
 {
 	struct execve_map_value *curr, *parent;
 	struct msg_clone_event msg;
-	struct msg_capabilities caps;
 	u64 msg_size = sizeof(struct msg_clone_event);
-	struct msg_k8s kube;
 	u32 tgid = 0;
 
 	if (!task)
@@ -56,19 +55,27 @@ BPF_KPROBE(event_wake_up_new_task, struct task_struct *task)
 	/* Setup the execve_map entry. */
 	curr->flags = EVENT_COMMON_FLAG_CLONE;
 	curr->key.pid = tgid;
-	curr->key.ktime = ktime_get_ns();
-	curr->nspid = get_task_pid_vnr();
-	memcpy(&curr->bin, &parent->bin, sizeof(curr->bin));
+	curr->key.ktime = tg_get_ktime();
+	curr->nspid = get_task_pid_vnr_by_task(task);
+	__bpf_memcpy_builtin(&curr->bin, &parent->bin, sizeof(curr->bin));
+	__bpf_memcpy_builtin(&curr->args, &parent->args, sizeof(curr->args));
 	curr->pkey = parent->key;
 
 	/* Store the thread leader capabilities so we can check later
 	 * before the execve hook point if they changed or not.
 	 * This needs to be converted later to credentials.
 	 */
-	get_current_subj_caps(&caps, task);
-	curr->caps.permitted = caps.permitted;
-	curr->caps.effective = caps.effective;
-	curr->caps.inheritable = caps.inheritable;
+	get_current_subj_caps(&curr->caps, task);
+
+	/* Store the thread leader namespaces so we can check later
+	 * before the execve hook point if they changed or not.
+	 */
+	get_namespaces(&curr->ns, task);
+
+	/* Set EVENT_IN_INIT_TREE flag on the process if its parent is in a
+	 * container's init tree or if it has nspid=1.
+	 */
+	set_in_init_tree(curr, parent);
 
 	/* Setup the msg_clone_event and sent to the user. */
 	msg.common.op = MSG_OP_CLONE;
@@ -86,12 +93,15 @@ BPF_KPROBE(event_wake_up_new_task, struct task_struct *task)
 	msg.nspid = curr->nspid;
 	msg.flags = curr->flags;
 
-	__event_get_cgroup_info(task, &kube);
+#ifndef __RHEL7_BPF_PROG
+	struct msg_k8s kube;
 
-	if (cgroup_rate(ctx, &kube, msg.ktime)) {
-		perf_event_output_metric(ctx, MSG_OP_CLONE, &tcpmon_map,
-					 BPF_F_CURRENT_CPU, &msg, msg_size);
-	}
+	if (__event_get_cgroup_info(task, &kube))
+		errmetrics(ENOENT);
+
+	if (cgroup_rate(ctx, &kube, msg.ktime))
+#endif
+		event_output_metric(ctx, MSG_OP_CLONE, &msg, msg_size);
 
 	return 0;
 }

@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tetragon
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"os/exec"
+	"slices"
 	"strings"
 
 	v1 "k8s.io/api/apps/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -32,6 +36,7 @@ var (
 	AgentBTFKey               = "tetragon.btf"
 	AgentImageKey             = "tetragon.image.override"
 	OperatorImageKey          = "tetragonOperator.image.override"
+	RTHooksImageKey           = "rthooks.image.override"
 )
 
 type Option func(*flags.HelmOptions)
@@ -69,9 +74,7 @@ func WithHelmOptions(options map[string]string) Option {
 		if o.HelmValues == nil {
 			o.HelmValues = make(map[string]string)
 		}
-		for k, v := range options {
-			o.HelmValues[k] = v
-		}
+		maps.Copy(o.HelmValues, options)
 	}
 }
 
@@ -114,10 +117,8 @@ func Uninstall(opts ...Option) env.Func {
 			r := client.Resources(o.Namespace)
 
 			ds := v1.DaemonSet{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      o.DaemonSetName,
-					Namespace: o.Namespace,
-				},
+				Name:      o.DaemonSetName,
+				Namespace: o.Namespace,
 			}
 
 			// Wait for Tetragon daemon set to be ready
@@ -139,7 +140,7 @@ func Install(opts ...Option) env.Func {
 
 		// Only add and upate repo if helm url is specified
 		if o.HelmRepoUrl != "" {
-			repoName := strings.Split(o.HelmChart, "/")[0]
+			repoName, _, _ := strings.Cut(o.HelmChart, "/")
 			if err := manager.RunRepo(helm.WithArgs("add", "--force-update", repoName, o.HelmRepoUrl)); err != nil {
 				return ctx, fmt.Errorf("failed to add helm repo %s (%s): %w", repoName, o.HelmRepoUrl, err)
 			}
@@ -151,64 +152,73 @@ func Install(opts ...Option) env.Func {
 
 		var helmArgs strings.Builder
 		for k, v := range o.HelmValues {
-			helmArgs.WriteString(fmt.Sprintf(" --set=%s=%s", k, v))
-			if clusterName := helpers.GetTempKindClusterName(ctx); clusterName != "" {
-				switch k {
-				case AgentImageKey:
-					fallthrough
-				case OperatorImageKey:
-					klog.InfoS("Loading image into kind cluster", "cluster", clusterName, "image", v, "helm", k)
-					var err error
-					if ctx, err = envfuncs.LoadDockerImageToCluster(clusterName, v)(ctx, cfg); err != nil {
-						// If the image is not present locally, don't worry about it but
-						// log a message
-						if strings.Contains(err.Error(), "not present locally") {
-							klog.InfoS("Image is not present locally, attempting to install Tetragon regardless", "cluster", clusterName, "image", v, "helm", k)
-							break
-						}
-						return ctx, fmt.Errorf("failed to load image %s into cluster %s: %w", v, clusterName, err)
-					}
+			fmt.Fprintf(&helmArgs, " --set=%s=%s", k, v)
+			if !slices.Contains([]string{AgentImageKey, RTHooksImageKey, OperatorImageKey}, k) {
+				continue
+			}
+
+			clusterName := helpers.GetTempKindClusterName(ctx)
+			if flags.Opts.Minikube {
+				// If we are running against minkube, we don't care about the output of GetTempKindClusterName.
+				clusterName = "minikube"
+			} else if clusterName == "" {
+				continue
+			}
+
+			klog.InfoS("Loading image", "cluster", clusterName, "image", v, "helm", k)
+			var err error
+			if ctx, err = envfuncs.LoadDockerImageToCluster(clusterName, v)(ctx, cfg); err != nil {
+				// If the image is not present locally, don't worry about it but
+				// log a message
+				if strings.Contains(err.Error(), "not present locally") {
+					klog.InfoS("Image is not present locally, attempting to install Tetragon regardless", "cluster", clusterName, "image", v, "helm", k)
+					continue
 				}
+
+				// If failed to load the image, this could be related to kind/containerd issues, so just log
+				// the message and attempt to install Tetragon regardless. See
+				// https://github.com/kubernetes-sigs/kind/issues/3795
+				klog.InfoS("Failed to load image into kind cluster", "cluster", clusterName, "image", v, "error", err)
 			}
 		}
 		if o.ValuesFile != "" {
-			helmArgs.WriteString(fmt.Sprintf(" --values=%s", o.ValuesFile))
+			helmArgs.WriteString(" --values=" + o.ValuesFile)
 		}
 
 		// Handle BTF option for KinD cluster
 		if o.BTF != "" {
 			if clusterName := helpers.GetTempKindClusterName(ctx); clusterName != "" {
-				controlPlaneId := fmt.Sprintf("%s-control-plane", clusterName)
-				cmd := exec.CommandContext(ctx, "docker", "cp", o.BTF, fmt.Sprintf("%s:/btf", controlPlaneId))
+				controlPlaneId := clusterName + "-control-plane"
+				cmd := exec.CommandContext(ctx, "docker", "cp", o.BTF, controlPlaneId+":/btf")
 				err := cmd.Run()
 				if err != nil {
 					return ctx, fmt.Errorf("failed to load BTF file into KinD cluster: %w", err)
 				}
-				helmArgs.WriteString(fmt.Sprintf(" --set=%s=/btf", AgentBTFKey))
+				fmt.Fprintf(&helmArgs, " --set=%s=/btf", AgentBTFKey)
 				helmArgs.WriteString(" --set=extraHostPathMounts[0].name=btf")
 				helmArgs.WriteString(" --set=extraHostPathMounts[0].mountPath=/btf")
 				helmArgs.WriteString(" --set=extraHostPathMounts[0].readOnly=true")
 			} else {
-				return ctx, fmt.Errorf("option -tetragon.btf only makes sense for KinD clusters")
+				return ctx, errors.New("option -tetragon.btf only makes sense for KinD clusters")
 			}
 		}
 
 		// Handle procRoot for KinD cluster
 		if clusterName := helpers.GetTempKindClusterName(ctx); clusterName != "" {
 			// real-host-proc lets us mount procFS from the real host rather than the KinD node
-			helmArgs.WriteString(fmt.Sprintf(" --set=%s[0].name=real-host-proc", AgentExtraVolumesKey))
-			helmArgs.WriteString(fmt.Sprintf(" --set=%s[0].hostPath.path=/procRoot", AgentExtraVolumesKey))
-			helmArgs.WriteString(fmt.Sprintf(" --set=%s[0].hostPath.type=Directory", AgentExtraVolumesKey))
-			helmArgs.WriteString(fmt.Sprintf(" --set=%s[0].mountPath=/procRootReal", AgentExtraVolumeMountsKey))
-			helmArgs.WriteString(fmt.Sprintf(" --set=%s[0].name=real-host-proc", AgentExtraVolumeMountsKey))
+			fmt.Fprintf(&helmArgs, " --set=%s[0].name=real-host-proc", AgentExtraVolumesKey)
+			fmt.Fprintf(&helmArgs, " --set=%s[0].hostPath.path=/procRoot", AgentExtraVolumesKey)
+			fmt.Fprintf(&helmArgs, " --set=%s[0].hostPath.type=Directory", AgentExtraVolumesKey)
+			fmt.Fprintf(&helmArgs, " --set=%s[0].mountPath=/procRootReal", AgentExtraVolumeMountsKey)
+			fmt.Fprintf(&helmArgs, " --set=%s[0].name=real-host-proc", AgentExtraVolumeMountsKey)
 			// Set tetragon procfs value to the new host proc mountpoint
-			helmArgs.WriteString(fmt.Sprintf(" --set=%s.procfs=/procRootReal", AgentExtraArgsKey))
+			fmt.Fprintf(&helmArgs, " --set=%s.procfs=/procRootReal", AgentExtraArgsKey)
 			// real-export-dir gives us a directory we can use to export files directly to the host
-			helmArgs.WriteString(fmt.Sprintf(" --set=%s[1].name=real-export-dir", AgentExtraVolumesKey))
-			helmArgs.WriteString(fmt.Sprintf(" --set=%s[1].hostPath.path=/tetragonExport", AgentExtraVolumesKey))
-			helmArgs.WriteString(fmt.Sprintf(" --set=%s[1].hostPath.type=Directory", AgentExtraVolumesKey))
-			helmArgs.WriteString(fmt.Sprintf(" --set=%s[1].mountPath=/tetragonExport", AgentExtraVolumeMountsKey))
-			helmArgs.WriteString(fmt.Sprintf(" --set=%s[1].name=real-export-dir", AgentExtraVolumeMountsKey))
+			fmt.Fprintf(&helmArgs, " --set=%s[1].name=real-export-dir", AgentExtraVolumesKey)
+			fmt.Fprintf(&helmArgs, " --set=%s[1].hostPath.path=/tetragonExport", AgentExtraVolumesKey)
+			fmt.Fprintf(&helmArgs, " --set=%s[1].hostPath.type=Directory", AgentExtraVolumesKey)
+			fmt.Fprintf(&helmArgs, " --set=%s[1].mountPath=/tetragonExport", AgentExtraVolumeMountsKey)
+			fmt.Fprintf(&helmArgs, " --set=%s[1].name=real-export-dir", AgentExtraVolumeMountsKey)
 		}
 
 		helmArgs.WriteString(" --install")
@@ -235,10 +245,8 @@ func Install(opts ...Option) env.Func {
 			r := client.Resources(o.Namespace)
 
 			ds := v1.DaemonSet{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      o.DaemonSetName,
-					Namespace: o.Namespace,
-				},
+				Name:      o.DaemonSetName,
+				Namespace: o.Namespace,
 			}
 
 			// Wait for Tetragon daemon set to be ready

@@ -34,10 +34,21 @@
       name: bpf-maps
     - mountPath: "/var/run/cilium"
       name: cilium-run
+    - mountPath: "/var/run/tetragon"
+      name: tetragon-run
     - mountPath: {{ .Values.exportDirectory }}
       name: export-logs
     - mountPath: "/procRoot"
       name: host-proc
+{{- if and (.Values.tetragon.cri.enabled) (.Values.tetragon.cri.socketHostPath) }}
+    - mountPath: {{ dir .Values.tetragon.cri.socketHostPath | quote }}
+      name: cri-socket
+{{- end }}
+{{- if and .Values.tetragon.grpc.enabled .Values.tetragon.grpc.tls.enabled }}
+    - mountPath: /var/lib/tetragon/tls
+      name: tetragon-grpc-tls
+      readOnly: true
+{{- end }}
 {{- range .Values.extraHostPathMounts }}
     - name: {{ .name }}
       mountPath: {{ .mountPath }}

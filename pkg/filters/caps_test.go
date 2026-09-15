@@ -7,9 +7,11 @@ import (
 	"context"
 	"testing"
 
-	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
-	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/event"
 )
 
 func TestCapFilterAny(t *testing.T) {
@@ -17,9 +19,9 @@ func TestCapFilterAny(t *testing.T) {
 		Any: []tetragon.CapabilitiesType{tetragon.CapabilitiesType_CAP_SYS_ADMIN, tetragon.CapabilitiesType_CAP_BPF},
 	}}}}
 	fl, err := BuildFilterList(context.Background(), f, []OnBuildFilter{&CapsFilter{}})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	process := tetragon.Process{Cap: &tetragon.Capabilities{}}
-	ev := v1.Event{
+	ev := event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{
@@ -62,9 +64,9 @@ func TestCapFilterAll(t *testing.T) {
 		All: []tetragon.CapabilitiesType{tetragon.CapabilitiesType_CAP_SYS_ADMIN, tetragon.CapabilitiesType_CAP_BPF},
 	}}}}
 	fl, err := BuildFilterList(context.Background(), f, []OnBuildFilter{&CapsFilter{}})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	process := tetragon.Process{Cap: &tetragon.Capabilities{}}
-	ev := v1.Event{
+	ev := event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{
@@ -107,9 +109,9 @@ func TestCapFilterExactly(t *testing.T) {
 		Exactly: []tetragon.CapabilitiesType{tetragon.CapabilitiesType_CAP_SYS_ADMIN, tetragon.CapabilitiesType_CAP_BPF},
 	}}}}
 	fl, err := BuildFilterList(context.Background(), f, []OnBuildFilter{&CapsFilter{}})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	process := tetragon.Process{Cap: &tetragon.Capabilities{}}
-	ev := v1.Event{
+	ev := event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{
@@ -152,9 +154,9 @@ func TestCapFilterNone(t *testing.T) {
 		None: []tetragon.CapabilitiesType{tetragon.CapabilitiesType_CAP_SYS_ADMIN, tetragon.CapabilitiesType_CAP_BPF},
 	}}}}
 	fl, err := BuildFilterList(context.Background(), f, []OnBuildFilter{&CapsFilter{}})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	process := tetragon.Process{Cap: &tetragon.Capabilities{}}
-	ev := v1.Event{
+	ev := event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{

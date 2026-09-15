@@ -12,6 +12,7 @@
 #include "bpf_rate.h"
 #include "process.h"
 #include "bpf_process_event.h"
+#include "bpf_ktime.h"
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -39,7 +40,6 @@ FUNC_INLINE void event_exit_send(void *ctx, __u32 tgid)
 		struct task_struct *task = (struct task_struct *)get_current_task();
 		size_t size = sizeof(struct msg_exit);
 		struct msg_exit *exit;
-		struct msg_k8s kube;
 		int zero = 0;
 
 		exit = map_lookup_elem(&exit_heap_map, &zero);
@@ -51,7 +51,7 @@ FUNC_INLINE void event_exit_send(void *ctx, __u32 tgid)
 		exit->common.pad[0] = 0;
 		exit->common.pad[1] = 0;
 		exit->common.size = size;
-		exit->common.ktime = ktime_get_ns();
+		exit->common.ktime = tg_get_ktime();
 
 		exit->current.pid = tgid;
 		exit->current.pad[0] = 0;
@@ -67,17 +67,13 @@ FUNC_INLINE void event_exit_send(void *ctx, __u32 tgid)
 		 *  entry from the execve_map anyway and explicitly set it to the to tgid.
 		 */
 		exit->info.tid = tgid;
-		probe_read(&exit->info.code, sizeof(exit->info.code),
-			   _(&task->exit_code));
+		with_errmetrics(probe_read, &exit->info.code, sizeof(exit->info.code),
+				_(&task->exit_code));
 
-		__event_get_cgroup_info(task, &kube);
-
-		if (cgroup_rate(ctx, &kube, exit->common.ktime)) {
-			perf_event_output_metric(ctx, MSG_OP_EXIT, &tcpmon_map,
-						 BPF_F_CURRENT_CPU, exit, size);
-		}
+		event_output_metric(ctx, MSG_OP_EXIT, exit, size);
 	}
 	execve_map_delete(tgid);
+	map_delete_elem(&tg_parents_bin, &enter->key.pid);
 }
 
 #endif /* __EXIT_H__ */

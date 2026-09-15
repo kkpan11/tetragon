@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package selectors
 
 import (
 	"encoding/binary"
-	"fmt"
+	"errors"
 
 	"github.com/cilium/tetragon/pkg/api/processapi"
 	"github.com/cilium/tetragon/pkg/kernels"
+	"github.com/cilium/tetragon/pkg/policyfilter"
 )
 
 type KernelLPMTrie4 struct {
@@ -30,6 +33,9 @@ type ValueReader interface {
 }
 
 const (
+	// see bpf/process/types/basic.h MAX_SELECTORS
+	MaxSelectors = 5
+
 	stringMapsKeyIncSize      = 24
 	StringMapsNumSubMaps      = 11
 	StringMapsNumSubMapsSmall = 8
@@ -53,6 +59,8 @@ const (
 	stringMapSize10 = 4096 + 2
 
 	StringMapSize7a = 512
+
+	SubstringMapEntries = 100
 )
 
 var (
@@ -96,11 +104,16 @@ type KernelSelectorMaps struct {
 type MatchBinariesSelectorOptions struct {
 	Op    uint32
 	MapID uint32
+	// matchBinaries set for the selector
+	MBSetID uint32
 }
 
+const KernelBufferSize = 4096
+
 type KernelSelectorData struct {
-	off uint32     // offset into encoding
-	e   [4096]byte // kernel encoding of selectors
+	// kernel encoding of selectors, grows as selectors are encoded. The
+	// current write offset is always len(e).
+	e []byte
 }
 
 type KernelSelectorState struct {
@@ -121,18 +134,60 @@ type KernelSelectorState struct {
 	listReader ValueReader
 
 	maps *KernelSelectorMaps
+
+	isUprobe              bool
+	uprobeID              int
+	overrideActionIPDelta int64
+
+	regs map[int][]processapi.RegAssignment
+
+	subStrs []string
+
+	celExprFunctions *CelExprFunctions
+
+	matchWorkloadIDs map[int]policyfilter.PolicyID
+
+	destroyed bool
 }
 
-func NewKernelSelectorState(listReader ValueReader, maps *KernelSelectorMaps) *KernelSelectorState {
+func NewKernelSelectorState(
+	listReader ValueReader,
+	maps *KernelSelectorMaps,
+	isUprobe bool,
+	uprobeID int,
+	overrideActionIPDelta int64,
+	celExprs *CelExprFunctions,
+) *KernelSelectorState {
 	if maps == nil {
 		maps = &KernelSelectorMaps{}
 	}
-	return &KernelSelectorState{
-		matchBinaries:      make(map[int]MatchBinariesSelectorOptions),
-		matchBinariesPaths: make(map[int][][processapi.BINARY_PATH_MAX_LEN]byte),
-		listReader:         listReader,
-		maps:               maps,
+	if celExprs == nil {
+		celExprs = &CelExprFunctions{}
 	}
+	return &KernelSelectorState{
+		// Selectors are expected to fit into KernelBufferSize, so
+		// preallocate that much and avoid growing in the common case.
+		data:                  KernelSelectorData{e: make([]byte, 0, KernelBufferSize)},
+		matchBinaries:         make(map[int]MatchBinariesSelectorOptions),
+		matchBinariesPaths:    make(map[int][][processapi.BINARY_PATH_MAX_LEN]byte),
+		listReader:            listReader,
+		maps:                  maps,
+		isUprobe:              isUprobe,
+		uprobeID:              uprobeID,
+		overrideActionIPDelta: overrideActionIPDelta,
+		celExprFunctions:      celExprs,
+		matchWorkloadIDs:      make(map[int]policyfilter.PolicyID),
+		regs:                  make(map[int][]processapi.RegAssignment),
+	}
+}
+
+func (k *KernelSelectorState) Destroyed() bool {
+	// We do not allow concurent changes to the selector so this does
+	// not need to be atomical, it only serves as a flag to indicate
+	// the CleanupKernelSelectorState was called
+	destroyed := k.destroyed
+	k.destroyed = true
+	return destroyed
 }
 
 func (k KernelSelectorState) MatchBinaries() map[int]MatchBinariesSelectorOptions {
@@ -145,6 +200,10 @@ func (k *KernelSelectorState) AddMatchBinaries(i int, sel MatchBinariesSelectorO
 
 func (k KernelSelectorState) MatchBinariesPaths() map[int][][processapi.BINARY_PATH_MAX_LEN]byte {
 	return k.matchBinariesPaths
+}
+
+func (k KernelSelectorState) MatchWorkloadIDs() map[int]policyfilter.PolicyID {
+	return k.matchWorkloadIDs
 }
 
 func (k *KernelSelectorState) WriteMatchBinariesPath(selectorID int, path string) {
@@ -164,8 +223,10 @@ func (k *KernelSelectorState) MatchBinariesPathsMaxEntries() int {
 	return maxEntries
 }
 
-func (k *KernelSelectorState) Buffer() [4096]byte {
-	return k.data.e
+func (k *KernelSelectorState) CopyToFixedBuffer() [KernelBufferSize]byte {
+	var out [KernelBufferSize]byte
+	copy(out[:], k.data.e)
+	return out
 }
 
 func (k *KernelSelectorState) ValueMaps() []ValueMap {
@@ -190,6 +251,14 @@ func (k *KernelSelectorState) StringPrefixMaps() []map[KernelLPMTrieStringPrefix
 
 func (k *KernelSelectorState) StringPostfixMaps() []map[KernelLPMTrieStringPostfix]struct{} {
 	return k.maps.stringPostfixMaps
+}
+
+func (k *KernelSelectorState) Regs() map[int][]processapi.RegAssignment {
+	return k.regs
+}
+
+func (k *KernelSelectorState) SubStrings() []string {
+	return k.subStrs
 }
 
 // ValueMapsMaxEntries returns the maximum entries over all maps
@@ -258,28 +327,35 @@ func (k *KernelSelectorState) StringPostfixMapsMaxEntries() int {
 	return maxEntries
 }
 
+// grow appends size zeroed bytes to e and returns them, so callers can
+// write into the returned slice without worrying about the buffer end.
+func (k *KernelSelectorData) grow(size uint32) []byte {
+	oldLen := len(k.e)
+	k.e = append(k.e, make([]byte, size)...)
+	return k.e[oldLen:]
+}
+
 func WriteSelectorInt32(k *KernelSelectorData, v int32) {
-	binary.LittleEndian.PutUint32(k.e[k.off:], uint32(v))
-	k.off += 4
+	binary.LittleEndian.PutUint32(k.grow(4), uint32(v))
 }
 
 func WriteSelectorUint32(k *KernelSelectorData, v uint32) {
-	binary.LittleEndian.PutUint32(k.e[k.off:], v)
-	k.off += 4
+	binary.LittleEndian.PutUint32(k.grow(4), v)
 }
 
 func WriteSelectorInt64(k *KernelSelectorData, v int64) {
-	binary.LittleEndian.PutUint64(k.e[k.off:], uint64(v))
-	k.off += 8
+	binary.LittleEndian.PutUint64(k.grow(8), uint64(v))
 }
 
 func WriteSelectorUint64(k *KernelSelectorData, v uint64) {
-	binary.LittleEndian.PutUint64(k.e[k.off:], v)
-	k.off += 8
+	binary.LittleEndian.PutUint64(k.grow(8), v)
 }
 
+// WriteSelectorLength and WriteSelectorOffsetUint32 backpatch a uint32
+// previously reserved by AdvanceSelectorLength, so loff always refers to
+// bytes already appended to e.
 func WriteSelectorLength(k *KernelSelectorData, loff uint32) {
-	diff := k.off - loff
+	diff := uint32(len(k.e)) - loff
 	binary.LittleEndian.PutUint32(k.e[loff:], diff)
 }
 
@@ -288,19 +364,16 @@ func WriteSelectorOffsetUint32(k *KernelSelectorData, loff uint32, val uint32) {
 }
 
 func GetCurrentOffset(k *KernelSelectorData) uint32 {
-	return k.off
+	return uint32(len(k.e))
 }
 
 func WriteSelectorByteArray(k *KernelSelectorData, b []byte, size uint32) {
-	for l := uint32(0); l < size; l++ {
-		k.e[k.off+l] = b[l]
-	}
-	k.off += size
+	copy(k.grow(size), b[:size])
 }
 
 func AdvanceSelectorLength(k *KernelSelectorData) uint32 {
-	off := k.off
-	k.off += 4
+	off := uint32(len(k.e))
+	k.grow(4)
 	return off
 }
 
@@ -313,7 +386,7 @@ func stringPaddedLen(s int) int {
 	paddedLen := s
 
 	if s <= 6*stringMapsKeyIncSize {
-		if s%stringMapsKeyIncSize != 0 {
+		if s == 0 || s%stringMapsKeyIncSize != 0 {
 			paddedLen = ((s / stringMapsKeyIncSize) + 1) * stringMapsKeyIncSize
 		}
 		return paddedLen
@@ -339,7 +412,7 @@ func stringPaddedLen(s int) int {
 }
 
 func ArgStringSelectorValue(v string, removeNul bool) ([MaxStringMapsSize]byte, int, error) {
-	if removeNul {
+	if removeNul && len(v) > 0 {
 		// Remove any trailing nul characters ("\0" or 0x00)
 		for v[len(v)-1] == 0 {
 			v = v[0 : len(v)-1]
@@ -350,19 +423,16 @@ func ArgStringSelectorValue(v string, removeNul bool) ([MaxStringMapsSize]byte, 
 	s := len(b)
 	if kernels.MinKernelVersion("5.11") {
 		if s > MaxStringMapsSize-2 {
-			return ret, 0, fmt.Errorf("string is too long")
+			return ret, 0, errors.New("string is too long")
 		}
 	} else if kernels.MinKernelVersion("5.4") {
 		if s > StringMapSize7a-2 {
-			return ret, 0, fmt.Errorf("string is too long")
+			return ret, 0, errors.New("string is too long")
 		}
 	} else {
 		if s > stringMapSize5-1 {
-			return ret, 0, fmt.Errorf("string is too long")
+			return ret, 0, errors.New("string is too long")
 		}
-	}
-	if s == 0 {
-		return ret, 0, fmt.Errorf("string is empty")
 	}
 	// Calculate length of string padded to next multiple of key increment size
 	paddedLen := stringPaddedLen(s)
@@ -461,11 +531,10 @@ func (k *KernelSelectorState) createStringMaps() SelectorStringMaps {
 //
 // For a simpler example of this construction, see the InMap functionality.
 func (k *KernelSelectorState) insertStringMaps(stringMaps SelectorStringMaps) [StringMapsNumSubMaps]uint32 {
-
 	details := [StringMapsNumSubMaps]uint32{}
 	mapid := uint32(0)
 
-	for subMap := 0; subMap < StringMapsNumSubMaps; subMap++ {
+	for subMap := range StringMapsNumSubMaps {
 		if len(stringMaps[subMap]) > 0 {
 			mapid = uint32(len(k.maps.stringMaps[subMap]))
 			k.maps.stringMaps[subMap] = append(k.maps.stringMaps[subMap], stringMaps[subMap])
@@ -488,4 +557,12 @@ func (k *KernelSelectorState) newStringPostfixMap() (uint32, map[KernelLPMTrieSt
 	mapid := len(k.maps.stringPostfixMaps)
 	k.maps.stringPostfixMaps = append(k.maps.stringPostfixMaps, map[KernelLPMTrieStringPostfix]struct{}{})
 	return uint32(mapid), k.maps.stringPostfixMaps[mapid]
+}
+
+func (k *KernelSelectorState) CelExprFunctions() *CelExprFunctions {
+	return k.celExprFunctions
+}
+
+func (k *KernelSelectorState) UprobeRegsMapID(selIdx int) uint32 {
+	return uint32(k.uprobeID<<16 + selIdx)
 }

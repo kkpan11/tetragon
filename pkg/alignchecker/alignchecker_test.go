@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package alignchecker
 
 import (
@@ -9,8 +11,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
-	"github.com/stretchr/testify/assert"
 )
 
 var tetragonLib string
@@ -27,6 +30,6 @@ func init() {
 func Test_Alignments(t *testing.T) {
 	bpfObjPath := filepath.Join(tetragonLib, "bpf_alignchecker.o")
 
-	err := CheckStructAlignments(bpfObjPath)
-	assert.NoError(t, err, "structs must align")
+	err := CheckStructAlignmentsDefault(bpfObjPath)
+	require.NoError(t, err, "structs must align")
 }

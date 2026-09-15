@@ -7,9 +7,11 @@ import (
 	"context"
 	"testing"
 
-	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
-	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/event"
 )
 
 func TestPolicyNamesFilterInvalidEvent(t *testing.T) {
@@ -17,15 +19,12 @@ func TestPolicyNamesFilterInvalidEvent(t *testing.T) {
 	filters := []*tetragon.Filter{{PolicyNames: []string{"red-policy"}}}
 	filterFuncs := []OnBuildFilter{&PolicyNamesFilter{}}
 	fs, err := BuildFilterList(ctx, filters, filterFuncs)
-	assert.NoError(t, err)
-	ev := v1.Event{
-		Event: &tetragon.GetEventsResponse{
-			Event: &tetragon.GetEventsResponse_ProcessKprobe{
-				ProcessKprobe: &tetragon.ProcessKprobe{},
-			},
-		},
+	require.NoError(t, err)
+
+	events := eventsWithPolicyName("")
+	for _, ev := range events {
+		assert.False(t, fs.MatchOne(&ev))
 	}
-	assert.False(t, fs.MatchOne(&ev))
 }
 
 func TestPolicyNamesFilterCorrectValue(t *testing.T) {
@@ -33,37 +32,23 @@ func TestPolicyNamesFilterCorrectValue(t *testing.T) {
 	filters := []*tetragon.Filter{{PolicyNames: []string{"red-policy", "blue-policy"}}}
 	filterFuncs := []OnBuildFilter{&PolicyNamesFilter{}}
 	fs, err := BuildFilterList(ctx, filters, filterFuncs)
-	assert.NoError(t, err)
-	ev := v1.Event{
-		Event: &tetragon.GetEventsResponse{
-			Event: &tetragon.GetEventsResponse_ProcessKprobe{
-				ProcessKprobe: &tetragon.ProcessKprobe{
-					PolicyName: "red-policy",
-				},
-			},
-		},
+	require.NoError(t, err)
+
+	testCases := []struct {
+		policyName string
+		match      bool
+	}{
+		{"red-policy", true},
+		{"blue-policy", true},
+		{"yellow-policy", false},
 	}
-	assert.True(t, fs.MatchOne(&ev))
-	ev = v1.Event{
-		Event: &tetragon.GetEventsResponse{
-			Event: &tetragon.GetEventsResponse_ProcessKprobe{
-				ProcessKprobe: &tetragon.ProcessKprobe{
-					PolicyName: "blue-policy",
-				},
-			},
-		},
+
+	for _, tc := range testCases {
+		events := eventsWithPolicyName(tc.policyName)
+		for _, ev := range events {
+			assert.Equal(t, tc.match, fs.MatchOne(&ev))
+		}
 	}
-	assert.True(t, fs.MatchOne(&ev))
-	ev = v1.Event{
-		Event: &tetragon.GetEventsResponse{
-			Event: &tetragon.GetEventsResponse_ProcessKprobe{
-				ProcessKprobe: &tetragon.ProcessKprobe{
-					PolicyName: "yellow-policy",
-				},
-			},
-		},
-	}
-	assert.False(t, fs.MatchOne(&ev))
 }
 
 func TestPolicyNamesFilterEmptyValue(t *testing.T) {
@@ -71,18 +56,12 @@ func TestPolicyNamesFilterEmptyValue(t *testing.T) {
 	filters := []*tetragon.Filter{{PolicyNames: []string{""}}}
 	filterFuncs := []OnBuildFilter{&PolicyNamesFilter{}}
 	fs, err := BuildFilterList(ctx, filters, filterFuncs)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	// empty selector matches nothing
-	ev := v1.Event{
-		Event: &tetragon.GetEventsResponse{
-			Event: &tetragon.GetEventsResponse_ProcessKprobe{
-				ProcessKprobe: &tetragon.ProcessKprobe{
-					PolicyName: "red-policy",
-				},
-			},
-		},
+	events := eventsWithPolicyName("red-policy")
+	for _, ev := range events {
+		assert.False(t, fs.MatchOne(&ev))
 	}
-	assert.False(t, fs.MatchOne(&ev))
 }
 
 func TestPolicyNamesFilterNilValue(t *testing.T) {
@@ -90,16 +69,62 @@ func TestPolicyNamesFilterNilValue(t *testing.T) {
 	filters := []*tetragon.Filter{{PolicyNames: nil}}
 	filterFuncs := []OnBuildFilter{&PolicyNamesFilter{}}
 	fs, err := BuildFilterList(ctx, filters, filterFuncs)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	// nil selector matches everything, i.e., does not filter events
-	ev := v1.Event{
-		Event: &tetragon.GetEventsResponse{
-			Event: &tetragon.GetEventsResponse_ProcessKprobe{
-				ProcessKprobe: &tetragon.ProcessKprobe{
-					PolicyName: "red-policy",
+	events := eventsWithPolicyName("red-policy")
+	for _, ev := range events {
+		assert.True(t, fs.MatchOne(&ev))
+	}
+}
+
+// eventsWithPolicyName generates kprobe, tracepoint, uprobe, lsm, and usdt events
+// with the specified policy name.
+func eventsWithPolicyName(policyName string) []event.Event {
+	return []event.Event{
+		{
+			Event: &tetragon.GetEventsResponse{
+				Event: &tetragon.GetEventsResponse_ProcessUsdt{
+					ProcessUsdt: &tetragon.ProcessUsdt{
+						PolicyName: policyName,
+					},
+				},
+			},
+		},
+		{
+			Event: &tetragon.GetEventsResponse{
+				Event: &tetragon.GetEventsResponse_ProcessKprobe{
+					ProcessKprobe: &tetragon.ProcessKprobe{
+						PolicyName: policyName,
+					},
+				},
+			},
+		},
+		{
+			Event: &tetragon.GetEventsResponse{
+				Event: &tetragon.GetEventsResponse_ProcessTracepoint{
+					ProcessTracepoint: &tetragon.ProcessTracepoint{
+						PolicyName: policyName,
+					},
+				},
+			},
+		},
+		{
+			Event: &tetragon.GetEventsResponse{
+				Event: &tetragon.GetEventsResponse_ProcessUprobe{
+					ProcessUprobe: &tetragon.ProcessUprobe{
+						PolicyName: policyName,
+					},
+				},
+			},
+		},
+		{
+			Event: &tetragon.GetEventsResponse{
+				Event: &tetragon.GetEventsResponse_ProcessLsm{
+					ProcessLsm: &tetragon.ProcessLsm{
+						PolicyName: policyName,
+					},
 				},
 			},
 		},
 	}
-	assert.True(t, fs.MatchOne(&ev))
 }

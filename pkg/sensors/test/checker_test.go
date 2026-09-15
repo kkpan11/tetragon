@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package test
 
 import (
 	"context"
 	"errors"
-	"os"
+	"log/slog"
 	"sync"
 	"testing"
 
@@ -15,12 +17,11 @@ import (
 	"github.com/cilium/tetragon/pkg/observer/observertesthelper"
 	"github.com/cilium/tetragon/pkg/testutils"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
-	"github.com/sirupsen/logrus"
 )
 
 // TestTestChecker tests the test checker
 func TestTestChecker(t *testing.T) {
-	if _, err := os.Stat("/sys/kernel/debug/tracing/events/syscalls"); os.IsNotExist(err) {
+	if !testutils.CheckKernelTracingExists() {
 		t.Skip("cannot use syscall tracepoints (consider enabling CONFIG_FTRACE_SYSCALLS)")
 	}
 
@@ -32,10 +33,10 @@ func TestTestChecker(t *testing.T) {
 
 	dummyErr := errors.New("dummy error")
 	dummyChecker := ec.FnEventChecker{
-		NextCheckFn: func(_ ec.Event, _ *logrus.Logger) (bool, error) {
+		NextCheckFn: func(_ ec.Event, _ *slog.Logger) (bool, error) {
 			return false, nil
 		},
-		FinalCheckFn: func(_ *logrus.Logger) error {
+		FinalCheckFn: func(_ *slog.Logger) error {
 			return dummyErr
 		},
 	}

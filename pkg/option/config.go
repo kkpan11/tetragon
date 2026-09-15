@@ -10,9 +10,15 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/cilium/tetragon/pkg/logger"
-	"github.com/cilium/tetragon/pkg/metrics"
 	"github.com/spf13/viper"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+
+	"github.com/cilium/tetragon/pkg/constants"
+	"github.com/cilium/tetragon/pkg/defaults"
+	"github.com/cilium/tetragon/pkg/logger"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
+	"github.com/cilium/tetragon/pkg/metrics"
 )
 
 type config struct {
@@ -21,14 +27,30 @@ type config struct {
 	KernelVersion   string
 	HubbleLib       string
 	BTF             string
-	Verbosity       int
 	ForceSmallProgs bool
 	ForceLargeProgs bool
+	ClusterName     string
 
-	EnableProcessNs   bool
-	EnableProcessCred bool
-	EnableK8s         bool
-	K8sKubeConfigPath string
+	VerifierLogLevel int
+
+	EnablePodAnnotations bool
+
+	EnableProcessAncestors            bool
+	EnableProcessKprobeAncestors      bool
+	EnableProcessTracepointAncestors  bool
+	EnableProcessLoaderAncestors      bool
+	EnableProcessUprobeAncestors      bool
+	EnableProcessLsmAncestors         bool
+	EnableProcessUsdtAncestors        bool
+	EnableProcessEnvironmentVariables bool
+
+	FilterEnvironmentVariables map[string]struct{}
+
+	EnableProcessNs      bool
+	EnableProcessCred    bool
+	EnableK8s            bool
+	K8sKubeConfigPath    string
+	K8sControlPlaneRetry int
 
 	DisableKprobeMulti bool
 
@@ -40,14 +62,19 @@ type config struct {
 
 	LogOpts map[string]string
 
-	RBSize      int
-	RBSizeTotal int
-	RBQueueSize int
+	UsePerfRingBuffer bool
+	RBSize            int
+	RBSizeTotal       int
+	RBQueueSize       int
 
-	ProcessCacheSize int
-	DataCacheSize    int
+	ProcessCacheSize       int
+	DisableProcessCache    bool
+	DataCacheSize          int
+	DeletedPodCacheSize    int
+	ProcessCacheGCInterval time.Duration
 
 	MetricsServer      string
+	EnableEventMetrics bool
 	MetricsLabelFilter metrics.LabelFilter
 	ServerAddress      string
 	TracingPolicy      string
@@ -74,8 +101,9 @@ type config struct {
 
 	ReleasePinned bool
 
-	EnablePolicyFilter      bool
-	EnablePolicyFilterDebug bool
+	EnablePolicyFilter          bool
+	EnablePolicyFilterCgroupMap bool
+	EnablePolicyFilterDebug     bool
 
 	EnablePidSetFilter bool
 
@@ -93,7 +121,53 @@ type config struct {
 	HealthServerAddress  string
 	HealthServerInterval int
 
-	KeepSensorsOnExit bool
+	KeepSensorsOnExit      bool
+	PersistGRPCPolicies    bool
+	PersistGRPCPoliciesDir string
+
+	EnableCRI   bool
+	CRIEndpoint string
+
+	EnableCgIDmap      bool
+	EnableCgIDmapDebug bool
+	EnableCgTrackerID  bool
+
+	EventCacheNumRetries int
+	EventCacheRetryDelay int
+
+	ExecveMapEntries int
+	ExecveMapSize    string
+
+	ParentsMapEnabled bool
+	ParentsMapEntries int
+	ParentsMapSize    string
+
+	RetprobesCacheSize int
+
+	SleepablePreloadSize int
+	SleepableOffloadSize int
+
+	EnableGRPCDeprecatedTP bool
+
+	KeepCollection bool
+
+	// ServerTLSCertFile is the path to the PEM-encoded server leaf certificate
+	// served on the TCP gRPC listener. Empty disables TLS.
+	ServerTLSCertFile string
+	// ServerTLSKeyFile is the path to the PEM-encoded private key corresponding
+	// to ServerTLSCertFile. Required when ServerTLSCertFile is set.
+	ServerTLSKeyFile string
+	// ServerTLSClientCAFiles is a list of PEM-encoded CA bundle files used to
+	// verify presented client certificates. Required when
+	// ServerTLSRequireClientCert is true.
+	ServerTLSClientCAFiles []string
+	// ServerTLSRequireClientCert toggles mTLS. When true, the server promotes
+	// its ClientAuth policy to RequireAndVerifyClientCert; ServerTLSClientCAFiles
+	// must be non-empty.
+	ServerTLSRequireClientCert bool
+
+	BPFDebugAreas *BPFDbgEnum
+	BPFDebugLog   bool
 }
 
 var (
@@ -111,6 +185,30 @@ var (
 
 		// Enable all metrics labels by default
 		MetricsLabelFilter: DefaultLabelFilter(),
+
+		// set default values for the event cache
+		// mainly used in the case of testing
+		EventCacheNumRetries: defaults.DefaultEventCacheNumRetries,
+		EventCacheRetryDelay: defaults.DefaultEventCacheRetryDelay,
+
+		// Set default value for {k,u}retprobes lru events cache
+		RetprobesCacheSize: defaults.DefaultRetprobesCacheSize,
+
+		// Set default value for sleepable preload maps.
+		SleepablePreloadSize: defaults.DefaultSleepablePreloadSize,
+
+		// Set default value for sleepable offload maps.
+		SleepableOffloadSize: defaults.DefaultSleepableOffloadSize,
+
+		// Set default value for deleted pod lru cache
+		DeletedPodCacheSize: constants.WatcherDeletedPodCacheSize,
+
+		// Set default value for bpf debug areas
+		// to be kept in sync with bpf/libs/debug.h
+		BPFDebugAreas: NewBPFDbgEnum(map[string]uint8{
+			"generic": 1 << 0,
+			"process": 1 << 1,
+		}),
 	}
 )
 
@@ -118,13 +216,37 @@ func CgroupRateEnabled() bool {
 	return Config.CgroupRate.Events != 0 && Config.CgroupRate.Interval != 0
 }
 
+// AncestorsEnabled returns the value of the configuration option responsible for
+// enabling process ancestors for events with the specified eventType.
+// If events with the specified eventType don't support ancestors, false is returned.
+func AncestorsEnabled(eventType tetragon.EventType) bool {
+	switch eventType {
+	case tetragon.EventType_PROCESS_EXEC, tetragon.EventType_PROCESS_EXIT:
+		return Config.EnableProcessAncestors
+	case tetragon.EventType_PROCESS_KPROBE:
+		return Config.EnableProcessKprobeAncestors
+	case tetragon.EventType_PROCESS_TRACEPOINT:
+		return Config.EnableProcessTracepointAncestors
+	case tetragon.EventType_PROCESS_LOADER:
+		return Config.EnableProcessLoaderAncestors
+	case tetragon.EventType_PROCESS_UPROBE:
+		return Config.EnableProcessUprobeAncestors
+	case tetragon.EventType_PROCESS_LSM:
+		return Config.EnableProcessLsmAncestors
+	case tetragon.EventType_PROCESS_USDT:
+		return Config.EnableProcessUsdtAncestors
+	default:
+		return false
+	}
+}
+
 // ReadDirConfig reads the given directory and returns a map that maps the
 // filename to the contents of that file.
-func ReadDirConfig(dirName string) (map[string]interface{}, error) {
-	m := map[string]interface{}{}
+func ReadDirConfig(dirName string) (map[string]any, error) {
+	m := map[string]any{}
 	files, err := os.ReadDir(dirName)
 	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("unable to read configuration directory: %s", err)
+		return nil, fmt.Errorf("unable to read configuration directory: %w", err)
 	}
 	for _, f := range files {
 		if f.IsDir() {
@@ -136,7 +258,7 @@ func ReadDirConfig(dirName string) (map[string]interface{}, error) {
 		if f.Type()&os.ModeSymlink == 0 {
 			absFileName, err := filepath.EvalSymlinks(fName)
 			if err != nil {
-				log.WithError(err).Warnf("Unable to read configuration file %q", absFileName)
+				log.Warn(fmt.Sprintf("Unable to read configuration file %q", absFileName), logfields.Error, err)
 				continue
 			}
 			fName = absFileName
@@ -144,7 +266,7 @@ func ReadDirConfig(dirName string) (map[string]interface{}, error) {
 
 		fi, err := os.Stat(fName)
 		if err != nil {
-			log.WithError(err).Warnf("Unable to read configuration file %q", fName)
+			log.Warn(fmt.Sprintf("Unable to read configuration file %q", fName), logfields.Error, err)
 			continue
 		}
 		if fi.Mode().IsDir() {
@@ -153,7 +275,7 @@ func ReadDirConfig(dirName string) (map[string]interface{}, error) {
 
 		b, err := os.ReadFile(fName)
 		if err != nil {
-			log.WithError(err).Warnf("Unable to read configuration file %q", fName)
+			log.Warn(fmt.Sprintf("Unable to read configuration file %q", fName), logfields.Error, err)
 			continue
 		}
 		m[f.Name()] = string(bytes.TrimSpace(b))
@@ -194,8 +316,20 @@ func ReadConfigDir(path string) error {
 		return err
 	}
 	if err := viper.MergeConfigMap(cm); err != nil {
-		return fmt.Errorf("merge config failed %v", err)
+		return fmt.Errorf("merge config failed %w", err)
 	}
 
 	return nil
+}
+
+func K8SControlPlaneEnabled() bool {
+	// If K8s is enabled, we assume that the control plane is enabled.
+	// This is because the control plane is required to get the kubeconfig
+	// and other K8s related information.
+	return Config.EnableK8s || len(Config.K8sKubeConfigPath) > 0
+}
+
+func InClusterControlPlaneEnabled() bool {
+	// If K8s is enabled and no kubeconfig path is provided, we assume that the control plane is in-cluster.
+	return Config.EnableK8s && len(Config.K8sKubeConfigPath) == 0
 }

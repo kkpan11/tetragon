@@ -2,39 +2,34 @@
 // Copyright Authors of Tetragon
 
 //go:build amd64 && linux
-// +build amd64,linux
 
 package tracing
 
 import (
 	"context"
-	"os"
 	"strconv"
 	"sync"
 	"syscall"
 	"testing"
 
-	"github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
+	"github.com/stretchr/testify/require"
+
 	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
 	"github.com/cilium/tetragon/pkg/jsonchecker"
 	"github.com/cilium/tetragon/pkg/kernels"
 	lc "github.com/cilium/tetragon/pkg/matchers/listmatcher"
 	"github.com/cilium/tetragon/pkg/observer/observertesthelper"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
-	"github.com/stretchr/testify/assert"
 )
 
-func testListSyscallsDups(t *testing.T, checker *eventchecker.UnorderedEventChecker, configHook string) {
+func testListSyscallsDups(t *testing.T, checker *ec.UnorderedEventChecker, configHook string) {
 	var doneWG, readyWG sync.WaitGroup
 	defer doneWG.Wait()
 
 	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
 	defer cancel()
 
-	err := os.WriteFile(testConfigFile, []byte(configHook), 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
-	}
+	createCrdFile(t, configHook)
 
 	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
 	if err != nil {
@@ -48,7 +43,7 @@ func testListSyscallsDups(t *testing.T, checker *eventchecker.UnorderedEventChec
 	syscall.Dup3(9999, 2222, 0)
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestTracepointListSyscallDups(t *testing.T) {
@@ -62,7 +57,7 @@ func TestTracepointListSyscallDups(t *testing.T) {
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: "sys-write"
+  name: "sys-dups"
 spec:
   lists:
   - name: "test"
@@ -94,7 +89,7 @@ spec:
       - index: 1
         operator: "Equal"
         values:
-        - 9999
+        - "9999"
 `
 
 	// The test hooks raw tracepoint and uses InMap operator with list
@@ -104,7 +99,7 @@ spec:
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
-				ec.NewKprobeArgumentChecker().WithSizeArg(syscall.SYS_DUP),
+				ec.NewKprobeArgumentChecker().WithSyscallId(mkSysIDChecker(t, syscall.SYS_DUP)),
 				ec.NewKprobeArgumentChecker().WithSizeArg(9999),
 			))
 
@@ -112,7 +107,7 @@ spec:
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
-				ec.NewKprobeArgumentChecker().WithSizeArg(syscall.SYS_DUP2),
+				ec.NewKprobeArgumentChecker().WithSyscallId(mkSysIDChecker(t, syscall.SYS_DUP2)),
 				ec.NewKprobeArgumentChecker().WithSizeArg(9999),
 			))
 
@@ -120,7 +115,7 @@ spec:
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
-				ec.NewKprobeArgumentChecker().WithSizeArg(syscall.SYS_DUP3),
+				ec.NewKprobeArgumentChecker().WithSyscallId(mkSysIDChecker(t, syscall.SYS_DUP3)),
 				ec.NewKprobeArgumentChecker().WithSizeArg(9999),
 			))
 

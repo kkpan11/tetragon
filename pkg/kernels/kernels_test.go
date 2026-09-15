@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package kernels
 
 import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestKernelStringToNumeric(t *testing.T) {
@@ -42,6 +45,6 @@ func TestKernelStringToNumeric(t *testing.T) {
 
 func TestGetKernelVersion(t *testing.T) {
 	ver, verStr, err := GetKernelVersion("", "/proc")
-	assert.Nil(t, err)
+	require.NoError(t, err)
 	assert.EqualValues(t, KernelStringToNumeric(verStr), ver)
 }

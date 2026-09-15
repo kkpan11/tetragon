@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !nok8s
+
 package policyfilter
 
 import (
@@ -10,7 +12,7 @@ import (
 )
 
 func TestErrorLabel(t *testing.T) {
-	var err error = &podNamespaceConflictErr{PodID{}, "foo", "lala"}
-	require.Equal(t, "", ErrorLabel(nil))
+	var err error = &podNamespaceConflictError{PodID{}, "foo", "lala"}
+	require.Empty(t, ErrorLabel(nil))
 	require.Equal(t, "pod-namespace-conflict", ErrorLabel(err))
 }

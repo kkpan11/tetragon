@@ -13,4 +13,16 @@
 #define FUNC_INLINE static inline __attribute__((always_inline))
 #endif
 
+#ifndef fallthrough
+#define fallthrough __attribute__((fallthrough))
+#endif
+
+#ifndef __throw_build_bug
+#define __throw_build_bug() __builtin_trap()
+#endif
+
+#ifndef __nobuiltin
+#define __nobuiltin(X) __attribute__((no_builtin(X)))
+#endif
+
 #endif /* __BPF_COMPILER_H__ */

@@ -17,6 +17,9 @@ limitations under the License.
 package helm
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -54,11 +57,14 @@ type Opts struct {
 	Wait bool
 	// Timeout is used to indicate the time to wait for any individual Kubernetes ops
 	Timeout string
+	// Context is used to indicate the context to be used for running helm commands.
+	Context context.Context
 }
 
 type Manager struct {
 	e          *gexe.Echo
 	kubeConfig string
+	path       string
 }
 
 type Option func(*Opts)
@@ -137,6 +143,12 @@ func WithTimeout(timeout string) Option {
 	}
 }
 
+func WithContext(ctx context.Context) Option {
+	return func(opts *Opts) {
+		opts.Context = ctx
+	}
+}
+
 // processOpts is used to generate the Opts resource that will be used to generate
 // the actual helm command to be run using the getCommand helper
 func (m *Manager) processOpts(opts ...Option) *Opts {
@@ -149,7 +161,7 @@ func (m *Manager) processOpts(opts ...Option) *Opts {
 
 // getCommand is used to convert the Opts into a helm suitable command to be run
 func (m *Manager) getCommand(opt *Opts) (string, error) {
-	commandParts := []string{"helm", opt.mode}
+	commandParts := []string{m.path, opt.mode}
 	if opt.mode == "" {
 		return "", fmt.Errorf("missing helm operation mode. Please use the WithMode option while invoking the run")
 	}
@@ -230,8 +242,17 @@ func (m *Manager) RunTest(opts ...Option) error {
 // run method is used to invoke a helm command to perform a suitable operation.
 // Please make sure to configure the right Opts using the Option helpers
 func (m *Manager) run(opts *Opts) (err error) {
-	if m.e.Prog().Avail("helm") == "" {
-		err = fmt.Errorf(missingHelm)
+	ctx := opts.Context
+	// Fallback to background context in case if the context is not provided as part of the options
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if m.path == "" {
+		m.path = "helm"
+	}
+	log.V(4).InfoS("Determining if helm binary is available or not", "executable", m.path)
+	if m.e.Prog().Avail(m.path) == "" {
+		err = errors.New(missingHelm)
 		return
 	}
 	command, err := m.getCommand(opts)
@@ -239,14 +260,25 @@ func (m *Manager) run(opts *Opts) (err error) {
 		return
 	}
 	log.V(4).InfoS("Running Helm Operation", "command", command)
-	proc := m.e.RunProc(command)
-	result := proc.Result()
+	proc := m.e.NewProcWithContext(ctx, command)
+
+	var stderr bytes.Buffer
+	proc.SetStderr(&stderr)
+
+	result := proc.Run().Result()
 	log.V(4).Info("Helm Command output \n", result)
-	if proc.IsSuccess() {
-		return nil
-	} else {
-		return proc.Err()
+	if !proc.IsSuccess() {
+		return fmt.Errorf("%s: %w", strings.TrimSuffix(stderr.String(), "\n"), proc.Err())
 	}
+	return nil
+}
+
+// WithPath is used to provide a custom path where the `helm` executable command
+// can be found. This is useful in case if your binary is in a non standard location
+// and you want to framework to use that instead of returning an error.
+func (m *Manager) WithPath(path string) *Manager {
+	m.path = path
+	return m
 }
 
 func New(kubeConfig string) *Manager {

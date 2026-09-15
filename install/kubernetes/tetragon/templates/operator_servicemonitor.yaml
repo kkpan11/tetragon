@@ -8,7 +8,10 @@ metadata:
     {{- else }}
     {{- include "tetragon-operator.labels" . | nindent 4 }}
     {{- end }}
-  name: {{ .Release.Name }}-operator
+    {{- with .Values.tetragonOperator.prometheus.serviceMonitor.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  name: {{ include "tetragon-operator.name" . }}
   namespace: {{ .Release.Namespace }}
 spec:
   endpoints:
@@ -17,7 +20,8 @@ spec:
       path: /metrics
       port: metrics
       relabelings:
-        - replacement: ${1}
+        - action: replace
+          replacement: ${1}
           sourceLabels:
             - __meta_kubernetes_pod_node_name
           targetLabel: node
@@ -26,5 +30,5 @@ spec:
       - {{ .Release.Namespace }}
   selector:
     matchLabels:
-      {{- include "tetragon-operator.labels" . | nindent 6 }}
+      {{- include "tetragon-operator.selectorLabels" . | nindent 6 }}
 {{- end }}

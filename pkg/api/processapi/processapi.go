@@ -20,8 +20,8 @@ const (
 	CGROUP_PATH_LENGTH = 4096
 
 	MSG_SIZEOF_MAXARG = 100
-	MSG_SIZEOF_EXECVE = 56
-	MSG_SIZEOF_CWD    = 256
+	MSG_SIZEOF_EXECVE = 64
+	MSG_SIZEOF_CWD    = 4096
 	MSG_SIZEOF_ARGS   = 1024
 	MSG_SIZEOF_BUFFER = MSG_SIZEOF_ARGS +
 		MSG_SIZEOF_CWD +
@@ -43,8 +43,25 @@ const (
 	MSG_COMMON_FLAG_RETURN            = 0x1
 	MSG_COMMON_FLAG_KERNEL_STACKTRACE = 0x2
 	MSG_COMMON_FLAG_USER_STACKTRACE   = 0x4
+	MSG_COMMON_FLAG_IMA_HASH          = 0x8
+	MSG_COMMON_FLAG_PROCESS_NOT_FOUND = 0x10
+	MSG_COMMON_FLAG_ACTION_FAILED     = 0x20
 
 	BINARY_PATH_MAX_LEN = 256
+	MAX_ARG_LENGTH      = 256
+
+	STRING_POSTFIX_MAX_LENGTH = 128
+)
+
+const (
+	SentFailedUnknown = iota
+	SentFailedEnoent
+	SentFailedE2big
+	SentFailedEbusy
+	SentFailedEinval
+	SentFailedEnospc
+	SentFailedEagain
+	SentFailedMax
 )
 
 type MsgExec struct {
@@ -60,6 +77,10 @@ type MsgExec struct {
 	Pad        uint32
 	Ino        uint64
 	Ktime      uint64
+	SizePath   uint16
+	SizeArgs   uint16
+	SizeCwd    uint16
+	SizeEnvs   uint16
 }
 
 type MsgExecveKey struct {
@@ -74,21 +95,22 @@ type MsgCommon struct {
 	// Flags is used to:
 	//  - distinguish between an entry and a return kprobe event
 	//  - indicate if a stack trace id was passed in the event
-	Flags  uint8
-	Pad_v2 [2]uint8
-	Size   uint32
-	Ktime  uint64
+	Flags uint8
+	PadV2 [2]uint8
+	Size  uint32
+	Ktime uint64
 }
 
 type MsgK8s struct {
-	NetNS  uint32
-	Cid    uint32
-	Cgrpid uint64
-	Docker [DOCKER_ID_LENGTH]byte
+	Cgrpid        uint64
+	CgrpTrackerID uint64
+	Docker        [DOCKER_ID_LENGTH]byte
 }
 
 type MsgK8sUnix struct {
-	Docker string
+	Docker        string
+	Cgrpid        uint64
+	CgrpTrackerID uint64
 }
 
 type MsgGenericCred struct {
@@ -139,8 +161,19 @@ type MsgCapabilities struct {
 }
 
 type Binary struct {
-	PathLength int64
+	PathLength int32
+	Reversed   uint32
 	Path       [BINARY_PATH_MAX_LEN]byte
+	End        [STRING_POSTFIX_MAX_LENGTH]byte
+	EndR       [STRING_POSTFIX_MAX_LENGTH]byte
+	MBSet      uint64
+	MBGen      uint64
+}
+
+type Args struct {
+	Buf     [MAX_ARG_LENGTH]byte
+	Len     uint32
+	Padding uint32
 }
 
 type MsgNamespaces struct {
@@ -182,6 +215,7 @@ type MsgProcess struct {
 	Ktime      uint64
 	Filename   string
 	Args       string
+	Envs       []string
 	User       MsgUserRecord
 }
 
@@ -228,7 +262,7 @@ type MsgThrottleEvent struct {
 }
 
 type KernelStats struct {
-	SentFailed [256]uint64 `align:"sent_failed"`
+	SentFailed [256][SentFailedMax]uint64 `align:"sent_failed"`
 }
 
 type CgroupRateKey struct {
@@ -246,4 +280,24 @@ type CgroupRateValue struct {
 type CgroupRateOptions struct {
 	Events   uint64
 	Interval uint64
+}
+
+type RegAssignment struct {
+	Type    uint8
+	Pad1    uint8
+	Src     uint16
+	Dst     uint16
+	SrcSize uint8
+	DstSize uint8
+	Off     uint64
+}
+
+const (
+	UPROBE_REGS_MAX = 18
+)
+
+type UprobeRegs struct {
+	Ass [UPROBE_REGS_MAX]RegAssignment
+	Cnt uint32
+	Pad uint32
 }

@@ -7,8 +7,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cilium/tetragon/tools/protoc-gen-go-tetragon/common"
 	"google.golang.org/protobuf/compiler/protogen"
+
+	"github.com/cilium/tetragon/tools/protoc-gen-go-tetragon/common"
 )
 
 func generateResponseTypeString(g *protogen.GeneratedFile, files []*protogen.File) error {
@@ -18,16 +19,16 @@ func generateResponseTypeString(g *protogen.GeneratedFile, files []*protogen.Fil
 	}
 
 	doCases := func() string {
-		var ret string
+		var ret strings.Builder
 		for _, oneof := range oneofs {
-			msgGoIdent := common.TetragonApiIdent(g, fmt.Sprintf("GetEventsResponse_%s", oneof.TypeName))
-			typeGoIdent := common.TetragonApiIdent(g, fmt.Sprintf("EventType_%s", strings.ToUpper(oneof.FieldName)))
+			msgGoIdent := common.TetragonApiIdent(g, "GetEventsResponse_"+oneof.TypeName)
+			typeGoIdent := common.TetragonApiIdent(g, "EventType_"+strings.ToUpper(oneof.FieldName))
 
-			ret += `case *` + msgGoIdent + `:
+			ret.WriteString(`case *` + msgGoIdent + `:
                 return ` + typeGoIdent + `.String(), nil
-            `
+            `)
 		}
-		return ret
+		return ret.String()
 	}
 
 	tetragonGER := common.TetragonApiIdent(g, "GetEventsResponse")
@@ -82,19 +83,19 @@ func generateResponseInnerGetProcess(g *protogen.GeneratedFile, files []*protoge
 	tetragonProcess := common.ProcessIdent(g)
 
 	doCases := func() string {
-		var ret string
+		var ret strings.Builder
 		for _, msg := range events {
 			if !common.IsProcessEvent(msg) {
 				continue
 			}
 
-			goIdent := common.TetragonApiIdent(g, fmt.Sprintf("GetEventsResponse_%s", msg.GoIdent.GoName))
+			goIdent := common.TetragonApiIdent(g, "GetEventsResponse_"+msg.GoIdent.GoName)
 
-			ret += `case *` + goIdent + `:
+			ret.WriteString(`case *` + goIdent + `:
                 return ev.` + msg.GoIdent.GoName + `.Process
-            `
+            `)
 		}
-		return ret
+		return ret.String()
 	}
 
 	ifaceIdent := common.TetragonApiIdent(g, "IsGetEventsResponse_Event")
@@ -156,19 +157,19 @@ func generateResponseInnerGetParent(g *protogen.GeneratedFile, files []*protogen
 	tetragonProcess := common.ProcessIdent(g)
 
 	doCases := func() string {
-		var ret string
+		var ret strings.Builder
 		for _, msg := range events {
 			if !common.IsParentEvent(msg) {
 				continue
 			}
 
-			goIdent := common.TetragonApiIdent(g, fmt.Sprintf("GetEventsResponse_%s", msg.GoIdent.GoName))
+			goIdent := common.TetragonApiIdent(g, "GetEventsResponse_"+msg.GoIdent.GoName)
 
-			ret += `case *` + goIdent + `:
+			ret.WriteString(`case *` + goIdent + `:
                 return ev.` + msg.GoIdent.GoName + `.Parent
-            `
+            `)
 		}
-		return ret
+		return ret.String()
 	}
 
 	ifaceIdent := common.TetragonApiIdent(g, "IsGetEventsResponse_Event")
@@ -184,10 +185,153 @@ func generateResponseInnerGetParent(g *protogen.GeneratedFile, files []*protogen
 	return nil
 }
 
+func generateResponseGetAncestors(g *protogen.GeneratedFile) error {
+	tetragonProcess := common.ProcessIdent(g)
+	tetragonGER := common.TetragonApiIdent(g, "GetEventsResponse")
+
+	g.P(`// ResponseGetAncestors returns a GetEventsResponse's ancestors processes if they exists
+    func ResponseGetAncestors(response *` + tetragonGER + `) []*` + tetragonProcess + ` {
+        if response == nil {
+            return nil
+        }
+
+        event := response.Event
+        if event == nil {
+            return nil
+        }
+
+        return ResponseInnerGetAncestors(event)
+	 }`)
+
+	return nil
+}
+
+func generateResponseInnerGetAncestors(g *protogen.GeneratedFile, files []*protogen.File) error {
+	events, err := common.GetEvents(files)
+	if err != nil {
+		return err
+	}
+
+	tetragonProcess := common.ProcessIdent(g)
+
+	doCases := func() string {
+		var ret strings.Builder
+		for _, msg := range events {
+			if !common.IsAncestorsEvent(msg) {
+				continue
+			}
+
+			goIdent := common.TetragonApiIdent(g, "GetEventsResponse_"+msg.GoIdent.GoName)
+
+			ret.WriteString(`case *` + goIdent + `:
+                return ev.` + msg.GoIdent.GoName + `.Ancestors
+            `)
+		}
+		return ret.String()
+	}
+
+	ifaceIdent := common.TetragonApiIdent(g, "IsGetEventsResponse_Event")
+
+	g.P(`// ResponseInnerGetAncestors returns a GetEventsResponse inner event's ancestors processes if they exists
+    func ResponseInnerGetAncestors(event ` + ifaceIdent + `) []*` + tetragonProcess + ` {
+        switch ev := event.(type) {
+            ` + doCases() + `
+        }
+        return nil
+	 }`)
+
+	return nil
+}
+
+func generateResponseTypeMap(g *protogen.GeneratedFile, files []*protogen.File) error {
+	oneofs, err := common.GetEventsResponseOneofs(files)
+	if err != nil {
+		return err
+	}
+
+	doCases := func() string {
+		var ret strings.Builder
+		for _, oneof := range oneofs {
+			msgGoIdent := common.TetragonApiIdent(g, oneof.TypeName)
+			fmt.Fprintf(&ret, "\"%s\": &%s{},\n", oneof.FieldName, msgGoIdent)
+		}
+		return ret.String()
+	}
+
+	protoMessage := common.GoIdent(g, "google.golang.org/protobuf/proto", "Message")
+	g.P(`// ResponseTypeMap returns a map from event field names (e.g. "process_exec") to corresponding
+    // protobuf messages (e.g. &tetragon.ProcessExec{}).
+    func ResponseTypeMap() map[string]` + protoMessage + `{
+		return map[string]proto.Message {
+            ` + doCases() + `
+        }
+    }`)
+
+	return nil
+}
+
+func generateProcessEventTuple(g *protogen.GeneratedFile, files []*protogen.File) error {
+	oneofs, err := common.GetEventsResponseOneofs(files)
+	if err != nil {
+		return err
+	}
+
+	doCases := func() string {
+		var ret strings.Builder
+		for _, oneof := range oneofs {
+			msgGoIdent := strings.Split(common.TetragonApiIdent(g, oneof.TypeName), ".")
+			goIdent := common.TetragonApiIdent(g, "GetEventsResponse_"+msgGoIdent[len(msgGoIdent)-1])
+			fmt.Fprintf(&ret, "case *%s:\n", goIdent)
+			fmt.Fprintf(&ret, "    return \"%s\", response.Get%s(), (*tetragon.%s)(nil)\n", oneof.FieldName, msgGoIdent[len(msgGoIdent)-1], msgGoIdent[len(msgGoIdent)-1])
+		}
+		return ret.String()
+	}
+
+	tetragonGER := common.TetragonApiIdent(g, "GetEventsResponse")
+	g.P(`// ProcessEventMapTuple returns a tuple from event field name (e.g. "process_exec") to corresponding
+    // protobuf messages for a given tetragon.GetEventsResponse (e.g. response.GetProcessExec()).
+    func ProcessEventMapTuple(response *` + tetragonGER + `) (string, any, any) {
+		switch response.Event.(type) {
+            ` + doCases() + `
+        }
+		return "", nil, nil
+    }`)
+
+	return nil
+}
+
+func generateProcessEventMapEmpty(g *protogen.GeneratedFile, files []*protogen.File) error {
+	oneofs, err := common.GetEventsResponseOneofs(files)
+	if err != nil {
+		return err
+	}
+
+	doCases := func() string {
+		var ret strings.Builder
+		for _, oneof := range oneofs {
+			msgGoIdent := strings.Split(common.TetragonApiIdent(g, oneof.TypeName), ".")
+			fmt.Fprintf(&ret, "\"%s\": (*tetragon.%s)(nil),\n", oneof.FieldName, msgGoIdent[len(msgGoIdent)-1])
+		}
+		return ret.String()
+	}
+
+	g.P(`// ProcessEventMapEmpty returns a map from event field names (e.g. "process_exec") with nil as value
+    func ProcessEventMapEmpty() map[string]any {
+		return map[string]any {
+            ` + doCases() + `
+        }
+    }`)
+
+	return nil
+}
+
 // Generate generates boilerplate helpers
 func Generate(gen *protogen.Plugin, files []*protogen.File) error {
-	// Pick arbitrary file to use for prefix of generated files, files[0] here.
-	g := common.NewCodegenFile(gen, files[0], "helpers")
+	f, err := common.GetFirstTetragonFile(files)
+	if err != nil {
+		return err
+	}
+	g := common.NewCodegenFile(gen, f, "helpers")
 
 	if err := generateResponseTypeString(g, files); err != nil {
 		return err
@@ -211,6 +355,27 @@ func Generate(gen *protogen.Plugin, files []*protogen.File) error {
 
 	// nolint:revive // ignore "if-return: redundant if just return error" for clarity
 	if err := generateResponseInnerGetParent(g, files); err != nil {
+		return err
+	}
+
+	if err := generateResponseGetAncestors(g); err != nil {
+		return err
+	}
+
+	// nolint:revive // ignore "if-return: redundant if just return error" for clarity
+	if err := generateResponseInnerGetAncestors(g, files); err != nil {
+		return err
+	}
+
+	if err := generateResponseTypeMap(g, files); err != nil {
+		return err
+	}
+
+	if err := generateProcessEventTuple(g, files); err != nil {
+		return err
+	}
+
+	if err := generateProcessEventMapEmpty(g, files); err != nil {
 		return err
 	}
 

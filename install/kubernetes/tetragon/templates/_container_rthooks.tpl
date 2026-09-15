@@ -1,11 +1,9 @@
 {{- define "container.tetragon-rthooks" -}}
 - name: tetragon-rthooks
-  securityContext:
-    {{- toYaml .Values.rthooks.securityContext | nindent 4 }}
-  image: "{{ if .Values.rthooks.image.override }}{{ .Values.rthooks.image.override }}{{ else }}{{ .Values.rthooks.image.repository }}:{{ .Values.rthooks.image.tag }}{{ end }}"
+  image: {{ include "rthooks.image" . }}
   terminationMessagePolicy: FallbackToLogsOnError
   imagePullPolicy: {{ .Values.imagePullPolicy }}
-  command: 
+  command:
     - tetragon-oci-hook-setup
     - install
     - --interface={{ include "rthooksInterface" .  | required "rtooks.interface needs to be correctly defined" }}
@@ -17,12 +15,14 @@
     - --grpc-address={{ .Values.tetragon.grpc.address }}
     - --fail-allow-namespaces
     - {{ if .Values.rthooks.failAllowNamespaces }}{{ printf "%s,%s" .Release.Namespace .Values.rthooks.failAllowNamespaces }}{{ else }}{{ .Release.Namespace }}{{ end }}
+   {{- range .Values.rthooks.failAllowNamespacesRegex }}
+    - --fail-allow-namespaces-regex={{ . }}
+   {{- end }}
    {{- range $key, $value := .Values.rthooks.extraHookArgs }}
    {{- if eq nil $value }}
-    - {{ $key }}
-    - {{ $value }}
+    - --{{ $key }}
    {{- else }}
-    - {{ $key }}
+    - --{{ $key }}={{ $value }}
   {{- end }}
   {{- end }}
   volumeMounts:
@@ -40,7 +40,25 @@
       mountPath: {{ .Values.rthooks.nriHook.nriSocket }}
 {{- end }}
 {{- with .Values.rthooks.resources }}
-  resources: {}
+  resources:
+    {{- toYaml . | nindent 4 }}
+{{- end }}
+{{- end -}}
+
+{{- define "container.tetragon-rthooks-export-logs" -}}
+- name: export-logs
+  image: {{ include "rthooks.image" . }}
+  imagePullPolicy: {{ .Values.imagePullPolicy }}
+  command:
+    - tail
+    - -F
+    - {{ printf "%s/%s" .Values.rthooks.installDir "tetragon-oci-hook.log" | quote }}
+  volumeMounts:
+    - name: oci-hook-install-path
+      mountPath: {{ .Values.rthooks.installDir | quote }}
+      readOnly: true
+{{- with .Values.rthooks.exportLogs.resources }}
+  resources:
     {{- toYaml . | nindent 4 }}
 {{- end }}
 {{- end -}}

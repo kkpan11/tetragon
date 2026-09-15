@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package main
 
 import (
@@ -34,9 +36,9 @@ func readFromStdin(selfBin string) {
 			log.Fatalf("scanned %d args instead of 3", n)
 		}
 		cmd := exec.Command(selfBin,
-			fmt.Sprintf("%d", fd),
-			fmt.Sprintf("%d", off),
-			fmt.Sprintf("%d", whence),
+			strconv.Itoa(fd),
+			strconv.FormatInt(off, 10),
+			strconv.Itoa(whence),
 		)
 		out, err := cmd.CombinedOutput()
 		if err != nil {

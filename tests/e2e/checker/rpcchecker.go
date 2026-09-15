@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package checker
 
 import (
@@ -10,13 +12,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/e2e-framework/pkg/envconf"
+	"sigs.k8s.io/e2e-framework/pkg/features"
+	"sigs.k8s.io/yaml"
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
@@ -26,14 +36,6 @@ import (
 	"github.com/cilium/tetragon/pkg/logger"
 	"github.com/cilium/tetragon/pkg/multiplexer"
 	"github.com/cilium/tetragon/tests/e2e/state"
-	"github.com/sirupsen/logrus"
-	"github.com/stretchr/testify/assert"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"k8s.io/klog/v2"
-	"sigs.k8s.io/e2e-framework/pkg/envconf"
-	"sigs.k8s.io/e2e-framework/pkg/features"
-	"sigs.k8s.io/yaml"
 )
 
 // RPCChecker checks gRPC events from one or more events streams.
@@ -129,7 +131,7 @@ func (rc *RPCChecker) CheckInNamespace(connTimeout time.Duration, namespaces ...
 
 // CheckInNamespace returns a feature func that runs event checks on events filtered by
 // one or more filters.
-func (rc *RPCChecker) CheckWithFilters(connTimeout time.Duration, allowList, denyList []*tetragon.Filter) features.Func {
+func (rc *RPCChecker) CheckWithFilters(_ time.Duration, allowList, denyList []*tetragon.Filter) features.Func {
 	return func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
 		// We acquire a lock here to avoid erroneously running this checker more than once
 		// simultaneously in a testenv.TestInParallel call.
@@ -151,21 +153,19 @@ func (rc *RPCChecker) CheckWithFilters(connTimeout time.Duration, allowList, den
 			}
 		}
 
-		ports, ok := ctx.Value(state.GrpcForwardedPorts).(map[string]int)
+		connsMap, ok := ctx.Value(state.GrpcForwardedConns).(map[string]*grpc.ClientConn)
 		if !ok {
-			assert.Fail(t, "failed to find forwarded gRPC ports")
+			assert.Fail(t, "failed to find forwarded gRPC connections")
 			return ctx
 		}
 
-		var addrs []string
-		for _, port := range ports {
-			addrs = append(addrs, fmt.Sprintf("localhost:%d", port))
+		var conns []*grpc.ClientConn
+		for _, conn := range connsMap {
+			conns = append(conns, conn)
 		}
 
 		if rc.getEvents == nil {
-			if err := rc.connect(ctx, connTimeout, addrs...); !assert.NoError(t, err, "checker should connect") {
-				return ctx
-			}
+			rc.setConns(conns)
 		}
 
 		if err := rc.check(ctx, allowList, denyList); !assert.NoError(t, err, "checks should pass") {
@@ -186,13 +186,10 @@ func (rc *RPCChecker) ResetEventCount() {
 
 // Connect connects the RPCChecker to one or more gRPC servers. This must be called
 // before calling RPCChecker.Check().
-func (rc *RPCChecker) connect(ctx context.Context, connTimeout time.Duration, addrs ...string) error {
+func (rc *RPCChecker) setConns(conns []*grpc.ClientConn) {
 	cm := multiplexer.NewClientMultiplexer()
-	if err := cm.Connect(ctx, connTimeout, addrs...); err != nil {
-		return err
-	}
+	cm.SetConns(conns)
 	rc.getEvents = cm
-	return nil
 }
 
 // Check checks an event stream from one or more gRPC servers.
@@ -225,7 +222,7 @@ func (rc *RPCChecker) check(ctx context.Context, allowList, denyList []*tetragon
 	defer func() {
 		checker, ok := rc.checker.(interface{ GetRemainingChecks() []ec.EventChecker })
 		if !ok {
-			klog.ErrorS(fmt.Errorf("checker has no method GetRemainingChecks()"), "unable to dump remaining checks")
+			klog.ErrorS(errors.New("checker has no method GetRemainingChecks()"), "unable to dump remaining checks")
 			return
 		}
 		if err := dumpChecks(ctx, rc.Name(), checker.GetRemainingChecks()); err != nil {
@@ -276,24 +273,24 @@ func (rc *RPCChecker) check(ctx context.Context, allowList, denyList []*tetragon
 			}
 
 			// FIXME: refactor eventchecker so we can use klog here
-			log := logger.GetLogger().(*logrus.Logger)
-			mw := io.MultiWriter(os.Stderr, rc.logs)
-			log.SetOutput(mw)
+			log := logger.GetLogger()
+			//mw := io.MultiWriter(os.Stderr, rc.logs)
+			//log.SetOutput(mw)
 
 			done, err := ec.NextResponseCheck(rc.checker, event, log)
 			if done && err == nil {
-				log.Infof("%s => FINAL MATCH ", prefix)
-				log.Infof("DONE!")
+				log.Info(prefix + " => FINAL MATCH ")
+				log.Info("DONE!")
 				rc.checker.FinalCheck(nil) // reset event checker
 				return nil
 			} else if err == nil {
-				log.Infof("%s => MATCH, continuing", prefix)
+				log.Info(prefix + " => MATCH, continuing")
 			} else if done {
-				log.Errorf("%s => terminating error: %s", prefix, err)
+				log.Error(fmt.Sprintf("%s => terminating error: %s", prefix, err))
 				rc.checker.FinalCheck(nil) // reset event checker
 				return err
 			} else {
-				log.Infof("%s => no match: %s, continuing", prefix, err)
+				log.Info(fmt.Sprintf("%s => no match: %s, continuing", prefix, err))
 			}
 		}
 	}
@@ -334,7 +331,7 @@ func (rc *RPCChecker) updateContextEventCheckers(ctx context.Context) context.Co
 func getExportDir(ctx context.Context) (string, error) {
 	exportDir, ok := ctx.Value(state.ExportDir).(string)
 	if !ok {
-		return "", fmt.Errorf("export dir has not been created. Call helpers.CreateExportDir() first")
+		return "", errors.New("export dir has not been created. Call helpers.CreateExportDir() first")
 	}
 	return exportDir, nil
 }
@@ -349,10 +346,10 @@ func checkertypeString(checker ec.EventChecker) string {
 }
 
 func dumpChecks(ctx context.Context, checkerName string, checks []ec.EventChecker) error {
-	var unmatchedChecks []map[string]interface{}
+	var unmatchedChecks []map[string]any
 
 	for _, check := range checks {
-		unmatchedChecks = append(unmatchedChecks, map[string]interface{}{checkertypeString(check): check})
+		unmatchedChecks = append(unmatchedChecks, map[string]any{checkertypeString(check): check})
 	}
 
 	exportDir, err := getExportDir(ctx)

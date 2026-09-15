@@ -15,6 +15,8 @@ assignees: ''
       export BRANCH=v1.1
       export RELEASE=v1.1.2
 
+      Note: if you are doing a minor release (`X.Y.0`), set BRANCH to `main`.
+
 - [ ] Open a pull request to update the Helm chart and docs:
 
       git checkout -b pr/prepare-$RELEASE $BRANCH
@@ -25,10 +27,10 @@ assignees: ''
       git add install/kubernetes/tetragon/
 
       # update version in docs (Hugo config)
-      sed -i "s/^version =.*/version = \"${RELEASE}\"/" docs/hugo.toml
+      sed -i "s/^version =.*/version = \"${RELEASE}\"/" docs/config/_default/hugo.toml
       git add docs/
 
-      # update upgrade notes
+      # update upgrade notes (and remove empty sections with TBD)
       ./contrib/update-upgrade-notes.sh $RELEASE
       git add contrib/upgrade-notes/
 
@@ -37,11 +39,11 @@ assignees: ''
 
 - [ ] Once the pull request gets merged, create a tag for the release:
 
-      git checkout main
-      git pull origin main
+      git checkout $BRANCH
+      git pull origin $BRANCH
       git tag -a $RELEASE -m "$RELEASE release" -s
       git tag -a api/$RELEASE -m "api/$RELEASE release" -s
-      git push origin $RELEASE
+      git push origin $RELEASE api/$RELEASE
 
 - If you are releasing a major or minor version (`X.Y.0`):
 
@@ -90,12 +92,12 @@ gitGraph
 
 - [ ] Publish Helm chart
    - Follow [cilium/charts RELEASE.md] to publish the Helm chart.
-   - Once the pull request is merged and the chart is published, go to [cilium/charts GKE workflow] and wait for the
+   - Once the pull request is merged and the chart is published, go to [cilium/charts Validate Tetragon Helm chart workflow] and wait for the
      CI run to pass.
 
 [release blockers]: https://github.com/cilium/tetragon/issues?q=is%3Aissue+is%3Aopen+label%3Arelease-blocker
 [Image CI Releases workflow]: https://github.com/cilium/tetragon/actions/workflows/build-images-releases.yml
 [cilium/charts RELEASE.md]: https://github.com/cilium/charts/blob/master/RELEASE.md
-[cilium/charts GKE workflow]: https://github.com/cilium/charts/actions/workflows/conformance-tetragon-gke.yaml
+[cilium/charts Validate Tetragon Helm chart workflow]: https://github.com/cilium/charts/actions/workflows/validate-tetragon-chart.yaml
 [releases page]: https://github.com/cilium/tetragon/releases
 [a Tetragon maintainer]: https://github.com/orgs/cilium/teams/tetragon-maintainers/members

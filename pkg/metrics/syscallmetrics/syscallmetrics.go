@@ -4,21 +4,23 @@
 package syscallmetrics
 
 import (
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/metrics"
 	"github.com/cilium/tetragon/pkg/metrics/consts"
 	"github.com/cilium/tetragon/pkg/option"
-	"github.com/cilium/tetragon/pkg/syscallinfo"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
-	syscallStats = metrics.MustNewGranularCounter[metrics.ProcessLabels](prometheus.CounterOpts{
-		Namespace:   consts.MetricsNamespace,
-		Name:        "syscalls_total",
-		Help:        "System calls observed.",
-		ConstLabels: nil,
-	}, []string{"syscall"})
+	syscallStats = metrics.MustNewGranularCounterWithInit[metrics.ProcessLabels](
+		metrics.NewOpts(
+			consts.MetricsNamespace, "", "syscalls_total",
+			"System calls observed.",
+			nil, nil, []metrics.UnconstrainedLabel{{Name: "syscall", ExampleValue: consts.ExampleSyscallLabel}},
+		),
+		nil,
+	)
 )
 
 func InitMetrics(registry *prometheus.Registry) {
@@ -32,18 +34,18 @@ func InitMetricsForDocs(registry *prometheus.Registry) {
 	InitMetrics(registry)
 
 	// Initialize metrics with example labels
-	processLabels := option.CreateProcessLabels(consts.ExampleNamespace, consts.ExampleWorkload, consts.ExamplePod, consts.ExampleBinary)
+	processLabels := option.CreateProcessLabels(consts.ExampleNamespace, consts.ExampleWorkload, consts.ExamplePod, consts.ExampleBinary, consts.ExampleNodeName)
 	syscallStats.WithLabelValues(processLabels, consts.ExampleSyscallLabel).Inc()
 }
 
-func Handle(event interface{}) {
+func Handle(event any) {
 	ev, ok := event.(*tetragon.GetEventsResponse)
 	if !ok {
 		return
 	}
 
 	var syscall string
-	var namespace, workload, pod, binary string
+	var namespace, workload, pod, binary, nodeName string
 	if tpEvent := ev.GetProcessTracepoint(); tpEvent != nil {
 		if tpEvent.Subsys == "raw_syscalls" && tpEvent.Event == "sys_enter" {
 			syscall = rawSyscallName(tpEvent)
@@ -55,24 +57,12 @@ func Handle(event interface{}) {
 				}
 				binary = tpEvent.Process.Binary
 			}
+			nodeName = ev.NodeName
 		}
 	}
 
 	if syscall != "" {
-		processLabels := option.CreateProcessLabels(namespace, workload, pod, binary)
+		processLabels := option.CreateProcessLabels(namespace, workload, pod, binary, nodeName)
 		syscallStats.WithLabelValues(processLabels, syscall).Inc()
 	}
-}
-
-func rawSyscallName(tp *tetragon.ProcessTracepoint) string {
-	sysID := int64(-1)
-	if len(tp.Args) > 0 && tp.Args[0] != nil {
-		if x, ok := tp.Args[0].GetArg().(*tetragon.KprobeArgument_LongArg); ok {
-			sysID = x.LongArg
-		}
-	}
-	if sysID == -1 {
-		return ""
-	}
-	return syscallinfo.GetSyscallName(int(sysID))
 }

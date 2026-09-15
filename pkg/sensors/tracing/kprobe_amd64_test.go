@@ -2,16 +2,17 @@
 // Copyright Authors of Tetragon
 
 //go:build amd64 && linux
-// +build amd64,linux
 
 package tracing
 
 import (
 	"context"
+	"os/exec"
 	"strconv"
 	"sync"
-	"syscall"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
@@ -22,11 +23,11 @@ import (
 	sm "github.com/cilium/tetragon/pkg/matchers/stringmatcher"
 	"github.com/cilium/tetragon/pkg/observer/observertesthelper"
 	"github.com/cilium/tetragon/pkg/reader/caps"
+	"github.com/cilium/tetragon/pkg/testutils"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
 
 	_ "github.com/cilium/tetragon/pkg/sensors/exec"
 
-	"github.com/stretchr/testify/assert"
 	"golang.org/x/sys/unix"
 )
 
@@ -40,6 +41,7 @@ func TestKprobeTraceCapabilityChecks(t *testing.T) {
 	pidStr := strconv.Itoa(int(observertesthelper.GetMyPid()))
 	t.Logf("tester pid=%s\n", pidStr)
 
+	testCapIoperm := testutils.RepoRootPath("contrib/tester-progs/capabilities-ioperm")
 	capabilityhook_ := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -58,13 +60,14 @@ spec:
     - index: 2
       type: "capability"
     returnArg:
+      index: 0
       type: "int"
     selectors:
-    - matchPIDs:
-      - operator: In
+    - matchBinaries:
+      - operator: "In"
         values:
-        - ` + pidStr
-
+        - "` + testCapIoperm + `"
+`
 	createCrdFile(t, capabilityhook_)
 
 	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
@@ -98,21 +101,10 @@ spec:
 
 	checker := ec.NewUnorderedEventChecker(kpChecker)
 
-	io_delay := 0x80
-	// probe IO_DELAY to trigger a CAP_SYS_RAWIO check, this is for x86
-	err = syscall.Ioperm(io_delay, 1, 1)
-	if err != nil {
-		t.Logf("Failed to ioperm(0x%02x): %v\n", io_delay, err)
-		t.Fatal()
-	}
-
-	t.Logf("ioperm() enabling 0x%02x succeeded", io_delay)
-
-	// disable port
-	syscall.Ioperm(io_delay, 1, 0)
+	exec.Command(testCapIoperm).Run()
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestKprobeListSyscallDups(t *testing.T) {
@@ -125,7 +117,7 @@ func TestKprobeListSyscallDups(t *testing.T) {
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: "sys-write"
+  name: "sys-dups"
 spec:
   lists:
   - name: "test"
@@ -150,7 +142,7 @@ spec:
       - index: 0
         operator: "Equal"
         values:
-        - 9999
+        - "9999"
 `
 
 	// The test hooks sys_dup[23] syscalls through the list and
@@ -183,4 +175,78 @@ spec:
 	checker := ec.NewUnorderedEventChecker(kpCheckerDup, kpCheckerDup2, kpCheckerDup3)
 
 	testListSyscallsDups(t, checker, configHook)
+}
+
+func TestKprobePtRegsDataMatch(t *testing.T) {
+	pathHook := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "kprobe"
+spec:
+  kprobes:
+  - call: sys_prctl
+    syscall: true
+    data:
+    - index: 0
+      type: "uint64"
+      source: "pt_regs"
+      resolve: "rdi"
+    - index: 1
+      type: "uint64"
+      source: "pt_regs"
+      resolve: "rsi"
+    - index: 2
+      type: "uint64"
+      source: "pt_regs"
+      resolve: "rdx"
+    - index: 3
+      type: "uint64"
+      source: "pt_regs"
+      resolve: "r10"
+    - index: 4
+      type: "uint64"
+      source: "pt_regs"
+      resolve: "r8"
+    selectors:
+    - matchData:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "0xffff0"
+`
+
+	createCrdFile(t, pathHook)
+
+	kpChecker := ec.NewProcessKprobeChecker("").
+		WithFunctionName(sm.Suffix("sys_prctl")).
+		WithData(ec.NewKprobeArgumentListMatcher().
+			WithOperator(lc.Ordered).
+			WithValues(
+				ec.NewKprobeArgumentChecker().WithSizeArg(0xffff0),
+				ec.NewKprobeArgumentChecker().WithSizeArg(1),
+				ec.NewKprobeArgumentChecker().WithSizeArg(2),
+				ec.NewKprobeArgumentChecker().WithSizeArg(3),
+				ec.NewKprobeArgumentChecker().WithSizeArg(4),
+			))
+
+	checker := ec.NewUnorderedEventChecker(kpChecker)
+
+	var doneWG, readyWG sync.WaitGroup
+	defer doneWG.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib)
+	if err != nil {
+		t.Fatalf("GetDefaultObserverWithFile error: %s", err)
+	}
+	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
+	readyWG.Wait()
+
+	unix.Prctl(0xffff0, 1, 2, 3, 4)
+
+	err = jsonchecker.JsonTestCheck(t, checker)
+	require.NoError(t, err)
 }

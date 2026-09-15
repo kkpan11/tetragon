@@ -6,25 +6,21 @@ package multiplexer
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/logger"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"k8s.io/klog/v2"
 )
 
 const (
 	defaultConnectRetries = 10
 	defaultConnectBackoff = time.Second
 )
-
-type connResult struct {
-	*grpc.ClientConn
-	Error error
-}
 
 // GetEventsResult encapsulates a GetEventsResponse and an error
 type GetEventsResult struct {
@@ -62,67 +58,50 @@ func (cm *ClientMultiplexer) WithConnectBackoff(backoff time.Duration) *ClientMu
 	return cm
 }
 
-// Connect connects the ClientMultiplexer to one or more gRPC servers specified addrs
-func (cm *ClientMultiplexer) Connect(ctx context.Context, connTimeout time.Duration, addrs ...string) error {
-	connCtx, connCancel := context.WithTimeout(ctx, connTimeout)
-	defer connCancel()
+func ConnectAttempt(ctx context.Context, addr string) (*grpc.ClientConn, error) {
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", addr, err)
+	}
 
-	var wg sync.WaitGroup
-	queue := make(chan connResult, len(addrs))
-	wg.Add(len(addrs))
-
-	for _, addr := range addrs {
-		klog.V(2).InfoS("Connecting to gRPC server...", "addr", addr)
-		go func(addr string) {
-			defer wg.Done()
-
-			conn, err := grpc.DialContext(
-				connCtx,
-				addr,
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
-			)
-
-			if err != nil {
-				queue <- connResult{nil, fmt.Errorf("%s: %w", addr, err)}
-				return
+	// Deprecation of grpc.DialContext made us switch to grpc.NewClient
+	// which does not perform any I/O, the following statement should
+	// maintain the previous "connect" behavior by waiting for client
+	// connection.
+	for {
+		switch state := conn.GetState(); state {
+		case connectivity.Ready:
+			return conn, nil
+		case connectivity.Idle:
+			conn.Connect()
+			fallthrough
+		case connectivity.Connecting:
+			ok := conn.WaitForStateChange(ctx, state)
+			if !ok {
+				return nil, fmt.Errorf("conn for %s did not change from %s: %w", addr, state, ctx.Err())
 			}
-
-			queue <- connResult{conn, nil}
-			logger.GetLogger().WithField("addr", addr).Info("Connected to gRPC server")
-		}(addr)
-	}
-
-	// Close the channel when everything is connected
-	go func() {
-		wg.Wait()
-		close(queue)
-	}()
-
-	// Pull connections out of the channel
-	var conns []*grpc.ClientConn
-	var connErrors []error
-	for cr := range queue {
-		if cr.Error != nil {
-			connErrors = append(connErrors, cr.Error)
-		} else {
-			conns = append(conns, cr.ClientConn)
+		case connectivity.TransientFailure:
+			// gRPC will automatically schedule a reconnect; wait for the
+			// state to change before checking again. The caller's context
+			// deadline is the retry budget.
+			conn.WaitForStateChange(ctx, state)
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("conn for %s in state %s: %w", addr, state, ctx.Err())
+			}
+		case connectivity.Shutdown:
+			return nil, fmt.Errorf("conn for %s in state %s bailing out", addr, state)
+		default:
+			return nil, fmt.Errorf("%s: unknown conn state: %s", addr, state)
 		}
-	}
 
-	// Close everything and abort if we failed to connect to one or more server
-	if len(connErrors) > 0 {
-		for _, conn := range conns {
-			conn.Close()
-		}
-		return fmt.Errorf("failed to connect to one or more servers: %v", connErrors)
 	}
+}
 
+func (cm *ClientMultiplexer) SetConns(conns []*grpc.ClientConn) {
 	for _, conn := range conns {
 		client := tetragon.NewFineGuidanceSensorsClient(conn)
 		cm.clients = append(cm.clients, client)
 	}
-
-	return nil
 }
 
 // GetEventsWithFilters calls GetEvents for each client in the multiplexer and returns a channel that
@@ -134,7 +113,7 @@ func (cm *ClientMultiplexer) GetEvents(ctx context.Context, allowList, denyList 
 	for _, client := range cm.clients {
 		var stream tetragon.FineGuidanceSensors_GetEventsClient
 		var err error
-		for i := 0; i < cm.connectRetries; i++ {
+		for range cm.connectRetries {
 			stream, err = client.GetEvents(ctx, &tetragon.GetEventsRequest{
 				AllowList: allowList,
 				DenyList:  denyList,
@@ -156,6 +135,20 @@ func (cm *ClientMultiplexer) GetEvents(ctx context.Context, allowList, denyList 
 				default:
 				}
 				res, err := stream.Recv()
+				// We've occasionally been running into errors in e2e tests about invalid
+				// wire format messages and message size mismatches in protobuf. According
+				// to https://github.com/golang/protobuf/issues/1609, this is generally
+				// related to concurrency issues such as modifying a message during
+				// marshalling. Add a Clone() call before sending the event over the
+				// channel to mitigate this issue.
+				//
+				// Although this isn't great for performance, this is fine to do
+				// here as a quick workaround since we're only using this code
+				// for testing purposes anyway. In other words, this will never
+				// make it to a production environment.
+				if err != nil {
+					res = proto.Clone(res).(*tetragon.GetEventsResponse)
+				}
 				c <- GetEventsResult{res, err}
 			}
 		}(stream)

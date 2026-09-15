@@ -4,11 +4,10 @@
 package cgrouptrackmap
 
 import (
-	"fmt"
-
-	"github.com/sirupsen/logrus"
+	"errors"
 
 	"github.com/cilium/ebpf"
+
 	"github.com/cilium/tetragon/pkg/api/processapi"
 	"github.com/cilium/tetragon/pkg/logger"
 )
@@ -35,7 +34,7 @@ type CgrpTrackingValue struct {
 
 func LookupTrackingCgroup(mapPath string, cgrpid uint64) (*CgrpTrackingValue, error) {
 	if cgrpid == 0 {
-		return nil, fmt.Errorf("invalid CgroupIdTracking")
+		return nil, errors.New("invalid CgroupIdTracking")
 	}
 
 	m, err := ebpf.LoadPinnedMap(mapPath, nil)
@@ -45,10 +44,8 @@ func LookupTrackingCgroup(mapPath string, cgrpid uint64) (*CgrpTrackingValue, er
 
 	defer m.Close()
 
-	logger.GetLogger().WithFields(logrus.Fields{
-		"cgroup.id": cgrpid,
-		"bpf-map":   mapPath,
-	}).Trace("Looking for tracking CgroupID inside map")
+	logger.Trace(logger.GetLogger(), "Looking for tracking CgroupID inside map",
+		"cgroup.id", cgrpid, "bpf-map", mapPath)
 
 	var v CgrpTrackingValue
 
@@ -58,4 +55,22 @@ func LookupTrackingCgroup(mapPath string, cgrpid uint64) (*CgrpTrackingValue, er
 	}
 
 	return &v, nil
+}
+
+func DeleteTrackingCgroup(mapPath string, cgrpid uint64) error {
+	if cgrpid == 0 {
+		return errors.New("invalid CgroupIdTracking")
+	}
+
+	m, err := ebpf.LoadPinnedMap(mapPath, nil)
+	if err != nil {
+		return err
+	}
+
+	defer m.Close()
+
+	logger.Trace(logger.GetLogger(), "Deleting tracking CgroupID from map",
+		"cgroup.id", cgrpid, "bpf-map", mapPath)
+
+	return m.Delete(&CgrpTrackingKey{CgrpId: cgrpid})
 }

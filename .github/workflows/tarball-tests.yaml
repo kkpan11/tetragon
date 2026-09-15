@@ -1,0 +1,184 @@
+name: Tarball Tests
+
+on:
+  pull_request:
+    paths-ignore:
+    - "**.md"
+    - 'docs/**'
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+
+jobs:
+  standalone-tarball-builds:
+    name: Build tarball (${{ matrix.arch }})
+    runs-on: ${{ (matrix.arch == 'arm64' && 'ubuntu-22.04-arm') || 'ubuntu-22.04' }}
+    outputs:
+      tag: ${{ steps.tarball.outputs.tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Generate Tetragon Tarball
+        id: tarball
+        uses: ./.github/actions/build-tarball
+
+      - name: Move Tetragon tarball to upload directory
+        run: |
+          mkdir upload/
+          mv ./build/${{ matrix.arch }}/linux-tarball/tetragon-${{ steps.tarball.outputs.tag }}-${{ matrix.arch }}.tar.gz ./upload/
+
+      - name: Save tetragon-${{ steps.tarball.outputs.tag }}-${{ matrix.arch }}.tar.gz Tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tetragon-${{ steps.tarball.outputs.tag }}-${{ matrix.arch }}
+          path: upload/
+          retention-days: 1
+
+      - name: Save tetragon-${{ steps.tarball.outputs.tag }}-${{ matrix.arch }}-tester-progs.tar.gz Tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tetragon-${{ steps.tarball.outputs.tag }}-${{ matrix.arch }}-tester-progs
+          path: tester-progs.tar.gz
+          retention-days: 1
+
+  standalone-tarball-tests:
+    name: Packages e2e tests (${{ matrix.arch }})
+    needs: [standalone-tarball-builds]
+    # Ships kernel >= 7.x to test as many policytest cases as possible.
+    # https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2604-Readme.md
+    runs-on: ${{ (matrix.arch == 'arm64' && 'ubuntu-26.04-arm') || 'ubuntu-26.04' }}
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            match_arch: x86-64
+          - arch: arm64
+            match_arch: arm64
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Retrieve tetragon-${{ needs.standalone-tarball-builds.outputs.tag }}-${{ matrix.arch }}.tar.gz
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tetragon-${{ needs.standalone-tarball-builds.outputs.tag }}-${{ matrix.arch }}
+          path: ./download
+
+      - name: Move tetragon-${{ needs.standalone-tarball-builds.outputs.tag }}-${{ matrix.arch }}.tar.gz to build
+        run: |
+          mkdir -p ./build/${{ matrix.arch }}/
+          mv ./download ./build/${{ matrix.arch }}/linux-tarball
+
+      - name: Copy bpf.yaml tracing policy to /etc/tetragon/tetragon.tp.d/
+        run: |
+          sudo mkdir -p /etc/tetragon/tetragon.tp.d/
+          sudo cp examples/tracingpolicy/bpf.yaml /etc/tetragon/tetragon.tp.d/bpf.yaml
+
+      - name: Install Tetragon Tarball
+        run: |
+          tar zxvf tetragon-${{ needs.standalone-tarball-builds.outputs.tag }}-${{ matrix.arch }}.tar.gz
+          sudo ./tetragon-${{ needs.standalone-tarball-builds.outputs.tag }}-${{ matrix.arch }}/install.sh
+        working-directory: ./build/${{ matrix.arch }}/linux-tarball/
+
+      - name: Wait for Tetragon service
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_seconds: 30
+          max_attempts: 5
+          retry_wait_seconds: 5
+          retry_on: error
+          command: |
+            # Ensure that default native builds work
+            file /usr/local/bin/tetragon | grep ${{ matrix.match_arch }} -
+            sudo systemctl is-active tetragon
+            sudo tetra status
+
+      - name: Check Tetragon startup logs
+        run: sudo journalctl -b -u tetragon --no-pager
+
+      - name: Test Tetragon
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_seconds: 30
+          max_attempts: 5
+          retry_wait_seconds: 5
+          retry_on: error
+          command: |
+            sudo tetra status
+            test $(stat -c %a /var/run/tetragon/tetragon.sock) -eq "660"
+            sudo tetra bugtool
+            sudo tetra tracingpolicy list | grep bpf -
+            sudo tetra tracingpolicy add examples/tracingpolicy/tcp-connect.yaml
+            sudo tetra tracingpolicy list | grep connect -
+            sudo grep "tetra" /var/log/tetragon/tetragon.log
+
+      - name: Setup Tetragon with a different tracing-policy-dir
+        run: |
+          sudo systemctl stop tetragon
+          sudo mkdir -p /opt/tetragon.tp.d/
+          sudo cp examples/tracingpolicy/bpf.yaml /opt/tetragon.tp.d/bpf.yaml
+          echo "/opt/tetragon.tp.d/" | sudo tee /etc/tetragon/tetragon.conf.d/tracing-policy-dir
+          echo "localhost:8118" | sudo tee /etc/tetragon/tetragon.conf.d/gops-address
+          sudo systemctl start tetragon
+
+      - name: Test Tetragon with a different tracing-policy-dir
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_seconds: 60
+          max_attempts: 5
+          retry_wait_seconds: 5
+          retry_on: error
+          command: |
+            sudo systemctl is-active tetragon
+            sudo tetra status
+            sudo grep "tetra" /var/log/tetragon/tetragon.log
+            sudo tetra tracingpolicy list | grep bpf -
+            sudo tetra bugtool 2>&1 | grep "Successfully dumped gops pprof.*profile=heap" -
+
+      - name: Retrieve tetragon-${{ needs.standalone-tarball-builds.outputs.tag }}-${{ matrix.arch }}-tester-progs.tar.gz
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tetragon-${{ needs.standalone-tarball-builds.outputs.tag }}-${{ matrix.arch }}-tester-progs
+          path: ./download
+
+      - name: Prepare tester-progs
+        run: |
+          tar zxvf ./download/tester-progs.tar.gz
+          mv ./tester-progs/* contrib/tester-progs/
+
+      # Run policytest
+      # Since we don't support vmtests yet for arm64,
+      # and we are slowly moving existing tests to use policytest framework
+      # we are losing arm64 coverage unless we run policytest
+      # at least on github runners.
+      - name: Run policytest
+        run: |
+          sudo tetra policytest run --all-tests --output-file /tmp/tetragon.policytest.txt
+          cat /tmp/tetragon.policytest.txt
+
+      - name: Upload policytest results
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tetragon-policytest-${{ matrix.arch }}
+          path: /tmp/tetragon.policytest.txt
+          retention-days: 5
+
+      - name: Uninstall Tetragon Tarball
+        run: |
+          sudo ./tetragon-${{ needs.standalone-tarball-builds.outputs.tag }}-${{ matrix.arch }}/uninstall.sh
+        working-directory: ./build/${{ matrix.arch }}/linux-tarball/
+
+  vmpolicy-tests:
+    needs: [standalone-tarball-builds]
+    uses: ./.github/workflows/vmpolicytests.yaml
+    with:
+      tag: ${{ needs.standalone-tarball-builds.outputs.tag }}

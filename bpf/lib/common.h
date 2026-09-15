@@ -3,10 +3,15 @@
 #ifndef _MSG_COMMON__
 #define _MSG_COMMON__
 
+#include "config.h"
+
 /* msg_common internal flags */
 #define MSG_COMMON_FLAG_RETURN		  BIT(0)
 #define MSG_COMMON_FLAG_KERNEL_STACKTRACE BIT(1)
 #define MSG_COMMON_FLAG_USER_STACKTRACE	  BIT(2)
+#define MSG_COMMON_FLAG_IMA_HASH	  BIT(3)
+#define MSG_COMMON_FLAG_PROCESS_NOT_FOUND BIT(4)
+#define MSG_COMMON_FLAG_ACTION_FAILED	  BIT(5)
 
 /* Msg Layout */
 struct msg_common {
@@ -54,11 +59,33 @@ struct bpf_map_def {
 #define BIT(nr)	    (1 << (nr))
 #define BIT_ULL(nr) (1ULL << (nr))
 
-#ifdef TETRAGON_BPF_DEBUG
 #include <bpf_tracing.h>
-#define DEBUG(__fmt, ...) bpf_printk(__fmt, ##__VA_ARGS__)
+#include "debug.h"
+
+#define DEBUG(__fmt, ...) DEBUG_AREA(BPF_AREA_GENERIC, __fmt, ##__VA_ARGS__)
+
+// If TETRAGON_BPF_DEBUG is set, always enable debug messages
+#ifdef TETRAGON_BPF_DEBUG
+#define DEBUG_AREA(area, __fmt, ...) bpf_printk("tetragon@" #area " | " __fmt, ##__VA_ARGS__)
 #else
-#define DEBUG(__fmt, ...)
+// Use the proper CONFIG value to check whether debug messages are enabled
+#define DEBUG_AREA(area, __fmt, ...)            \
+	if (CONFIG(BPF_DEBUG_ENABLED) & (area)) \
+		bpf_printk("tetragon@" #area " | " __fmt, ##__VA_ARGS__);
+#endif
+
+#if __has_attribute(btf_decl_tag)
+#define __arg_ctx      __attribute__((btf_decl_tag("arg:ctx")))
+#define __arg_nonnull  __attribute((btf_decl_tag("arg:nonnull")))
+#define __arg_nullable __attribute((btf_decl_tag("arg:nullable")))
+#define __arg_trusted  __attribute((btf_decl_tag("arg:trusted")))
+#define __arg_arena    __attribute((btf_decl_tag("arg:arena")))
+#else
+#define __arg_ctx
+#define __arg_nonnull
+#define __arg_nullable
+#define __arg_trusted
+#define __arg_arena
 #endif
 
 #endif // _MSG_COMMON__

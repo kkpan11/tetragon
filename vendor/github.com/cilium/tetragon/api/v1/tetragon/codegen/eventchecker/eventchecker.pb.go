@@ -14,7 +14,7 @@ import (
 	listmatcher "github.com/cilium/tetragon/pkg/matchers/listmatcher"
 	stringmatcher "github.com/cilium/tetragon/pkg/matchers/stringmatcher"
 	timestampmatcher "github.com/cilium/tetragon/pkg/matchers/timestampmatcher"
-	logrus "github.com/sirupsen/logrus"
+	slog "log/slog"
 	yaml "sigs.k8s.io/yaml"
 	strings "strings"
 )
@@ -30,18 +30,18 @@ type MultiEventChecker interface {
 	// (false, !nil): this event check not was successful, but need to check more events
 	// (true,   nil): checker was successful, no need to check more events
 	// (true,  !nil): checker failed, no need to check more events
-	NextEventCheck(Event, *logrus.Logger) (bool, error)
+	NextEventCheck(Event, *slog.Logger) (bool, error)
 
 	// FinalCheck indicates that the sequence of events has ended, and
 	// asks the checker to make a final decision. Once this function is
 	// called, the checker is expected to return to its initial state so
 	// that it can be reused. Hence, this function should only be called
 	// once for each stream of events.
-	FinalCheck(*logrus.Logger) error
+	FinalCheck(*slog.Logger) error
 }
 
 // NextResponseCheck checks the next response
-func NextResponseCheck(c MultiEventChecker, res *tetragon.GetEventsResponse, l *logrus.Logger) (bool, error) {
+func NextResponseCheck(c MultiEventChecker, res *tetragon.GetEventsResponse, l *slog.Logger) (bool, error) {
 	event, err := EventFromResponse(res)
 	if err != nil {
 		return false, err
@@ -64,7 +64,7 @@ func NewOrderedEventChecker(checks ...EventChecker) *OrderedEventChecker {
 }
 
 // NextEventCheck implements the MultiEventChecker interface
-func (checker *OrderedEventChecker) NextEventCheck(event Event, logger *logrus.Logger) (bool, error) {
+func (checker *OrderedEventChecker) NextEventCheck(event Event, logger *slog.Logger) (bool, error) {
 	if checker.idx >= len(checker.checks) {
 		return true, nil
 	}
@@ -77,19 +77,19 @@ func (checker *OrderedEventChecker) NextEventCheck(event Event, logger *logrus.L
 	checker.idx++
 	if checker.idx == len(checker.checks) {
 		if logger != nil {
-			logger.Infof("OrderedEventChecker: all %d checks matched", len(checker.checks))
+			logger.Info(fmt.Sprintf("OrderedEventChecker: all %d checks matched", len(checker.checks)))
 		}
 		return true, nil
 	}
 
 	if logger != nil {
-		logger.Infof("OrderedEventChecker: %d/%d matched", checker.idx, len(checker.checks))
+		logger.Info(fmt.Sprintf("OrderedEventChecker: %d/%d matched", checker.idx, len(checker.checks)))
 	}
 	return false, nil
 }
 
 // FinalCheck implements the MultiEventChecker interface
-func (checker *OrderedEventChecker) FinalCheck(logger *logrus.Logger) error {
+func (checker *OrderedEventChecker) FinalCheck(logger *slog.Logger) error {
 	idx := checker.idx
 	checker.idx = 0
 
@@ -142,7 +142,7 @@ func NewUnorderedEventChecker(checks ...EventChecker) *UnorderedEventChecker {
 }
 
 // NextEventCheck implements the MultiEventChecker interface
-func (checker *UnorderedEventChecker) NextEventCheck(event Event, logger *logrus.Logger) (bool, error) {
+func (checker *UnorderedEventChecker) NextEventCheck(event Event, logger *slog.Logger) (bool, error) {
 	pending := checker.pendingChecks.Len()
 	if pending == 0 {
 		return true, nil
@@ -150,7 +150,7 @@ func (checker *UnorderedEventChecker) NextEventCheck(event Event, logger *logrus
 
 	totalMatched := checker.totalChecks - pending
 	if logger != nil {
-		logger.Infof("UnorderedEventChecker: checking event with %d/%d total matched", totalMatched, checker.totalChecks)
+		logger.Info(fmt.Sprintf("UnorderedEventChecker: checking event with %d/%d total matched", totalMatched, checker.totalChecks))
 	}
 	idx := 1
 
@@ -160,7 +160,7 @@ func (checker *UnorderedEventChecker) NextEventCheck(event Event, logger *logrus
 		if err == nil {
 			totalMatched++
 			if logger != nil {
-				logger.Infof("UnorderedEventChecker: successfully matched %d/%d", totalMatched, checker.totalChecks)
+				logger.Info(fmt.Sprintf("UnorderedEventChecker: successfully matched %d/%d", totalMatched, checker.totalChecks))
 			}
 			checker.pendingChecks.Remove(e)
 			pending--
@@ -169,12 +169,12 @@ func (checker *UnorderedEventChecker) NextEventCheck(event Event, logger *logrus
 			}
 
 			if logger != nil {
-				logger.Infof("UnorderedEventChecker: all %d check(s) matched", checker.totalChecks)
+				logger.Info(fmt.Sprintf("UnorderedEventChecker: all %d check(s) matched", checker.totalChecks))
 			}
 			return true, nil
 		}
 		if logger != nil {
-			logger.Infof("UnorderedEventChecker: checking pending %d/%d: %s", idx, pending, err)
+			logger.Info(fmt.Sprintf("UnorderedEventChecker: checking pending %d/%d: %s", idx, pending, err))
 		}
 		idx++
 	}
@@ -183,7 +183,7 @@ func (checker *UnorderedEventChecker) NextEventCheck(event Event, logger *logrus
 }
 
 // FinalCheck implements the MultiEventChecker interface
-func (checker *UnorderedEventChecker) FinalCheck(logger *logrus.Logger) error {
+func (checker *UnorderedEventChecker) FinalCheck(logger *slog.Logger) error {
 	pending := checker.pendingChecks.Len()
 	total := checker.totalChecks
 
@@ -245,19 +245,19 @@ type FnEventChecker struct {
 	// (false, !nil): this event check not was successful, but need to check more events
 	// (true,   nil): checker was successful, no need to check more events
 	// (true,  !nil): checker failed, no need to check more events
-	NextCheckFn func(Event, *logrus.Logger) (bool, error)
+	NextCheckFn func(Event, *slog.Logger) (bool, error)
 	// FinalCheckFn indicates that the sequence of events has ended, and asks the
 	// checker to make a final decision. Any cleanup should also be performed here.
-	FinalCheckFn func(*logrus.Logger) error
+	FinalCheckFn func(*slog.Logger) error
 }
 
 // NextEventCheck implements the MultiEventChecker interface
-func (checker *FnEventChecker) NextEventCheck(event Event, logger *logrus.Logger) (bool, error) {
+func (checker *FnEventChecker) NextEventCheck(event Event, logger *slog.Logger) (bool, error) {
 	return checker.NextCheckFn(event, logger)
 }
 
 // FinalCheck implements the MultiEventChecker interface
-func (checker *FnEventChecker) FinalCheck(logger *logrus.Logger) error {
+func (checker *FnEventChecker) FinalCheck(logger *slog.Logger) error {
 	return checker.FinalCheckFn(logger)
 }
 
@@ -274,6 +274,10 @@ func CheckerFromEvent(event Event) (EventChecker, error) {
 		return NewProcessTracepointChecker("").FromProcessTracepoint(ev), nil
 	case *tetragon.ProcessUprobe:
 		return NewProcessUprobeChecker("").FromProcessUprobe(ev), nil
+	case *tetragon.ProcessUsdt:
+		return NewProcessUsdtChecker("").FromProcessUsdt(ev), nil
+	case *tetragon.ProcessLsm:
+		return NewProcessLsmChecker("").FromProcessLsm(ev), nil
 	case *tetragon.Test:
 		return NewTestChecker("").FromTest(ev), nil
 	case *tetragon.ProcessLoader:
@@ -336,6 +340,10 @@ func EventFromResponse(response *tetragon.GetEventsResponse) (Event, error) {
 		return ev.ProcessTracepoint, nil
 	case *tetragon.GetEventsResponse_ProcessUprobe:
 		return ev.ProcessUprobe, nil
+	case *tetragon.GetEventsResponse_ProcessUsdt:
+		return ev.ProcessUsdt, nil
+	case *tetragon.GetEventsResponse_ProcessLsm:
+		return ev.ProcessLsm, nil
 	case *tetragon.GetEventsResponse_Test:
 		return ev.Test, nil
 	case *tetragon.GetEventsResponse_ProcessLoader:
@@ -426,9 +434,21 @@ func (checker *ProcessExecChecker) WithProcess(check *ProcessChecker) *ProcessEx
 	return checker
 }
 
+// UnsetProcess unsets the Process check to the ProcessExecChecker
+func (checker *ProcessExecChecker) UnsetProcess() *ProcessExecChecker {
+	checker.Process = nil
+	return checker
+}
+
 // WithParent adds a Parent check to the ProcessExecChecker
 func (checker *ProcessExecChecker) WithParent(check *ProcessChecker) *ProcessExecChecker {
 	checker.Parent = check
+	return checker
+}
+
+// UnsetParent unsets the Parent check to the ProcessExecChecker
+func (checker *ProcessExecChecker) UnsetParent() *ProcessExecChecker {
+	checker.Parent = nil
 	return checker
 }
 
@@ -573,6 +593,7 @@ type ProcessExitChecker struct {
 	Signal      *stringmatcher.StringMatcher       `json:"signal,omitempty"`
 	Status      *uint32                            `json:"status,omitempty"`
 	Time        *timestampmatcher.TimestampMatcher `json:"time,omitempty"`
+	Ancestors   *ProcessListMatcher                `json:"ancestors,omitempty"`
 }
 
 // CheckEvent checks a single event and implements the EventChecker interface
@@ -639,6 +660,11 @@ func (checker *ProcessExitChecker) Check(event *tetragon.ProcessExit) error {
 				return fmt.Errorf("Time check failed: %w", err)
 			}
 		}
+		if checker.Ancestors != nil {
+			if err := checker.Ancestors.Check(event.Ancestors); err != nil {
+				return fmt.Errorf("Ancestors check failed: %w", err)
+			}
+		}
 		return nil
 	}
 	if err := fieldChecks(); err != nil {
@@ -653,9 +679,21 @@ func (checker *ProcessExitChecker) WithProcess(check *ProcessChecker) *ProcessEx
 	return checker
 }
 
+// UnsetProcess unsets the Process check to the ProcessExitChecker
+func (checker *ProcessExitChecker) UnsetProcess() *ProcessExitChecker {
+	checker.Process = nil
+	return checker
+}
+
 // WithParent adds a Parent check to the ProcessExitChecker
 func (checker *ProcessExitChecker) WithParent(check *ProcessChecker) *ProcessExitChecker {
 	checker.Parent = check
+	return checker
+}
+
+// UnsetParent unsets the Parent check to the ProcessExitChecker
+func (checker *ProcessExitChecker) UnsetParent() *ProcessExitChecker {
+	checker.Parent = nil
 	return checker
 }
 
@@ -677,6 +715,12 @@ func (checker *ProcessExitChecker) WithTime(check *timestampmatcher.TimestampMat
 	return checker
 }
 
+// WithAncestors adds a Ancestors check to the ProcessExitChecker
+func (checker *ProcessExitChecker) WithAncestors(check *ProcessListMatcher) *ProcessExitChecker {
+	checker.Ancestors = check
+	return checker
+}
+
 //FromProcessExit populates the ProcessExitChecker using data from a ProcessExit event
 func (checker *ProcessExitChecker) FromProcessExit(event *tetragon.ProcessExit) *ProcessExitChecker {
 	if event == nil {
@@ -695,6 +739,19 @@ func (checker *ProcessExitChecker) FromProcessExit(event *tetragon.ProcessExit) 
 	}
 	// NB: We don't want to match timestamps for now
 	checker.Time = nil
+	{
+		var checks []*ProcessChecker
+		for _, check := range event.Ancestors {
+			var convertedCheck *ProcessChecker
+			if check != nil {
+				convertedCheck = NewProcessChecker().FromProcess(check)
+			}
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewProcessListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Ancestors = lm
+	}
 	return checker
 }
 
@@ -713,6 +770,8 @@ type ProcessKprobeChecker struct {
 	Message          *stringmatcher.StringMatcher `json:"message,omitempty"`
 	Tags             *StringListMatcher           `json:"tags,omitempty"`
 	UserStackTrace   *StackTraceEntryListMatcher  `json:"userStackTrace,omitempty"`
+	Ancestors        *ProcessListMatcher          `json:"ancestors,omitempty"`
+	Data             *KprobeArgumentListMatcher   `json:"data,omitempty"`
 }
 
 // CheckEvent checks a single event and implements the EventChecker interface
@@ -814,6 +873,16 @@ func (checker *ProcessKprobeChecker) Check(event *tetragon.ProcessKprobe) error 
 				return fmt.Errorf("UserStackTrace check failed: %w", err)
 			}
 		}
+		if checker.Ancestors != nil {
+			if err := checker.Ancestors.Check(event.Ancestors); err != nil {
+				return fmt.Errorf("Ancestors check failed: %w", err)
+			}
+		}
+		if checker.Data != nil {
+			if err := checker.Data.Check(event.Data); err != nil {
+				return fmt.Errorf("Data check failed: %w", err)
+			}
+		}
 		return nil
 	}
 	if err := fieldChecks(); err != nil {
@@ -828,9 +897,21 @@ func (checker *ProcessKprobeChecker) WithProcess(check *ProcessChecker) *Process
 	return checker
 }
 
+// UnsetProcess unsets the Process check to the ProcessKprobeChecker
+func (checker *ProcessKprobeChecker) UnsetProcess() *ProcessKprobeChecker {
+	checker.Process = nil
+	return checker
+}
+
 // WithParent adds a Parent check to the ProcessKprobeChecker
 func (checker *ProcessKprobeChecker) WithParent(check *ProcessChecker) *ProcessKprobeChecker {
 	checker.Parent = check
+	return checker
+}
+
+// UnsetParent unsets the Parent check to the ProcessKprobeChecker
+func (checker *ProcessKprobeChecker) UnsetParent() *ProcessKprobeChecker {
+	checker.Parent = nil
 	return checker
 }
 
@@ -893,6 +974,18 @@ func (checker *ProcessKprobeChecker) WithTags(check *StringListMatcher) *Process
 // WithUserStackTrace adds a UserStackTrace check to the ProcessKprobeChecker
 func (checker *ProcessKprobeChecker) WithUserStackTrace(check *StackTraceEntryListMatcher) *ProcessKprobeChecker {
 	checker.UserStackTrace = check
+	return checker
+}
+
+// WithAncestors adds a Ancestors check to the ProcessKprobeChecker
+func (checker *ProcessKprobeChecker) WithAncestors(check *ProcessListMatcher) *ProcessKprobeChecker {
+	checker.Ancestors = check
+	return checker
+}
+
+// WithData adds a Data check to the ProcessKprobeChecker
+func (checker *ProcessKprobeChecker) WithData(check *KprobeArgumentListMatcher) *ProcessKprobeChecker {
+	checker.Data = check
 	return checker
 }
 
@@ -964,6 +1057,32 @@ func (checker *ProcessKprobeChecker) FromProcessKprobe(event *tetragon.ProcessKp
 		lm := NewStackTraceEntryListMatcher().WithOperator(listmatcher.Ordered).
 			WithValues(checks...)
 		checker.UserStackTrace = lm
+	}
+	{
+		var checks []*ProcessChecker
+		for _, check := range event.Ancestors {
+			var convertedCheck *ProcessChecker
+			if check != nil {
+				convertedCheck = NewProcessChecker().FromProcess(check)
+			}
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewProcessListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Ancestors = lm
+	}
+	{
+		var checks []*KprobeArgumentChecker
+		for _, check := range event.Data {
+			var convertedCheck *KprobeArgumentChecker
+			if check != nil {
+				convertedCheck = NewKprobeArgumentChecker().FromKprobeArgument(check)
+			}
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewKprobeArgumentListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Data = lm
 	}
 	return checker
 }
@@ -1280,6 +1399,7 @@ type ProcessTracepointChecker struct {
 	Action      *KprobeActionChecker         `json:"action,omitempty"`
 	Message     *stringmatcher.StringMatcher `json:"message,omitempty"`
 	Tags        *StringListMatcher           `json:"tags,omitempty"`
+	Ancestors   *ProcessListMatcher          `json:"ancestors,omitempty"`
 }
 
 // CheckEvent checks a single event and implements the EventChecker interface
@@ -1366,6 +1486,11 @@ func (checker *ProcessTracepointChecker) Check(event *tetragon.ProcessTracepoint
 				return fmt.Errorf("Tags check failed: %w", err)
 			}
 		}
+		if checker.Ancestors != nil {
+			if err := checker.Ancestors.Check(event.Ancestors); err != nil {
+				return fmt.Errorf("Ancestors check failed: %w", err)
+			}
+		}
 		return nil
 	}
 	if err := fieldChecks(); err != nil {
@@ -1380,9 +1505,21 @@ func (checker *ProcessTracepointChecker) WithProcess(check *ProcessChecker) *Pro
 	return checker
 }
 
+// UnsetProcess unsets the Process check to the ProcessTracepointChecker
+func (checker *ProcessTracepointChecker) UnsetProcess() *ProcessTracepointChecker {
+	checker.Process = nil
+	return checker
+}
+
 // WithParent adds a Parent check to the ProcessTracepointChecker
 func (checker *ProcessTracepointChecker) WithParent(check *ProcessChecker) *ProcessTracepointChecker {
 	checker.Parent = check
+	return checker
+}
+
+// UnsetParent unsets the Parent check to the ProcessTracepointChecker
+func (checker *ProcessTracepointChecker) UnsetParent() *ProcessTracepointChecker {
+	checker.Parent = nil
 	return checker
 }
 
@@ -1429,6 +1566,12 @@ func (checker *ProcessTracepointChecker) WithTags(check *StringListMatcher) *Pro
 	return checker
 }
 
+// WithAncestors adds a Ancestors check to the ProcessTracepointChecker
+func (checker *ProcessTracepointChecker) WithAncestors(check *ProcessListMatcher) *ProcessTracepointChecker {
+	checker.Ancestors = check
+	return checker
+}
+
 //FromProcessTracepoint populates the ProcessTracepointChecker using data from a ProcessTracepoint event
 func (checker *ProcessTracepointChecker) FromProcessTracepoint(event *tetragon.ProcessTracepoint) *ProcessTracepointChecker {
 	if event == nil {
@@ -1469,20 +1612,38 @@ func (checker *ProcessTracepointChecker) FromProcessTracepoint(event *tetragon.P
 			WithValues(checks...)
 		checker.Tags = lm
 	}
+	{
+		var checks []*ProcessChecker
+		for _, check := range event.Ancestors {
+			var convertedCheck *ProcessChecker
+			if check != nil {
+				convertedCheck = NewProcessChecker().FromProcess(check)
+			}
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewProcessListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Ancestors = lm
+	}
 	return checker
 }
 
 // ProcessUprobeChecker implements a checker struct to check a ProcessUprobe event
 type ProcessUprobeChecker struct {
-	CheckerName string                       `json:"checkerName"`
-	Process     *ProcessChecker              `json:"process,omitempty"`
-	Parent      *ProcessChecker              `json:"parent,omitempty"`
-	Path        *stringmatcher.StringMatcher `json:"path,omitempty"`
-	Symbol      *stringmatcher.StringMatcher `json:"symbol,omitempty"`
-	PolicyName  *stringmatcher.StringMatcher `json:"policyName,omitempty"`
-	Message     *stringmatcher.StringMatcher `json:"message,omitempty"`
-	Args        *KprobeArgumentListMatcher   `json:"args,omitempty"`
-	Tags        *StringListMatcher           `json:"tags,omitempty"`
+	CheckerName  string                       `json:"checkerName"`
+	Process      *ProcessChecker              `json:"process,omitempty"`
+	Parent       *ProcessChecker              `json:"parent,omitempty"`
+	Path         *stringmatcher.StringMatcher `json:"path,omitempty"`
+	Symbol       *stringmatcher.StringMatcher `json:"symbol,omitempty"`
+	PolicyName   *stringmatcher.StringMatcher `json:"policyName,omitempty"`
+	Message      *stringmatcher.StringMatcher `json:"message,omitempty"`
+	Args         *KprobeArgumentListMatcher   `json:"args,omitempty"`
+	Tags         *StringListMatcher           `json:"tags,omitempty"`
+	Ancestors    *ProcessListMatcher          `json:"ancestors,omitempty"`
+	Offset       *uint64                      `json:"offset,omitempty"`
+	RefCtrOffset *uint64                      `json:"refCtrOffset,omitempty"`
+	Action       *KprobeActionChecker         `json:"action,omitempty"`
+	Data         *KprobeArgumentListMatcher   `json:"data,omitempty"`
 }
 
 // CheckEvent checks a single event and implements the EventChecker interface
@@ -1564,6 +1725,31 @@ func (checker *ProcessUprobeChecker) Check(event *tetragon.ProcessUprobe) error 
 				return fmt.Errorf("Tags check failed: %w", err)
 			}
 		}
+		if checker.Ancestors != nil {
+			if err := checker.Ancestors.Check(event.Ancestors); err != nil {
+				return fmt.Errorf("Ancestors check failed: %w", err)
+			}
+		}
+		if checker.Offset != nil {
+			if *checker.Offset != event.Offset {
+				return fmt.Errorf("Offset has value %d which does not match expected value %d", event.Offset, *checker.Offset)
+			}
+		}
+		if checker.RefCtrOffset != nil {
+			if *checker.RefCtrOffset != event.RefCtrOffset {
+				return fmt.Errorf("RefCtrOffset has value %d which does not match expected value %d", event.RefCtrOffset, *checker.RefCtrOffset)
+			}
+		}
+		if checker.Action != nil {
+			if err := checker.Action.Check(&event.Action); err != nil {
+				return fmt.Errorf("Action check failed: %w", err)
+			}
+		}
+		if checker.Data != nil {
+			if err := checker.Data.Check(event.Data); err != nil {
+				return fmt.Errorf("Data check failed: %w", err)
+			}
+		}
 		return nil
 	}
 	if err := fieldChecks(); err != nil {
@@ -1578,9 +1764,21 @@ func (checker *ProcessUprobeChecker) WithProcess(check *ProcessChecker) *Process
 	return checker
 }
 
+// UnsetProcess unsets the Process check to the ProcessUprobeChecker
+func (checker *ProcessUprobeChecker) UnsetProcess() *ProcessUprobeChecker {
+	checker.Process = nil
+	return checker
+}
+
 // WithParent adds a Parent check to the ProcessUprobeChecker
 func (checker *ProcessUprobeChecker) WithParent(check *ProcessChecker) *ProcessUprobeChecker {
 	checker.Parent = check
+	return checker
+}
+
+// UnsetParent unsets the Parent check to the ProcessUprobeChecker
+func (checker *ProcessUprobeChecker) UnsetParent() *ProcessUprobeChecker {
+	checker.Parent = nil
 	return checker
 }
 
@@ -1617,6 +1815,37 @@ func (checker *ProcessUprobeChecker) WithArgs(check *KprobeArgumentListMatcher) 
 // WithTags adds a Tags check to the ProcessUprobeChecker
 func (checker *ProcessUprobeChecker) WithTags(check *StringListMatcher) *ProcessUprobeChecker {
 	checker.Tags = check
+	return checker
+}
+
+// WithAncestors adds a Ancestors check to the ProcessUprobeChecker
+func (checker *ProcessUprobeChecker) WithAncestors(check *ProcessListMatcher) *ProcessUprobeChecker {
+	checker.Ancestors = check
+	return checker
+}
+
+// WithOffset adds a Offset check to the ProcessUprobeChecker
+func (checker *ProcessUprobeChecker) WithOffset(check uint64) *ProcessUprobeChecker {
+	checker.Offset = &check
+	return checker
+}
+
+// WithRefCtrOffset adds a RefCtrOffset check to the ProcessUprobeChecker
+func (checker *ProcessUprobeChecker) WithRefCtrOffset(check uint64) *ProcessUprobeChecker {
+	checker.RefCtrOffset = &check
+	return checker
+}
+
+// WithAction adds a Action check to the ProcessUprobeChecker
+func (checker *ProcessUprobeChecker) WithAction(check tetragon.KprobeAction) *ProcessUprobeChecker {
+	wrappedCheck := KprobeActionChecker(check)
+	checker.Action = &wrappedCheck
+	return checker
+}
+
+// WithData adds a Data check to the ProcessUprobeChecker
+func (checker *ProcessUprobeChecker) WithData(check *KprobeArgumentListMatcher) *ProcessUprobeChecker {
+	checker.Data = check
 	return checker
 }
 
@@ -1659,6 +1888,549 @@ func (checker *ProcessUprobeChecker) FromProcessUprobe(event *tetragon.ProcessUp
 			WithValues(checks...)
 		checker.Tags = lm
 	}
+	{
+		var checks []*ProcessChecker
+		for _, check := range event.Ancestors {
+			var convertedCheck *ProcessChecker
+			if check != nil {
+				convertedCheck = NewProcessChecker().FromProcess(check)
+			}
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewProcessListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Ancestors = lm
+	}
+	{
+		val := event.Offset
+		checker.Offset = &val
+	}
+	{
+		val := event.RefCtrOffset
+		checker.RefCtrOffset = &val
+	}
+	checker.Action = NewKprobeActionChecker(event.Action)
+	{
+		var checks []*KprobeArgumentChecker
+		for _, check := range event.Data {
+			var convertedCheck *KprobeArgumentChecker
+			if check != nil {
+				convertedCheck = NewKprobeArgumentChecker().FromKprobeArgument(check)
+			}
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewKprobeArgumentListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Data = lm
+	}
+	return checker
+}
+
+// ProcessUsdtChecker implements a checker struct to check a ProcessUsdt event
+type ProcessUsdtChecker struct {
+	CheckerName string                       `json:"checkerName"`
+	Process     *ProcessChecker              `json:"process,omitempty"`
+	Parent      *ProcessChecker              `json:"parent,omitempty"`
+	Path        *stringmatcher.StringMatcher `json:"path,omitempty"`
+	Provider    *stringmatcher.StringMatcher `json:"provider,omitempty"`
+	Name        *stringmatcher.StringMatcher `json:"name,omitempty"`
+	PolicyName  *stringmatcher.StringMatcher `json:"policyName,omitempty"`
+	Message     *stringmatcher.StringMatcher `json:"message,omitempty"`
+	Args        *KprobeArgumentListMatcher   `json:"args,omitempty"`
+	Tags        *StringListMatcher           `json:"tags,omitempty"`
+	Ancestors   *ProcessListMatcher          `json:"ancestors,omitempty"`
+	Action      *KprobeActionChecker         `json:"action,omitempty"`
+	Flags       *stringmatcher.StringMatcher `json:"flags,omitempty"`
+}
+
+// CheckEvent checks a single event and implements the EventChecker interface
+func (checker *ProcessUsdtChecker) CheckEvent(event Event) error {
+	if ev, ok := event.(*tetragon.ProcessUsdt); ok {
+		return checker.Check(ev)
+	}
+	return fmt.Errorf("%s: %T is not a ProcessUsdt event", CheckerLogPrefix(checker), event)
+}
+
+// CheckResponse checks a single gRPC response and implements the EventChecker interface
+func (checker *ProcessUsdtChecker) CheckResponse(response *tetragon.GetEventsResponse) error {
+	event, err := EventFromResponse(response)
+	if err != nil {
+		return err
+	}
+	return checker.CheckEvent(event)
+}
+
+// NewProcessUsdtChecker creates a new ProcessUsdtChecker
+func NewProcessUsdtChecker(name string) *ProcessUsdtChecker {
+	return &ProcessUsdtChecker{CheckerName: name}
+}
+
+// Get the name associated with the checker
+func (checker *ProcessUsdtChecker) GetCheckerName() string {
+	return checker.CheckerName
+}
+
+// Get the type of the checker as a string
+func (checker *ProcessUsdtChecker) GetCheckerType() string {
+	return "ProcessUsdtChecker"
+}
+
+// Check checks a ProcessUsdt event
+func (checker *ProcessUsdtChecker) Check(event *tetragon.ProcessUsdt) error {
+	if event == nil {
+		return fmt.Errorf("%s: ProcessUsdt event is nil", CheckerLogPrefix(checker))
+	}
+
+	fieldChecks := func() error {
+		if checker.Process != nil {
+			if err := checker.Process.Check(event.Process); err != nil {
+				return fmt.Errorf("Process check failed: %w", err)
+			}
+		}
+		if checker.Parent != nil {
+			if err := checker.Parent.Check(event.Parent); err != nil {
+				return fmt.Errorf("Parent check failed: %w", err)
+			}
+		}
+		if checker.Path != nil {
+			if err := checker.Path.Match(event.Path); err != nil {
+				return fmt.Errorf("Path check failed: %w", err)
+			}
+		}
+		if checker.Provider != nil {
+			if err := checker.Provider.Match(event.Provider); err != nil {
+				return fmt.Errorf("Provider check failed: %w", err)
+			}
+		}
+		if checker.Name != nil {
+			if err := checker.Name.Match(event.Name); err != nil {
+				return fmt.Errorf("Name check failed: %w", err)
+			}
+		}
+		if checker.PolicyName != nil {
+			if err := checker.PolicyName.Match(event.PolicyName); err != nil {
+				return fmt.Errorf("PolicyName check failed: %w", err)
+			}
+		}
+		if checker.Message != nil {
+			if err := checker.Message.Match(event.Message); err != nil {
+				return fmt.Errorf("Message check failed: %w", err)
+			}
+		}
+		if checker.Args != nil {
+			if err := checker.Args.Check(event.Args); err != nil {
+				return fmt.Errorf("Args check failed: %w", err)
+			}
+		}
+		if checker.Tags != nil {
+			if err := checker.Tags.Check(event.Tags); err != nil {
+				return fmt.Errorf("Tags check failed: %w", err)
+			}
+		}
+		if checker.Ancestors != nil {
+			if err := checker.Ancestors.Check(event.Ancestors); err != nil {
+				return fmt.Errorf("Ancestors check failed: %w", err)
+			}
+		}
+		if checker.Action != nil {
+			if err := checker.Action.Check(&event.Action); err != nil {
+				return fmt.Errorf("Action check failed: %w", err)
+			}
+		}
+		if checker.Flags != nil {
+			if err := checker.Flags.Match(event.Flags); err != nil {
+				return fmt.Errorf("Flags check failed: %w", err)
+			}
+		}
+		return nil
+	}
+	if err := fieldChecks(); err != nil {
+		return fmt.Errorf("%s: %w", CheckerLogPrefix(checker), err)
+	}
+	return nil
+}
+
+// WithProcess adds a Process check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) WithProcess(check *ProcessChecker) *ProcessUsdtChecker {
+	checker.Process = check
+	return checker
+}
+
+// UnsetProcess unsets the Process check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) UnsetProcess() *ProcessUsdtChecker {
+	checker.Process = nil
+	return checker
+}
+
+// WithParent adds a Parent check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) WithParent(check *ProcessChecker) *ProcessUsdtChecker {
+	checker.Parent = check
+	return checker
+}
+
+// UnsetParent unsets the Parent check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) UnsetParent() *ProcessUsdtChecker {
+	checker.Parent = nil
+	return checker
+}
+
+// WithPath adds a Path check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) WithPath(check *stringmatcher.StringMatcher) *ProcessUsdtChecker {
+	checker.Path = check
+	return checker
+}
+
+// WithProvider adds a Provider check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) WithProvider(check *stringmatcher.StringMatcher) *ProcessUsdtChecker {
+	checker.Provider = check
+	return checker
+}
+
+// WithName adds a Name check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) WithName(check *stringmatcher.StringMatcher) *ProcessUsdtChecker {
+	checker.Name = check
+	return checker
+}
+
+// WithPolicyName adds a PolicyName check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) WithPolicyName(check *stringmatcher.StringMatcher) *ProcessUsdtChecker {
+	checker.PolicyName = check
+	return checker
+}
+
+// WithMessage adds a Message check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) WithMessage(check *stringmatcher.StringMatcher) *ProcessUsdtChecker {
+	checker.Message = check
+	return checker
+}
+
+// WithArgs adds a Args check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) WithArgs(check *KprobeArgumentListMatcher) *ProcessUsdtChecker {
+	checker.Args = check
+	return checker
+}
+
+// WithTags adds a Tags check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) WithTags(check *StringListMatcher) *ProcessUsdtChecker {
+	checker.Tags = check
+	return checker
+}
+
+// WithAncestors adds a Ancestors check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) WithAncestors(check *ProcessListMatcher) *ProcessUsdtChecker {
+	checker.Ancestors = check
+	return checker
+}
+
+// WithAction adds a Action check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) WithAction(check tetragon.KprobeAction) *ProcessUsdtChecker {
+	wrappedCheck := KprobeActionChecker(check)
+	checker.Action = &wrappedCheck
+	return checker
+}
+
+// WithFlags adds a Flags check to the ProcessUsdtChecker
+func (checker *ProcessUsdtChecker) WithFlags(check *stringmatcher.StringMatcher) *ProcessUsdtChecker {
+	checker.Flags = check
+	return checker
+}
+
+//FromProcessUsdt populates the ProcessUsdtChecker using data from a ProcessUsdt event
+func (checker *ProcessUsdtChecker) FromProcessUsdt(event *tetragon.ProcessUsdt) *ProcessUsdtChecker {
+	if event == nil {
+		return checker
+	}
+	if event.Process != nil {
+		checker.Process = NewProcessChecker().FromProcess(event.Process)
+	}
+	if event.Parent != nil {
+		checker.Parent = NewProcessChecker().FromProcess(event.Parent)
+	}
+	checker.Path = stringmatcher.Full(event.Path)
+	checker.Provider = stringmatcher.Full(event.Provider)
+	checker.Name = stringmatcher.Full(event.Name)
+	checker.PolicyName = stringmatcher.Full(event.PolicyName)
+	checker.Message = stringmatcher.Full(event.Message)
+	{
+		var checks []*KprobeArgumentChecker
+		for _, check := range event.Args {
+			var convertedCheck *KprobeArgumentChecker
+			if check != nil {
+				convertedCheck = NewKprobeArgumentChecker().FromKprobeArgument(check)
+			}
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewKprobeArgumentListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Args = lm
+	}
+	{
+		var checks []*stringmatcher.StringMatcher
+		for _, check := range event.Tags {
+			var convertedCheck *stringmatcher.StringMatcher
+			convertedCheck = stringmatcher.Full(check)
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewStringListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Tags = lm
+	}
+	{
+		var checks []*ProcessChecker
+		for _, check := range event.Ancestors {
+			var convertedCheck *ProcessChecker
+			if check != nil {
+				convertedCheck = NewProcessChecker().FromProcess(check)
+			}
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewProcessListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Ancestors = lm
+	}
+	checker.Action = NewKprobeActionChecker(event.Action)
+	checker.Flags = stringmatcher.Full(event.Flags)
+	return checker
+}
+
+// ProcessLsmChecker implements a checker struct to check a ProcessLsm event
+type ProcessLsmChecker struct {
+	CheckerName  string                       `json:"checkerName"`
+	Process      *ProcessChecker              `json:"process,omitempty"`
+	Parent       *ProcessChecker              `json:"parent,omitempty"`
+	FunctionName *stringmatcher.StringMatcher `json:"functionName,omitempty"`
+	PolicyName   *stringmatcher.StringMatcher `json:"policyName,omitempty"`
+	Message      *stringmatcher.StringMatcher `json:"message,omitempty"`
+	Args         *KprobeArgumentListMatcher   `json:"args,omitempty"`
+	Action       *KprobeActionChecker         `json:"action,omitempty"`
+	Tags         *StringListMatcher           `json:"tags,omitempty"`
+	Ancestors    *ProcessListMatcher          `json:"ancestors,omitempty"`
+	ImaHash      *stringmatcher.StringMatcher `json:"imaHash,omitempty"`
+}
+
+// CheckEvent checks a single event and implements the EventChecker interface
+func (checker *ProcessLsmChecker) CheckEvent(event Event) error {
+	if ev, ok := event.(*tetragon.ProcessLsm); ok {
+		return checker.Check(ev)
+	}
+	return fmt.Errorf("%s: %T is not a ProcessLsm event", CheckerLogPrefix(checker), event)
+}
+
+// CheckResponse checks a single gRPC response and implements the EventChecker interface
+func (checker *ProcessLsmChecker) CheckResponse(response *tetragon.GetEventsResponse) error {
+	event, err := EventFromResponse(response)
+	if err != nil {
+		return err
+	}
+	return checker.CheckEvent(event)
+}
+
+// NewProcessLsmChecker creates a new ProcessLsmChecker
+func NewProcessLsmChecker(name string) *ProcessLsmChecker {
+	return &ProcessLsmChecker{CheckerName: name}
+}
+
+// Get the name associated with the checker
+func (checker *ProcessLsmChecker) GetCheckerName() string {
+	return checker.CheckerName
+}
+
+// Get the type of the checker as a string
+func (checker *ProcessLsmChecker) GetCheckerType() string {
+	return "ProcessLsmChecker"
+}
+
+// Check checks a ProcessLsm event
+func (checker *ProcessLsmChecker) Check(event *tetragon.ProcessLsm) error {
+	if event == nil {
+		return fmt.Errorf("%s: ProcessLsm event is nil", CheckerLogPrefix(checker))
+	}
+
+	fieldChecks := func() error {
+		if checker.Process != nil {
+			if err := checker.Process.Check(event.Process); err != nil {
+				return fmt.Errorf("Process check failed: %w", err)
+			}
+		}
+		if checker.Parent != nil {
+			if err := checker.Parent.Check(event.Parent); err != nil {
+				return fmt.Errorf("Parent check failed: %w", err)
+			}
+		}
+		if checker.FunctionName != nil {
+			if err := checker.FunctionName.Match(event.FunctionName); err != nil {
+				return fmt.Errorf("FunctionName check failed: %w", err)
+			}
+		}
+		if checker.PolicyName != nil {
+			if err := checker.PolicyName.Match(event.PolicyName); err != nil {
+				return fmt.Errorf("PolicyName check failed: %w", err)
+			}
+		}
+		if checker.Message != nil {
+			if err := checker.Message.Match(event.Message); err != nil {
+				return fmt.Errorf("Message check failed: %w", err)
+			}
+		}
+		if checker.Args != nil {
+			if err := checker.Args.Check(event.Args); err != nil {
+				return fmt.Errorf("Args check failed: %w", err)
+			}
+		}
+		if checker.Action != nil {
+			if err := checker.Action.Check(&event.Action); err != nil {
+				return fmt.Errorf("Action check failed: %w", err)
+			}
+		}
+		if checker.Tags != nil {
+			if err := checker.Tags.Check(event.Tags); err != nil {
+				return fmt.Errorf("Tags check failed: %w", err)
+			}
+		}
+		if checker.Ancestors != nil {
+			if err := checker.Ancestors.Check(event.Ancestors); err != nil {
+				return fmt.Errorf("Ancestors check failed: %w", err)
+			}
+		}
+		if checker.ImaHash != nil {
+			if err := checker.ImaHash.Match(event.ImaHash); err != nil {
+				return fmt.Errorf("ImaHash check failed: %w", err)
+			}
+		}
+		return nil
+	}
+	if err := fieldChecks(); err != nil {
+		return fmt.Errorf("%s: %w", CheckerLogPrefix(checker), err)
+	}
+	return nil
+}
+
+// WithProcess adds a Process check to the ProcessLsmChecker
+func (checker *ProcessLsmChecker) WithProcess(check *ProcessChecker) *ProcessLsmChecker {
+	checker.Process = check
+	return checker
+}
+
+// UnsetProcess unsets the Process check to the ProcessLsmChecker
+func (checker *ProcessLsmChecker) UnsetProcess() *ProcessLsmChecker {
+	checker.Process = nil
+	return checker
+}
+
+// WithParent adds a Parent check to the ProcessLsmChecker
+func (checker *ProcessLsmChecker) WithParent(check *ProcessChecker) *ProcessLsmChecker {
+	checker.Parent = check
+	return checker
+}
+
+// UnsetParent unsets the Parent check to the ProcessLsmChecker
+func (checker *ProcessLsmChecker) UnsetParent() *ProcessLsmChecker {
+	checker.Parent = nil
+	return checker
+}
+
+// WithFunctionName adds a FunctionName check to the ProcessLsmChecker
+func (checker *ProcessLsmChecker) WithFunctionName(check *stringmatcher.StringMatcher) *ProcessLsmChecker {
+	checker.FunctionName = check
+	return checker
+}
+
+// WithPolicyName adds a PolicyName check to the ProcessLsmChecker
+func (checker *ProcessLsmChecker) WithPolicyName(check *stringmatcher.StringMatcher) *ProcessLsmChecker {
+	checker.PolicyName = check
+	return checker
+}
+
+// WithMessage adds a Message check to the ProcessLsmChecker
+func (checker *ProcessLsmChecker) WithMessage(check *stringmatcher.StringMatcher) *ProcessLsmChecker {
+	checker.Message = check
+	return checker
+}
+
+// WithArgs adds a Args check to the ProcessLsmChecker
+func (checker *ProcessLsmChecker) WithArgs(check *KprobeArgumentListMatcher) *ProcessLsmChecker {
+	checker.Args = check
+	return checker
+}
+
+// WithAction adds a Action check to the ProcessLsmChecker
+func (checker *ProcessLsmChecker) WithAction(check tetragon.KprobeAction) *ProcessLsmChecker {
+	wrappedCheck := KprobeActionChecker(check)
+	checker.Action = &wrappedCheck
+	return checker
+}
+
+// WithTags adds a Tags check to the ProcessLsmChecker
+func (checker *ProcessLsmChecker) WithTags(check *StringListMatcher) *ProcessLsmChecker {
+	checker.Tags = check
+	return checker
+}
+
+// WithAncestors adds a Ancestors check to the ProcessLsmChecker
+func (checker *ProcessLsmChecker) WithAncestors(check *ProcessListMatcher) *ProcessLsmChecker {
+	checker.Ancestors = check
+	return checker
+}
+
+// WithImaHash adds a ImaHash check to the ProcessLsmChecker
+func (checker *ProcessLsmChecker) WithImaHash(check *stringmatcher.StringMatcher) *ProcessLsmChecker {
+	checker.ImaHash = check
+	return checker
+}
+
+//FromProcessLsm populates the ProcessLsmChecker using data from a ProcessLsm event
+func (checker *ProcessLsmChecker) FromProcessLsm(event *tetragon.ProcessLsm) *ProcessLsmChecker {
+	if event == nil {
+		return checker
+	}
+	if event.Process != nil {
+		checker.Process = NewProcessChecker().FromProcess(event.Process)
+	}
+	if event.Parent != nil {
+		checker.Parent = NewProcessChecker().FromProcess(event.Parent)
+	}
+	checker.FunctionName = stringmatcher.Full(event.FunctionName)
+	checker.PolicyName = stringmatcher.Full(event.PolicyName)
+	checker.Message = stringmatcher.Full(event.Message)
+	{
+		var checks []*KprobeArgumentChecker
+		for _, check := range event.Args {
+			var convertedCheck *KprobeArgumentChecker
+			if check != nil {
+				convertedCheck = NewKprobeArgumentChecker().FromKprobeArgument(check)
+			}
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewKprobeArgumentListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Args = lm
+	}
+	checker.Action = NewKprobeActionChecker(event.Action)
+	{
+		var checks []*stringmatcher.StringMatcher
+		for _, check := range event.Tags {
+			var convertedCheck *stringmatcher.StringMatcher
+			convertedCheck = stringmatcher.Full(check)
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewStringListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Tags = lm
+	}
+	{
+		var checks []*ProcessChecker
+		for _, check := range event.Ancestors {
+			var convertedCheck *ProcessChecker
+			if check != nil {
+				convertedCheck = NewProcessChecker().FromProcess(check)
+			}
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewProcessListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Ancestors = lm
+	}
+	checker.ImaHash = stringmatcher.Full(event.ImaHash)
 	return checker
 }
 
@@ -1792,6 +2564,8 @@ type ProcessLoaderChecker struct {
 	Process     *ProcessChecker              `json:"process,omitempty"`
 	Path        *stringmatcher.StringMatcher `json:"path,omitempty"`
 	Buildid     *bytesmatcher.BytesMatcher   `json:"buildid,omitempty"`
+	Parent      *ProcessChecker              `json:"parent,omitempty"`
+	Ancestors   *ProcessListMatcher          `json:"ancestors,omitempty"`
 }
 
 // CheckEvent checks a single event and implements the EventChecker interface
@@ -1848,6 +2622,16 @@ func (checker *ProcessLoaderChecker) Check(event *tetragon.ProcessLoader) error 
 				return fmt.Errorf("Buildid check failed: %w", err)
 			}
 		}
+		if checker.Parent != nil {
+			if err := checker.Parent.Check(event.Parent); err != nil {
+				return fmt.Errorf("Parent check failed: %w", err)
+			}
+		}
+		if checker.Ancestors != nil {
+			if err := checker.Ancestors.Check(event.Ancestors); err != nil {
+				return fmt.Errorf("Ancestors check failed: %w", err)
+			}
+		}
 		return nil
 	}
 	if err := fieldChecks(); err != nil {
@@ -1859,6 +2643,12 @@ func (checker *ProcessLoaderChecker) Check(event *tetragon.ProcessLoader) error 
 // WithProcess adds a Process check to the ProcessLoaderChecker
 func (checker *ProcessLoaderChecker) WithProcess(check *ProcessChecker) *ProcessLoaderChecker {
 	checker.Process = check
+	return checker
+}
+
+// UnsetProcess unsets the Process check to the ProcessLoaderChecker
+func (checker *ProcessLoaderChecker) UnsetProcess() *ProcessLoaderChecker {
+	checker.Process = nil
 	return checker
 }
 
@@ -1874,6 +2664,24 @@ func (checker *ProcessLoaderChecker) WithBuildid(check *bytesmatcher.BytesMatche
 	return checker
 }
 
+// WithParent adds a Parent check to the ProcessLoaderChecker
+func (checker *ProcessLoaderChecker) WithParent(check *ProcessChecker) *ProcessLoaderChecker {
+	checker.Parent = check
+	return checker
+}
+
+// UnsetParent unsets the Parent check to the ProcessLoaderChecker
+func (checker *ProcessLoaderChecker) UnsetParent() *ProcessLoaderChecker {
+	checker.Parent = nil
+	return checker
+}
+
+// WithAncestors adds a Ancestors check to the ProcessLoaderChecker
+func (checker *ProcessLoaderChecker) WithAncestors(check *ProcessListMatcher) *ProcessLoaderChecker {
+	checker.Ancestors = check
+	return checker
+}
+
 //FromProcessLoader populates the ProcessLoaderChecker using data from a ProcessLoader event
 func (checker *ProcessLoaderChecker) FromProcessLoader(event *tetragon.ProcessLoader) *ProcessLoaderChecker {
 	if event == nil {
@@ -1884,6 +2692,22 @@ func (checker *ProcessLoaderChecker) FromProcessLoader(event *tetragon.ProcessLo
 	}
 	checker.Path = stringmatcher.Full(event.Path)
 	checker.Buildid = bytesmatcher.Full(event.Buildid)
+	if event.Parent != nil {
+		checker.Parent = NewProcessChecker().FromProcess(event.Parent)
+	}
+	{
+		var checks []*ProcessChecker
+		for _, check := range event.Ancestors {
+			var convertedCheck *ProcessChecker
+			if check != nil {
+				convertedCheck = NewProcessChecker().FromProcess(check)
+			}
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewProcessListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.Ancestors = lm
+	}
 	return checker
 }
 
@@ -2050,6 +2874,67 @@ func (checker *ProcessThrottleChecker) FromProcessThrottle(event *tetragon.Proce
 	return checker
 }
 
+// UnsetProcessChecks strips any Process check set via WithProcess() from the
+// individual checks of a MultiEventChecker, e.g. for cases where the process cache
+// is disabled and the Process field can't be checked. The ProcessExec check is left
+// as is, because its Process field is valid regardless of the process cache.
+func UnsetProcessChecks(checker MultiEventChecker) {
+	getter, ok := checker.(interface{ GetChecks() []EventChecker })
+	if !ok {
+		return
+	}
+	for _, c := range getter.GetChecks() {
+		switch v := c.(type) {
+		case *ProcessExitChecker:
+			v.UnsetProcess()
+		case *ProcessKprobeChecker:
+			v.UnsetProcess()
+		case *ProcessTracepointChecker:
+			v.UnsetProcess()
+		case *ProcessUprobeChecker:
+			v.UnsetProcess()
+		case *ProcessUsdtChecker:
+			v.UnsetProcess()
+		case *ProcessLsmChecker:
+			v.UnsetProcess()
+		case *ProcessLoaderChecker:
+			v.UnsetProcess()
+
+		}
+	}
+}
+
+// UnsetParentChecks strips any Parent check set via WithParent() from the
+// individual checks of a MultiEventChecker, e.g. for cases where the process cache
+// is disabled and the Parent field can't be checked.
+func UnsetParentChecks(checker MultiEventChecker) {
+	getter, ok := checker.(interface{ GetChecks() []EventChecker })
+	if !ok {
+		return
+	}
+	for _, c := range getter.GetChecks() {
+		switch v := c.(type) {
+		case *ProcessExecChecker:
+			v.UnsetParent()
+		case *ProcessExitChecker:
+			v.UnsetParent()
+		case *ProcessKprobeChecker:
+			v.UnsetParent()
+		case *ProcessTracepointChecker:
+			v.UnsetParent()
+		case *ProcessUprobeChecker:
+			v.UnsetParent()
+		case *ProcessUsdtChecker:
+			v.UnsetParent()
+		case *ProcessLsmChecker:
+			v.UnsetParent()
+		case *ProcessLoaderChecker:
+			v.UnsetParent()
+
+		}
+	}
+}
+
 // ImageChecker implements a checker struct to check a Image field
 type ImageChecker struct {
 	Id   *stringmatcher.StringMatcher `json:"id,omitempty"`
@@ -2113,14 +2998,68 @@ func (checker *ImageChecker) FromImage(event *tetragon.Image) *ImageChecker {
 	return checker
 }
 
+// SecurityContextChecker implements a checker struct to check a SecurityContext field
+type SecurityContextChecker struct {
+	Privileged *bool `json:"privileged,omitempty"`
+}
+
+// NewSecurityContextChecker creates a new SecurityContextChecker
+func NewSecurityContextChecker() *SecurityContextChecker {
+	return &SecurityContextChecker{}
+}
+
+// Get the type of the checker as a string
+func (checker *SecurityContextChecker) GetCheckerType() string {
+	return "SecurityContextChecker"
+}
+
+// Check checks a SecurityContext field
+func (checker *SecurityContextChecker) Check(event *tetragon.SecurityContext) error {
+	if event == nil {
+		return fmt.Errorf("%s: SecurityContext field is nil", CheckerLogPrefix(checker))
+	}
+
+	fieldChecks := func() error {
+		if checker.Privileged != nil {
+			if *checker.Privileged != event.Privileged {
+				return fmt.Errorf("Privileged has value %t which does not match expected value %t", event.Privileged, *checker.Privileged)
+			}
+		}
+		return nil
+	}
+	if err := fieldChecks(); err != nil {
+		return fmt.Errorf("%s: %w", CheckerLogPrefix(checker), err)
+	}
+	return nil
+}
+
+// WithPrivileged adds a Privileged check to the SecurityContextChecker
+func (checker *SecurityContextChecker) WithPrivileged(check bool) *SecurityContextChecker {
+	checker.Privileged = &check
+	return checker
+}
+
+//FromSecurityContext populates the SecurityContextChecker using data from a SecurityContext field
+func (checker *SecurityContextChecker) FromSecurityContext(event *tetragon.SecurityContext) *SecurityContextChecker {
+	if event == nil {
+		return checker
+	}
+	{
+		val := event.Privileged
+		checker.Privileged = &val
+	}
+	return checker
+}
+
 // ContainerChecker implements a checker struct to check a Container field
 type ContainerChecker struct {
-	Id             *stringmatcher.StringMatcher       `json:"id,omitempty"`
-	Name           *stringmatcher.StringMatcher       `json:"name,omitempty"`
-	Image          *ImageChecker                      `json:"image,omitempty"`
-	StartTime      *timestampmatcher.TimestampMatcher `json:"startTime,omitempty"`
-	Pid            *uint32                            `json:"pid,omitempty"`
-	MaybeExecProbe *bool                              `json:"maybeExecProbe,omitempty"`
+	Id              *stringmatcher.StringMatcher       `json:"id,omitempty"`
+	Name            *stringmatcher.StringMatcher       `json:"name,omitempty"`
+	Image           *ImageChecker                      `json:"image,omitempty"`
+	StartTime       *timestampmatcher.TimestampMatcher `json:"startTime,omitempty"`
+	Pid             *uint32                            `json:"pid,omitempty"`
+	MaybeExecProbe  *bool                              `json:"maybeExecProbe,omitempty"`
+	SecurityContext *SecurityContextChecker            `json:"securityContext,omitempty"`
 }
 
 // NewContainerChecker creates a new ContainerChecker
@@ -2173,6 +3112,11 @@ func (checker *ContainerChecker) Check(event *tetragon.Container) error {
 				return fmt.Errorf("MaybeExecProbe has value %t which does not match expected value %t", event.MaybeExecProbe, *checker.MaybeExecProbe)
 			}
 		}
+		if checker.SecurityContext != nil {
+			if err := checker.SecurityContext.Check(event.SecurityContext); err != nil {
+				return fmt.Errorf("SecurityContext check failed: %w", err)
+			}
+		}
 		return nil
 	}
 	if err := fieldChecks(); err != nil {
@@ -2217,6 +3161,12 @@ func (checker *ContainerChecker) WithMaybeExecProbe(check bool) *ContainerChecke
 	return checker
 }
 
+// WithSecurityContext adds a SecurityContext check to the ContainerChecker
+func (checker *ContainerChecker) WithSecurityContext(check *SecurityContextChecker) *ContainerChecker {
+	checker.SecurityContext = check
+	return checker
+}
+
 //FromContainer populates the ContainerChecker using data from a Container field
 func (checker *ContainerChecker) FromContainer(event *tetragon.Container) *ContainerChecker {
 	if event == nil {
@@ -2237,17 +3187,22 @@ func (checker *ContainerChecker) FromContainer(event *tetragon.Container) *Conta
 		val := event.MaybeExecProbe
 		checker.MaybeExecProbe = &val
 	}
+	if event.SecurityContext != nil {
+		checker.SecurityContext = NewSecurityContextChecker().FromSecurityContext(event.SecurityContext)
+	}
 	return checker
 }
 
 // PodChecker implements a checker struct to check a Pod field
 type PodChecker struct {
-	Namespace    *stringmatcher.StringMatcher           `json:"namespace,omitempty"`
-	Name         *stringmatcher.StringMatcher           `json:"name,omitempty"`
-	Container    *ContainerChecker                      `json:"container,omitempty"`
-	PodLabels    map[string]stringmatcher.StringMatcher `json:"podLabels,omitempty"`
-	Workload     *stringmatcher.StringMatcher           `json:"workload,omitempty"`
-	WorkloadKind *stringmatcher.StringMatcher           `json:"workloadKind,omitempty"`
+	Namespace      *stringmatcher.StringMatcher           `json:"namespace,omitempty"`
+	Name           *stringmatcher.StringMatcher           `json:"name,omitempty"`
+	Uid            *stringmatcher.StringMatcher           `json:"uid,omitempty"`
+	Container      *ContainerChecker                      `json:"container,omitempty"`
+	PodLabels      map[string]stringmatcher.StringMatcher `json:"podLabels,omitempty"`
+	Workload       *stringmatcher.StringMatcher           `json:"workload,omitempty"`
+	WorkloadKind   *stringmatcher.StringMatcher           `json:"workloadKind,omitempty"`
+	PodAnnotations map[string]stringmatcher.StringMatcher `json:"podAnnotations,omitempty"`
 }
 
 // NewPodChecker creates a new PodChecker
@@ -2275,6 +3230,11 @@ func (checker *PodChecker) Check(event *tetragon.Pod) error {
 		if checker.Name != nil {
 			if err := checker.Name.Match(event.Name); err != nil {
 				return fmt.Errorf("Name check failed: %w", err)
+			}
+		}
+		if checker.Uid != nil {
+			if err := checker.Uid.Match(event.Uid); err != nil {
+				return fmt.Errorf("Uid check failed: %w", err)
 			}
 		}
 		if checker.Container != nil {
@@ -2317,6 +3277,31 @@ func (checker *PodChecker) Check(event *tetragon.Pod) error {
 				return fmt.Errorf("WorkloadKind check failed: %w", err)
 			}
 		}
+		{
+			var unmatched []string
+			matched := make(map[string]struct{})
+			for key, value := range event.PodAnnotations {
+				if len(checker.PodAnnotations) > 0 {
+					// Attempt to grab the matcher for this key
+					if matcher, ok := checker.PodAnnotations[key]; ok {
+						if err := matcher.Match(value); err != nil {
+							return fmt.Errorf("PodAnnotations[%s] (%s=%s) check failed: %w", key, key, value, err)
+						}
+						matched[key] = struct{}{}
+					}
+				}
+			}
+
+			// See if we have any unmatched values that we wanted to match
+			if len(matched) != len(checker.PodAnnotations) {
+				for k := range checker.PodAnnotations {
+					if _, ok := matched[k]; !ok {
+						unmatched = append(unmatched, k)
+					}
+				}
+				return fmt.Errorf("PodAnnotations unmatched: %v", unmatched)
+			}
+		}
 		return nil
 	}
 	if err := fieldChecks(); err != nil {
@@ -2334,6 +3319,12 @@ func (checker *PodChecker) WithNamespace(check *stringmatcher.StringMatcher) *Po
 // WithName adds a Name check to the PodChecker
 func (checker *PodChecker) WithName(check *stringmatcher.StringMatcher) *PodChecker {
 	checker.Name = check
+	return checker
+}
+
+// WithUid adds a Uid check to the PodChecker
+func (checker *PodChecker) WithUid(check *stringmatcher.StringMatcher) *PodChecker {
+	checker.Uid = check
 	return checker
 }
 
@@ -2361,6 +3352,12 @@ func (checker *PodChecker) WithWorkloadKind(check *stringmatcher.StringMatcher) 
 	return checker
 }
 
+// WithPodAnnotations adds a PodAnnotations check to the PodChecker
+func (checker *PodChecker) WithPodAnnotations(check map[string]stringmatcher.StringMatcher) *PodChecker {
+	checker.PodAnnotations = check
+	return checker
+}
+
 //FromPod populates the PodChecker using data from a Pod field
 func (checker *PodChecker) FromPod(event *tetragon.Pod) *PodChecker {
 	if event == nil {
@@ -2368,12 +3365,14 @@ func (checker *PodChecker) FromPod(event *tetragon.Pod) *PodChecker {
 	}
 	checker.Namespace = stringmatcher.Full(event.Namespace)
 	checker.Name = stringmatcher.Full(event.Name)
+	checker.Uid = stringmatcher.Full(event.Uid)
 	if event.Container != nil {
 		checker.Container = NewContainerChecker().FromContainer(event.Container)
 	}
 	// TODO: implement fromMap
 	checker.Workload = stringmatcher.Full(event.Workload)
 	checker.WorkloadKind = stringmatcher.Full(event.WorkloadKind)
+	// TODO: implement fromMap
 	return checker
 }
 
@@ -3690,27 +4689,92 @@ func (checker *UserRecordChecker) FromUserRecord(event *tetragon.UserRecord) *Us
 	return checker
 }
 
+// EnvVarChecker implements a checker struct to check a EnvVar field
+type EnvVarChecker struct {
+	Key   *stringmatcher.StringMatcher `json:"Key,omitempty"`
+	Value *stringmatcher.StringMatcher `json:"Value,omitempty"`
+}
+
+// NewEnvVarChecker creates a new EnvVarChecker
+func NewEnvVarChecker() *EnvVarChecker {
+	return &EnvVarChecker{}
+}
+
+// Get the type of the checker as a string
+func (checker *EnvVarChecker) GetCheckerType() string {
+	return "EnvVarChecker"
+}
+
+// Check checks a EnvVar field
+func (checker *EnvVarChecker) Check(event *tetragon.EnvVar) error {
+	if event == nil {
+		return fmt.Errorf("%s: EnvVar field is nil", CheckerLogPrefix(checker))
+	}
+
+	fieldChecks := func() error {
+		if checker.Key != nil {
+			if err := checker.Key.Match(event.Key); err != nil {
+				return fmt.Errorf("Key check failed: %w", err)
+			}
+		}
+		if checker.Value != nil {
+			if err := checker.Value.Match(event.Value); err != nil {
+				return fmt.Errorf("Value check failed: %w", err)
+			}
+		}
+		return nil
+	}
+	if err := fieldChecks(); err != nil {
+		return fmt.Errorf("%s: %w", CheckerLogPrefix(checker), err)
+	}
+	return nil
+}
+
+// WithKey adds a Key check to the EnvVarChecker
+func (checker *EnvVarChecker) WithKey(check *stringmatcher.StringMatcher) *EnvVarChecker {
+	checker.Key = check
+	return checker
+}
+
+// WithValue adds a Value check to the EnvVarChecker
+func (checker *EnvVarChecker) WithValue(check *stringmatcher.StringMatcher) *EnvVarChecker {
+	checker.Value = check
+	return checker
+}
+
+//FromEnvVar populates the EnvVarChecker using data from a EnvVar field
+func (checker *EnvVarChecker) FromEnvVar(event *tetragon.EnvVar) *EnvVarChecker {
+	if event == nil {
+		return checker
+	}
+	checker.Key = stringmatcher.Full(event.Key)
+	checker.Value = stringmatcher.Full(event.Value)
+	return checker
+}
+
 // ProcessChecker implements a checker struct to check a Process field
 type ProcessChecker struct {
-	ExecId             *stringmatcher.StringMatcher       `json:"execId,omitempty"`
-	Pid                *uint32                            `json:"pid,omitempty"`
-	Uid                *uint32                            `json:"uid,omitempty"`
-	Cwd                *stringmatcher.StringMatcher       `json:"cwd,omitempty"`
-	Binary             *stringmatcher.StringMatcher       `json:"binary,omitempty"`
-	Arguments          *stringmatcher.StringMatcher       `json:"arguments,omitempty"`
-	Flags              *stringmatcher.StringMatcher       `json:"flags,omitempty"`
-	StartTime          *timestampmatcher.TimestampMatcher `json:"startTime,omitempty"`
-	Auid               *uint32                            `json:"auid,omitempty"`
-	Pod                *PodChecker                        `json:"pod,omitempty"`
-	Docker             *stringmatcher.StringMatcher       `json:"docker,omitempty"`
-	ParentExecId       *stringmatcher.StringMatcher       `json:"parentExecId,omitempty"`
-	Refcnt             *uint32                            `json:"refcnt,omitempty"`
-	Cap                *CapabilitiesChecker               `json:"cap,omitempty"`
-	Ns                 *NamespacesChecker                 `json:"ns,omitempty"`
-	Tid                *uint32                            `json:"tid,omitempty"`
-	ProcessCredentials *ProcessCredentialsChecker         `json:"processCredentials,omitempty"`
-	BinaryProperties   *BinaryPropertiesChecker           `json:"binaryProperties,omitempty"`
-	User               *UserRecordChecker                 `json:"user,omitempty"`
+	ExecId               *stringmatcher.StringMatcher       `json:"execId,omitempty"`
+	Pid                  *uint32                            `json:"pid,omitempty"`
+	Uid                  *uint32                            `json:"uid,omitempty"`
+	Cwd                  *stringmatcher.StringMatcher       `json:"cwd,omitempty"`
+	Binary               *stringmatcher.StringMatcher       `json:"binary,omitempty"`
+	Arguments            *stringmatcher.StringMatcher       `json:"arguments,omitempty"`
+	Flags                *stringmatcher.StringMatcher       `json:"flags,omitempty"`
+	StartTime            *timestampmatcher.TimestampMatcher `json:"startTime,omitempty"`
+	Auid                 *uint32                            `json:"auid,omitempty"`
+	Pod                  *PodChecker                        `json:"pod,omitempty"`
+	Docker               *stringmatcher.StringMatcher       `json:"docker,omitempty"`
+	ParentExecId         *stringmatcher.StringMatcher       `json:"parentExecId,omitempty"`
+	Refcnt               *uint32                            `json:"refcnt,omitempty"`
+	Cap                  *CapabilitiesChecker               `json:"cap,omitempty"`
+	Ns                   *NamespacesChecker                 `json:"ns,omitempty"`
+	Tid                  *uint32                            `json:"tid,omitempty"`
+	ProcessCredentials   *ProcessCredentialsChecker         `json:"processCredentials,omitempty"`
+	BinaryProperties     *BinaryPropertiesChecker           `json:"binaryProperties,omitempty"`
+	User                 *UserRecordChecker                 `json:"user,omitempty"`
+	InInitTree           *bool                              `json:"inInitTree,omitempty"`
+	EnvironmentVariables *EnvVarListMatcher                 `json:"environmentVariables,omitempty"`
 }
 
 // NewProcessChecker creates a new ProcessChecker
@@ -3837,6 +4901,19 @@ func (checker *ProcessChecker) Check(event *tetragon.Process) error {
 				return fmt.Errorf("User check failed: %w", err)
 			}
 		}
+		if checker.InInitTree != nil {
+			if event.InInitTree == nil {
+				return fmt.Errorf("InInitTree is nil and does not match expected value %v", *checker.InInitTree)
+			}
+			if *checker.InInitTree != event.InInitTree.Value {
+				return fmt.Errorf("InInitTree has value %v which does not match expected value %v", event.InInitTree.Value, *checker.InInitTree)
+			}
+		}
+		if checker.EnvironmentVariables != nil {
+			if err := checker.EnvironmentVariables.Check(event.EnvironmentVariables); err != nil {
+				return fmt.Errorf("EnvironmentVariables check failed: %w", err)
+			}
+		}
 		return nil
 	}
 	if err := fieldChecks(); err != nil {
@@ -3959,6 +5036,18 @@ func (checker *ProcessChecker) WithUser(check *UserRecordChecker) *ProcessChecke
 	return checker
 }
 
+// WithInInitTree adds a InInitTree check to the ProcessChecker
+func (checker *ProcessChecker) WithInInitTree(check bool) *ProcessChecker {
+	checker.InInitTree = &check
+	return checker
+}
+
+// WithEnvironmentVariables adds a EnvironmentVariables check to the ProcessChecker
+func (checker *ProcessChecker) WithEnvironmentVariables(check *EnvVarListMatcher) *ProcessChecker {
+	checker.EnvironmentVariables = check
+	return checker
+}
+
 //FromProcess populates the ProcessChecker using data from a Process field
 func (checker *ProcessChecker) FromProcess(event *tetragon.Process) *ProcessChecker {
 	if event == nil {
@@ -4011,7 +5100,124 @@ func (checker *ProcessChecker) FromProcess(event *tetragon.Process) *ProcessChec
 	if event.User != nil {
 		checker.User = NewUserRecordChecker().FromUserRecord(event.User)
 	}
+	if event.InInitTree != nil {
+		val := event.InInitTree.Value
+		checker.InInitTree = &val
+	}
+	{
+		var checks []*EnvVarChecker
+		for _, check := range event.EnvironmentVariables {
+			var convertedCheck *EnvVarChecker
+			if check != nil {
+				convertedCheck = NewEnvVarChecker().FromEnvVar(check)
+			}
+			checks = append(checks, convertedCheck)
+		}
+		lm := NewEnvVarListMatcher().WithOperator(listmatcher.Ordered).
+			WithValues(checks...)
+		checker.EnvironmentVariables = lm
+	}
 	return checker
+}
+
+// EnvVarListMatcher checks a list of *tetragon.EnvVar fields
+type EnvVarListMatcher struct {
+	Operator listmatcher.Operator `json:"operator"`
+	Values   []*EnvVarChecker     `json:"values"`
+}
+
+// NewEnvVarListMatcher creates a new EnvVarListMatcher. The checker defaults to a subset checker unless otherwise specified using WithOperator()
+func NewEnvVarListMatcher() *EnvVarListMatcher {
+	return &EnvVarListMatcher{
+		Operator: listmatcher.Subset,
+	}
+}
+
+// WithOperator sets the match kind for the EnvVarListMatcher
+func (checker *EnvVarListMatcher) WithOperator(operator listmatcher.Operator) *EnvVarListMatcher {
+	checker.Operator = operator
+	return checker
+}
+
+// WithValues sets the checkers that the EnvVarListMatcher should use
+func (checker *EnvVarListMatcher) WithValues(values ...*EnvVarChecker) *EnvVarListMatcher {
+	checker.Values = values
+	return checker
+}
+
+// Check checks a list of *tetragon.EnvVar fields
+func (checker *EnvVarListMatcher) Check(values []*tetragon.EnvVar) error {
+	switch checker.Operator {
+	case listmatcher.Ordered:
+		return checker.orderedCheck(values)
+	case listmatcher.Unordered:
+		return checker.unorderedCheck(values)
+	case listmatcher.Subset:
+		return checker.subsetCheck(values)
+	default:
+		return fmt.Errorf("Unhandled ListMatcher operator %s", checker.Operator)
+	}
+}
+
+// orderedCheck checks a list of ordered *tetragon.EnvVar fields
+func (checker *EnvVarListMatcher) orderedCheck(values []*tetragon.EnvVar) error {
+	innerCheck := func(check *EnvVarChecker, value *tetragon.EnvVar) error {
+		if err := check.Check(value); err != nil {
+			return fmt.Errorf("EnvironmentVariables check failed: %w", err)
+		}
+		return nil
+	}
+
+	if len(checker.Values) != len(values) {
+		return fmt.Errorf("EnvVarListMatcher: Wanted %d elements, got %d", len(checker.Values), len(values))
+	}
+
+	for i, check := range checker.Values {
+		value := values[i]
+		if err := innerCheck(check, value); err != nil {
+			return fmt.Errorf("EnvVarListMatcher: Check failed on element %d: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
+// unorderedCheck checks a list of unordered *tetragon.EnvVar fields
+func (checker *EnvVarListMatcher) unorderedCheck(values []*tetragon.EnvVar) error {
+	if len(checker.Values) != len(values) {
+		return fmt.Errorf("EnvVarListMatcher: Wanted %d elements, got %d", len(checker.Values), len(values))
+	}
+
+	return checker.subsetCheck(values)
+}
+
+// subsetCheck checks a subset of *tetragon.EnvVar fields
+func (checker *EnvVarListMatcher) subsetCheck(values []*tetragon.EnvVar) error {
+	innerCheck := func(check *EnvVarChecker, value *tetragon.EnvVar) error {
+		if err := check.Check(value); err != nil {
+			return fmt.Errorf("EnvironmentVariables check failed: %w", err)
+		}
+		return nil
+	}
+
+	numDesired := len(checker.Values)
+	numMatched := 0
+
+nextCheck:
+	for _, check := range checker.Values {
+		for _, value := range values {
+			if err := innerCheck(check, value); err == nil {
+				numMatched += 1
+				continue nextCheck
+			}
+		}
+	}
+
+	if numMatched < numDesired {
+		return fmt.Errorf("EnvVarListMatcher: Check failed, only matched %d elements but wanted %d", numMatched, numDesired)
+	}
+
+	return nil
 }
 
 // KprobeSockChecker implements a checker struct to check a KprobeSock field
@@ -4439,6 +5645,148 @@ func (checker *KprobeSkbChecker) FromKprobeSkb(event *tetragon.KprobeSkb) *Kprob
 	}
 	checker.Protocol = stringmatcher.Full(event.Protocol)
 	checker.Family = stringmatcher.Full(event.Family)
+	return checker
+}
+
+// KprobeSockaddrChecker implements a checker struct to check a KprobeSockaddr field
+type KprobeSockaddrChecker struct {
+	Family *stringmatcher.StringMatcher `json:"family,omitempty"`
+	Addr   *stringmatcher.StringMatcher `json:"addr,omitempty"`
+	Port   *uint32                      `json:"port,omitempty"`
+}
+
+// NewKprobeSockaddrChecker creates a new KprobeSockaddrChecker
+func NewKprobeSockaddrChecker() *KprobeSockaddrChecker {
+	return &KprobeSockaddrChecker{}
+}
+
+// Get the type of the checker as a string
+func (checker *KprobeSockaddrChecker) GetCheckerType() string {
+	return "KprobeSockaddrChecker"
+}
+
+// Check checks a KprobeSockaddr field
+func (checker *KprobeSockaddrChecker) Check(event *tetragon.KprobeSockaddr) error {
+	if event == nil {
+		return fmt.Errorf("%s: KprobeSockaddr field is nil", CheckerLogPrefix(checker))
+	}
+
+	fieldChecks := func() error {
+		if checker.Family != nil {
+			if err := checker.Family.Match(event.Family); err != nil {
+				return fmt.Errorf("Family check failed: %w", err)
+			}
+		}
+		if checker.Addr != nil {
+			if err := checker.Addr.Match(event.Addr); err != nil {
+				return fmt.Errorf("Addr check failed: %w", err)
+			}
+		}
+		if checker.Port != nil {
+			if *checker.Port != event.Port {
+				return fmt.Errorf("Port has value %d which does not match expected value %d", event.Port, *checker.Port)
+			}
+		}
+		return nil
+	}
+	if err := fieldChecks(); err != nil {
+		return fmt.Errorf("%s: %w", CheckerLogPrefix(checker), err)
+	}
+	return nil
+}
+
+// WithFamily adds a Family check to the KprobeSockaddrChecker
+func (checker *KprobeSockaddrChecker) WithFamily(check *stringmatcher.StringMatcher) *KprobeSockaddrChecker {
+	checker.Family = check
+	return checker
+}
+
+// WithAddr adds a Addr check to the KprobeSockaddrChecker
+func (checker *KprobeSockaddrChecker) WithAddr(check *stringmatcher.StringMatcher) *KprobeSockaddrChecker {
+	checker.Addr = check
+	return checker
+}
+
+// WithPort adds a Port check to the KprobeSockaddrChecker
+func (checker *KprobeSockaddrChecker) WithPort(check uint32) *KprobeSockaddrChecker {
+	checker.Port = &check
+	return checker
+}
+
+//FromKprobeSockaddr populates the KprobeSockaddrChecker using data from a KprobeSockaddr field
+func (checker *KprobeSockaddrChecker) FromKprobeSockaddr(event *tetragon.KprobeSockaddr) *KprobeSockaddrChecker {
+	if event == nil {
+		return checker
+	}
+	checker.Family = stringmatcher.Full(event.Family)
+	checker.Addr = stringmatcher.Full(event.Addr)
+	{
+		val := event.Port
+		checker.Port = &val
+	}
+	return checker
+}
+
+// KprobeSockaddrUnChecker implements a checker struct to check a KprobeSockaddrUn field
+type KprobeSockaddrUnChecker struct {
+	Family *stringmatcher.StringMatcher `json:"family,omitempty"`
+	Path   *stringmatcher.StringMatcher `json:"path,omitempty"`
+}
+
+// NewKprobeSockaddrUnChecker creates a new KprobeSockaddrUnChecker
+func NewKprobeSockaddrUnChecker() *KprobeSockaddrUnChecker {
+	return &KprobeSockaddrUnChecker{}
+}
+
+// Get the type of the checker as a string
+func (checker *KprobeSockaddrUnChecker) GetCheckerType() string {
+	return "KprobeSockaddrUnChecker"
+}
+
+// Check checks a KprobeSockaddrUn field
+func (checker *KprobeSockaddrUnChecker) Check(event *tetragon.KprobeSockaddrUn) error {
+	if event == nil {
+		return fmt.Errorf("%s: KprobeSockaddrUn field is nil", CheckerLogPrefix(checker))
+	}
+
+	fieldChecks := func() error {
+		if checker.Family != nil {
+			if err := checker.Family.Match(event.Family); err != nil {
+				return fmt.Errorf("Family check failed: %w", err)
+			}
+		}
+		if checker.Path != nil {
+			if err := checker.Path.Match(event.Path); err != nil {
+				return fmt.Errorf("Path check failed: %w", err)
+			}
+		}
+		return nil
+	}
+	if err := fieldChecks(); err != nil {
+		return fmt.Errorf("%s: %w", CheckerLogPrefix(checker), err)
+	}
+	return nil
+}
+
+// WithFamily adds a Family check to the KprobeSockaddrUnChecker
+func (checker *KprobeSockaddrUnChecker) WithFamily(check *stringmatcher.StringMatcher) *KprobeSockaddrUnChecker {
+	checker.Family = check
+	return checker
+}
+
+// WithPath adds a Path check to the KprobeSockaddrUnChecker
+func (checker *KprobeSockaddrUnChecker) WithPath(check *stringmatcher.StringMatcher) *KprobeSockaddrUnChecker {
+	checker.Path = check
+	return checker
+}
+
+//FromKprobeSockaddrUn populates the KprobeSockaddrUnChecker using data from a KprobeSockaddrUn field
+func (checker *KprobeSockaddrUnChecker) FromKprobeSockaddrUn(event *tetragon.KprobeSockaddrUn) *KprobeSockaddrUnChecker {
+	if event == nil {
+		return checker
+	}
+	checker.Family = stringmatcher.Full(event.Family)
+	checker.Path = stringmatcher.Full(event.Path)
 	return checker
 }
 
@@ -5175,6 +6523,85 @@ func (checker *KprobeBpfAttrChecker) FromKprobeBpfAttr(event *tetragon.KprobeBpf
 	return checker
 }
 
+// KprobeBpfProgChecker implements a checker struct to check a KprobeBpfProg field
+type KprobeBpfProgChecker struct {
+	ProgType *stringmatcher.StringMatcher `json:"ProgType,omitempty"`
+	InsnCnt  *uint32                      `json:"InsnCnt,omitempty"`
+	ProgName *stringmatcher.StringMatcher `json:"ProgName,omitempty"`
+}
+
+// NewKprobeBpfProgChecker creates a new KprobeBpfProgChecker
+func NewKprobeBpfProgChecker() *KprobeBpfProgChecker {
+	return &KprobeBpfProgChecker{}
+}
+
+// Get the type of the checker as a string
+func (checker *KprobeBpfProgChecker) GetCheckerType() string {
+	return "KprobeBpfProgChecker"
+}
+
+// Check checks a KprobeBpfProg field
+func (checker *KprobeBpfProgChecker) Check(event *tetragon.KprobeBpfProg) error {
+	if event == nil {
+		return fmt.Errorf("%s: KprobeBpfProg field is nil", CheckerLogPrefix(checker))
+	}
+
+	fieldChecks := func() error {
+		if checker.ProgType != nil {
+			if err := checker.ProgType.Match(event.ProgType); err != nil {
+				return fmt.Errorf("ProgType check failed: %w", err)
+			}
+		}
+		if checker.InsnCnt != nil {
+			if *checker.InsnCnt != event.InsnCnt {
+				return fmt.Errorf("InsnCnt has value %d which does not match expected value %d", event.InsnCnt, *checker.InsnCnt)
+			}
+		}
+		if checker.ProgName != nil {
+			if err := checker.ProgName.Match(event.ProgName); err != nil {
+				return fmt.Errorf("ProgName check failed: %w", err)
+			}
+		}
+		return nil
+	}
+	if err := fieldChecks(); err != nil {
+		return fmt.Errorf("%s: %w", CheckerLogPrefix(checker), err)
+	}
+	return nil
+}
+
+// WithProgType adds a ProgType check to the KprobeBpfProgChecker
+func (checker *KprobeBpfProgChecker) WithProgType(check *stringmatcher.StringMatcher) *KprobeBpfProgChecker {
+	checker.ProgType = check
+	return checker
+}
+
+// WithInsnCnt adds a InsnCnt check to the KprobeBpfProgChecker
+func (checker *KprobeBpfProgChecker) WithInsnCnt(check uint32) *KprobeBpfProgChecker {
+	checker.InsnCnt = &check
+	return checker
+}
+
+// WithProgName adds a ProgName check to the KprobeBpfProgChecker
+func (checker *KprobeBpfProgChecker) WithProgName(check *stringmatcher.StringMatcher) *KprobeBpfProgChecker {
+	checker.ProgName = check
+	return checker
+}
+
+//FromKprobeBpfProg populates the KprobeBpfProgChecker using data from a KprobeBpfProg field
+func (checker *KprobeBpfProgChecker) FromKprobeBpfProg(event *tetragon.KprobeBpfProg) *KprobeBpfProgChecker {
+	if event == nil {
+		return checker
+	}
+	checker.ProgType = stringmatcher.Full(event.ProgType)
+	{
+		val := event.InsnCnt
+		checker.InsnCnt = &val
+	}
+	checker.ProgName = stringmatcher.Full(event.ProgName)
+	return checker
+}
+
 // KprobePerfEventChecker implements a checker struct to check a KprobePerfEvent field
 type KprobePerfEventChecker struct {
 	KprobeFunc  *stringmatcher.StringMatcher `json:"KprobeFunc,omitempty"`
@@ -5381,6 +6808,122 @@ func (checker *KprobeBpfMapChecker) FromKprobeBpfMap(event *tetragon.KprobeBpfMa
 	return checker
 }
 
+// KprobeErrorChecker implements a checker struct to check a KprobeError field
+type KprobeErrorChecker struct {
+	Message *stringmatcher.StringMatcher `json:"Message,omitempty"`
+}
+
+// NewKprobeErrorChecker creates a new KprobeErrorChecker
+func NewKprobeErrorChecker() *KprobeErrorChecker {
+	return &KprobeErrorChecker{}
+}
+
+// Get the type of the checker as a string
+func (checker *KprobeErrorChecker) GetCheckerType() string {
+	return "KprobeErrorChecker"
+}
+
+// Check checks a KprobeError field
+func (checker *KprobeErrorChecker) Check(event *tetragon.KprobeError) error {
+	if event == nil {
+		return fmt.Errorf("%s: KprobeError field is nil", CheckerLogPrefix(checker))
+	}
+
+	fieldChecks := func() error {
+		if checker.Message != nil {
+			if err := checker.Message.Match(event.Message); err != nil {
+				return fmt.Errorf("Message check failed: %w", err)
+			}
+		}
+		return nil
+	}
+	if err := fieldChecks(); err != nil {
+		return fmt.Errorf("%s: %w", CheckerLogPrefix(checker), err)
+	}
+	return nil
+}
+
+// WithMessage adds a Message check to the KprobeErrorChecker
+func (checker *KprobeErrorChecker) WithMessage(check *stringmatcher.StringMatcher) *KprobeErrorChecker {
+	checker.Message = check
+	return checker
+}
+
+//FromKprobeError populates the KprobeErrorChecker using data from a KprobeError field
+func (checker *KprobeErrorChecker) FromKprobeError(event *tetragon.KprobeError) *KprobeErrorChecker {
+	if event == nil {
+		return checker
+	}
+	checker.Message = stringmatcher.Full(event.Message)
+	return checker
+}
+
+// SyscallIdChecker implements a checker struct to check a SyscallId field
+type SyscallIdChecker struct {
+	Id  *uint32                      `json:"id,omitempty"`
+	Abi *stringmatcher.StringMatcher `json:"abi,omitempty"`
+}
+
+// NewSyscallIdChecker creates a new SyscallIdChecker
+func NewSyscallIdChecker() *SyscallIdChecker {
+	return &SyscallIdChecker{}
+}
+
+// Get the type of the checker as a string
+func (checker *SyscallIdChecker) GetCheckerType() string {
+	return "SyscallIdChecker"
+}
+
+// Check checks a SyscallId field
+func (checker *SyscallIdChecker) Check(event *tetragon.SyscallId) error {
+	if event == nil {
+		return fmt.Errorf("%s: SyscallId field is nil", CheckerLogPrefix(checker))
+	}
+
+	fieldChecks := func() error {
+		if checker.Id != nil {
+			if *checker.Id != event.Id {
+				return fmt.Errorf("Id has value %d which does not match expected value %d", event.Id, *checker.Id)
+			}
+		}
+		if checker.Abi != nil {
+			if err := checker.Abi.Match(event.Abi); err != nil {
+				return fmt.Errorf("Abi check failed: %w", err)
+			}
+		}
+		return nil
+	}
+	if err := fieldChecks(); err != nil {
+		return fmt.Errorf("%s: %w", CheckerLogPrefix(checker), err)
+	}
+	return nil
+}
+
+// WithId adds a Id check to the SyscallIdChecker
+func (checker *SyscallIdChecker) WithId(check uint32) *SyscallIdChecker {
+	checker.Id = &check
+	return checker
+}
+
+// WithAbi adds a Abi check to the SyscallIdChecker
+func (checker *SyscallIdChecker) WithAbi(check *stringmatcher.StringMatcher) *SyscallIdChecker {
+	checker.Abi = check
+	return checker
+}
+
+//FromSyscallId populates the SyscallIdChecker using data from a SyscallId field
+func (checker *SyscallIdChecker) FromSyscallId(event *tetragon.SyscallId) *SyscallIdChecker {
+	if event == nil {
+		return checker
+	}
+	{
+		val := event.Id
+		checker.Id = &val
+	}
+	checker.Abi = stringmatcher.Full(event.Abi)
+	return checker
+}
+
 // KprobeArgumentChecker implements a checker struct to check a KprobeArgument field
 type KprobeArgumentChecker struct {
 	StringArg             *stringmatcher.StringMatcher `json:"stringArg,omitempty"`
@@ -5409,6 +6952,12 @@ type KprobeArgumentChecker struct {
 	CapEffectiveArg       *stringmatcher.StringMatcher `json:"capEffectiveArg,omitempty"`
 	LinuxBinprmArg        *KprobeLinuxBinprmChecker    `json:"linuxBinprmArg,omitempty"`
 	NetDevArg             *KprobeNetDevChecker         `json:"netDevArg,omitempty"`
+	BpfCmdArg             *BpfCmdChecker               `json:"bpfCmdArg,omitempty"`
+	SyscallId             *SyscallIdChecker            `json:"syscallId,omitempty"`
+	SockaddrArg           *KprobeSockaddrChecker       `json:"sockaddrArg,omitempty"`
+	BpfProgArg            *KprobeBpfProgChecker        `json:"bpfProgArg,omitempty"`
+	ErrorArg              *KprobeErrorChecker          `json:"errorArg,omitempty"`
+	SockaddrunArg         *KprobeSockaddrUnChecker     `json:"sockaddrunArg,omitempty"`
 	Label                 *stringmatcher.StringMatcher `json:"label,omitempty"`
 }
 
@@ -5689,6 +7238,66 @@ func (checker *KprobeArgumentChecker) Check(event *tetragon.KprobeArgument) erro
 				return fmt.Errorf("KprobeArgumentChecker: NetDevArg check failed: %T is not a NetDevArg", event)
 			}
 		}
+		if checker.BpfCmdArg != nil {
+			switch event := event.Arg.(type) {
+			case *tetragon.KprobeArgument_BpfCmdArg:
+				if err := checker.BpfCmdArg.Check(&event.BpfCmdArg); err != nil {
+					return fmt.Errorf("BpfCmdArg check failed: %w", err)
+				}
+			default:
+				return fmt.Errorf("KprobeArgumentChecker: BpfCmdArg check failed: %T is not a BpfCmdArg", event)
+			}
+		}
+		if checker.SyscallId != nil {
+			switch event := event.Arg.(type) {
+			case *tetragon.KprobeArgument_SyscallId:
+				if err := checker.SyscallId.Check(event.SyscallId); err != nil {
+					return fmt.Errorf("SyscallId check failed: %w", err)
+				}
+			default:
+				return fmt.Errorf("KprobeArgumentChecker: SyscallId check failed: %T is not a SyscallId", event)
+			}
+		}
+		if checker.SockaddrArg != nil {
+			switch event := event.Arg.(type) {
+			case *tetragon.KprobeArgument_SockaddrArg:
+				if err := checker.SockaddrArg.Check(event.SockaddrArg); err != nil {
+					return fmt.Errorf("SockaddrArg check failed: %w", err)
+				}
+			default:
+				return fmt.Errorf("KprobeArgumentChecker: SockaddrArg check failed: %T is not a SockaddrArg", event)
+			}
+		}
+		if checker.BpfProgArg != nil {
+			switch event := event.Arg.(type) {
+			case *tetragon.KprobeArgument_BpfProgArg:
+				if err := checker.BpfProgArg.Check(event.BpfProgArg); err != nil {
+					return fmt.Errorf("BpfProgArg check failed: %w", err)
+				}
+			default:
+				return fmt.Errorf("KprobeArgumentChecker: BpfProgArg check failed: %T is not a BpfProgArg", event)
+			}
+		}
+		if checker.ErrorArg != nil {
+			switch event := event.Arg.(type) {
+			case *tetragon.KprobeArgument_ErrorArg:
+				if err := checker.ErrorArg.Check(event.ErrorArg); err != nil {
+					return fmt.Errorf("ErrorArg check failed: %w", err)
+				}
+			default:
+				return fmt.Errorf("KprobeArgumentChecker: ErrorArg check failed: %T is not a ErrorArg", event)
+			}
+		}
+		if checker.SockaddrunArg != nil {
+			switch event := event.Arg.(type) {
+			case *tetragon.KprobeArgument_SockaddrunArg:
+				if err := checker.SockaddrunArg.Check(event.SockaddrunArg); err != nil {
+					return fmt.Errorf("SockaddrunArg check failed: %w", err)
+				}
+			default:
+				return fmt.Errorf("KprobeArgumentChecker: SockaddrunArg check failed: %T is not a SockaddrunArg", event)
+			}
+		}
 		if checker.Label != nil {
 			if err := checker.Label.Match(event.Label); err != nil {
 				return fmt.Errorf("Label check failed: %w", err)
@@ -5858,6 +7467,43 @@ func (checker *KprobeArgumentChecker) WithNetDevArg(check *KprobeNetDevChecker) 
 	return checker
 }
 
+// WithBpfCmdArg adds a BpfCmdArg check to the KprobeArgumentChecker
+func (checker *KprobeArgumentChecker) WithBpfCmdArg(check tetragon.BpfCmd) *KprobeArgumentChecker {
+	wrappedCheck := BpfCmdChecker(check)
+	checker.BpfCmdArg = &wrappedCheck
+	return checker
+}
+
+// WithSyscallId adds a SyscallId check to the KprobeArgumentChecker
+func (checker *KprobeArgumentChecker) WithSyscallId(check *SyscallIdChecker) *KprobeArgumentChecker {
+	checker.SyscallId = check
+	return checker
+}
+
+// WithSockaddrArg adds a SockaddrArg check to the KprobeArgumentChecker
+func (checker *KprobeArgumentChecker) WithSockaddrArg(check *KprobeSockaddrChecker) *KprobeArgumentChecker {
+	checker.SockaddrArg = check
+	return checker
+}
+
+// WithBpfProgArg adds a BpfProgArg check to the KprobeArgumentChecker
+func (checker *KprobeArgumentChecker) WithBpfProgArg(check *KprobeBpfProgChecker) *KprobeArgumentChecker {
+	checker.BpfProgArg = check
+	return checker
+}
+
+// WithErrorArg adds a ErrorArg check to the KprobeArgumentChecker
+func (checker *KprobeArgumentChecker) WithErrorArg(check *KprobeErrorChecker) *KprobeArgumentChecker {
+	checker.ErrorArg = check
+	return checker
+}
+
+// WithSockaddrunArg adds a SockaddrunArg check to the KprobeArgumentChecker
+func (checker *KprobeArgumentChecker) WithSockaddrunArg(check *KprobeSockaddrUnChecker) *KprobeArgumentChecker {
+	checker.SockaddrunArg = check
+	return checker
+}
+
 // WithLabel adds a Label check to the KprobeArgumentChecker
 func (checker *KprobeArgumentChecker) WithLabel(check *stringmatcher.StringMatcher) *KprobeArgumentChecker {
 	checker.Label = check
@@ -6015,6 +7661,40 @@ func (checker *KprobeArgumentChecker) FromKprobeArgument(event *tetragon.KprobeA
 	case *tetragon.KprobeArgument_NetDevArg:
 		if event.NetDevArg != nil {
 			checker.NetDevArg = NewKprobeNetDevChecker().FromKprobeNetDev(event.NetDevArg)
+		}
+	}
+	switch event := event.Arg.(type) {
+	case *tetragon.KprobeArgument_BpfCmdArg:
+		checker.BpfCmdArg = NewBpfCmdChecker(event.BpfCmdArg)
+	}
+	switch event := event.Arg.(type) {
+	case *tetragon.KprobeArgument_SyscallId:
+		if event.SyscallId != nil {
+			checker.SyscallId = NewSyscallIdChecker().FromSyscallId(event.SyscallId)
+		}
+	}
+	switch event := event.Arg.(type) {
+	case *tetragon.KprobeArgument_SockaddrArg:
+		if event.SockaddrArg != nil {
+			checker.SockaddrArg = NewKprobeSockaddrChecker().FromKprobeSockaddr(event.SockaddrArg)
+		}
+	}
+	switch event := event.Arg.(type) {
+	case *tetragon.KprobeArgument_BpfProgArg:
+		if event.BpfProgArg != nil {
+			checker.BpfProgArg = NewKprobeBpfProgChecker().FromKprobeBpfProg(event.BpfProgArg)
+		}
+	}
+	switch event := event.Arg.(type) {
+	case *tetragon.KprobeArgument_ErrorArg:
+		if event.ErrorArg != nil {
+			checker.ErrorArg = NewKprobeErrorChecker().FromKprobeError(event.ErrorArg)
+		}
+	}
+	switch event := event.Arg.(type) {
+	case *tetragon.KprobeArgument_SockaddrunArg:
+		if event.SockaddrunArg != nil {
+			checker.SockaddrunArg = NewKprobeSockaddrUnChecker().FromKprobeSockaddrUn(event.SockaddrunArg)
 		}
 	}
 	checker.Label = stringmatcher.Full(event.Label)
@@ -6306,6 +7986,58 @@ func (checker *StackTraceEntryChecker) FromStackTraceEntry(event *tetragon.Stack
 	checker.Symbol = stringmatcher.Full(event.Symbol)
 	checker.Module = stringmatcher.Full(event.Module)
 	return checker
+}
+
+// BpfCmdChecker checks a tetragon.BpfCmd
+type BpfCmdChecker tetragon.BpfCmd
+
+// MarshalJSON implements json.Marshaler interface
+func (enum BpfCmdChecker) MarshalJSON() ([]byte, error) {
+	if name, ok := tetragon.BpfCmd_name[int32(enum)]; ok {
+		name = strings.TrimPrefix(name, "BPF_")
+		return json.Marshal(name)
+	}
+
+	return nil, fmt.Errorf("Unknown BpfCmd %d", enum)
+}
+
+// UnmarshalJSON implements json.Unmarshaler interface
+func (enum *BpfCmdChecker) UnmarshalJSON(b []byte) error {
+	var str string
+	if err := yaml.UnmarshalStrict(b, &str); err != nil {
+		return err
+	}
+
+	// Convert to uppercase if not already
+	str = strings.ToUpper(str)
+
+	// Look up the value from the enum values map
+	if n, ok := tetragon.BpfCmd_value[str]; ok {
+		*enum = BpfCmdChecker(n)
+	} else if n, ok := tetragon.BpfCmd_value["BPF_"+str]; ok {
+		*enum = BpfCmdChecker(n)
+	} else {
+		return fmt.Errorf("Unknown BpfCmd %s", str)
+	}
+
+	return nil
+}
+
+// NewBpfCmdChecker creates a new BpfCmdChecker
+func NewBpfCmdChecker(val tetragon.BpfCmd) *BpfCmdChecker {
+	enum := BpfCmdChecker(val)
+	return &enum
+}
+
+// Check checks a BpfCmd against the checker
+func (enum *BpfCmdChecker) Check(val *tetragon.BpfCmd) error {
+	if val == nil {
+		return fmt.Errorf("BpfCmdChecker: BpfCmd is nil and does not match expected value %s", tetragon.BpfCmd(*enum))
+	}
+	if *enum != BpfCmdChecker(*val) {
+		return fmt.Errorf("BpfCmdChecker: BpfCmd has value %s which does not match expected value %s", (*val), tetragon.BpfCmd(*enum))
+	}
+	return nil
 }
 
 // CapabilitiesTypeChecker checks a tetragon.CapabilitiesType

@@ -1,28 +1,26 @@
 module github.com/cilium/tetragon/api
 
 // renovate: datasource=golang-version depName=go
-go 1.22.1
-
-toolchain go1.22.3
+go 1.27.0
 
 require (
 	github.com/cilium/tetragon v0.0.0-00010101000000-000000000000
-	github.com/sirupsen/logrus v1.9.3
-	github.com/stretchr/testify v1.9.0
-	google.golang.org/grpc v1.63.3
-	google.golang.org/protobuf v1.34.2
-	sigs.k8s.io/yaml v1.4.0
+	github.com/stretchr/testify v1.12.1
+	google.golang.org/grpc v1.83.2
+	google.golang.org/protobuf v1.36.12
+	sigs.k8s.io/yaml v1.6.0
 )
 
 require (
-	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
-	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	golang.org/x/net v0.26.0 // indirect
-	golang.org/x/sys v0.22.0 // indirect
-	golang.org/x/text v0.16.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20240415180920-8c6c420018be // indirect
-	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
+	go.yaml.in/yaml/v2 v2.4.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 )
 
-replace github.com/cilium/tetragon => ../
+replace (
+	github.com/cilium/tetragon => ../
+	github.com/cilium/tetragon/pkg/k8s => ../pkg/k8s
+)

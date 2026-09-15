@@ -114,6 +114,9 @@ static int BPF_FUNC(map_delete_elem, void *map, const void *key);
 static int BPF_FUNC(probe_read, void *dst, uint32_t size, const void *src);
 static int BPF_FUNC(probe_read_str, void *dst, int size, const void *src);
 static int BPF_FUNC(probe_read_kernel, void *dst, uint32_t size, const void *src);
+static int BPF_FUNC(probe_read_user, void *dst, uint32_t size, const void *src);
+static int BPF_FUNC(probe_write_user, void *dst, const void *src, uint32_t len);
+static int BPF_FUNC(copy_from_user, void *dst, uint32_t size, const void *src);
 
 /* Time access */
 static uint64_t BPF_FUNC(ktime_get_ns);
@@ -235,8 +238,9 @@ static int BPF_FUNC(fib_lookup, void *ctx, struct bpf_fib_lookup *params, uint32
 
 /* Current Process Info */
 static uint64_t BPF_FUNC(get_current_task);
+static uint64_t BPF_FUNC(get_current_task_btf);
 static uint64_t BPF_FUNC(get_current_cgroup_id);
-static uint64_t BPF_FUNC(get_current_ancestor_cgroup_id);
+static uint64_t BPF_FUNC(get_current_ancestor_cgroup_id, int ancestor_level);
 static uint64_t BPF_FUNC(get_current_uid_gid);
 static uint64_t BPF_FUNC(get_current_pid_tgid);
 
@@ -252,7 +256,7 @@ static __u64 BPF_FUNC(get_attach_cookie, void *ctx);
 static int BPF_FUNC(perf_event_output, void *ctx, void *map, uint64_t flags, void *data, uint64_t size);
 
 static int BPF_FUNC(get_stack, void *ctx, void *buf, uint32_t size, uint64_t flags);
-static long BPF_FUNC(ringbuf_output, void *data, uint64_t size, uint64_t flags);
+static long BPF_FUNC(ringbuf_output, void *ringbuf, void *data, uint64_t size, uint64_t flags);
 static void *BPF_FUNC(ringbuf_reserve, void *ringbuf, uint64_t size, uint64_t flags);
 static void BPF_FUNC(ringbuf_submit, void *data, uint64_t flags);
 static void BPF_FUNC(ringbuf_discard, void *data, uint64_t flags);
@@ -267,32 +271,54 @@ static long BPF_FUNC(dynptr_read, void *dst, uint32_t len, const struct bpf_dynp
 static long BPF_FUNC(dynptr_write, const struct bpf_dynptr *dst, uint32_t offset, void *src, uint32_t len, uint64_t flags);
 static void BPF_FUNC(dynptr_data, const struct bpf_dynptr *ptr, uint32_t offset, uint32_t len);
 
-/** LLVM built-ins, mem*() routines work for constant size */
+static long BPF_FUNC(sock_ops_cb_flags_set, struct bpf_sock_ops *bpf_sock, int argval);
 
-#ifndef lock_xadd
-# define lock_xadd(ptr, val)	((void) __sync_fetch_and_add(ptr, val))
-#endif
+/* LSM */
+static long BPF_FUNC(ima_file_hash, struct file *file, void *dst, uint32_t size);
+static long BPF_FUNC(ima_inode_hash, struct inode *inode, void *dst, uint32_t size);
 
-#ifndef memset
-# define memset(s, c, n)	__builtin_memset((s), (c), (n))
-#endif
+static int BPF_FUNC(seq_write, struct seq_file *m, const void *data, uint32_t len);
 
-#ifndef memcpy
-# define memcpy(d, s, n)	__builtin_memcpy((d), (s), (n))
-#endif
+/* Tracing */
+static int BPF_FUNC(get_func_arg, void *ctx, __u32 n, __u64 *value);
+static int BPF_FUNC(get_func_ret, void *ctx, __u64 *value);
+static long BPF_FUNC(get_func_ip, void *ctx);
 
-#ifndef memmove
-# define memmove(d, s, n)	__builtin_memmove((d), (s), (n))
-#endif
-
-/* FIXME: __builtin_memcmp() is not yet fully useable unless llvm bug
- * https://llvm.org/bugs/show_bug.cgi?id=26218 gets resolved. Also
- * this one would generate a reloc entry (non-map), otherwise.
+/**
+ * atomic add is support from before 4.19 on both arm and x86,
+ * x86 has other atomics support from 5.11, arm from 5.17
  */
-#if 0
-#ifndef memcmp
-# define memcmp(a, b, n)	__builtin_memcmp((a), (b), (n))
+#if defined(__TARGET_ARCH_arm64) && defined(__V61_BPF_PROG)
+#define __HAS_ALL_ATOMICS 1
 #endif
+#if defined(__TARGET_ARCH_x86) && defined(__V511_BPF_PROG)
+#define __HAS_ALL_ATOMICS 1
 #endif
+
+#define lock_add(ptr, val)	((void)__sync_fetch_and_add(ptr, val))
+
+#ifdef __HAS_ALL_ATOMICS
+# define lock_or(ptr, val)	((void)__sync_fetch_and_or(ptr, val))
+# define lock_and(ptr, val)	((void)__sync_fetch_and_and(ptr, val))
+#else
+# define lock_or(ptr, val)	(*(ptr) |= val)
+# define lock_and(ptr, val)	(*(ptr) &= val)
+#endif
+
+enum {
+	__READ_ARG_1,
+	__READ_ARG_2,
+	__READ_ARG_ALL,
+};
+
+enum {
+	__FILTER_ARG_1,
+	__FILTER_ARG_2,
+	__FILTER_ARG_ALL,
+};
+
+// kfuncs
+extern int bpf_strnstr(const char *s1__ign, const char *s2__ign, size_t len) __weak __ksym;
+extern int bpf_strncasestr(const char *s1__ign, const char *s2__ign, size_t len) __weak __ksym;
 
 #endif /* __BPF_API__ */

@@ -23,6 +23,8 @@ package cgrouprate
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -32,22 +34,32 @@ import (
 	"github.com/cilium/tetragon/pkg/grpc/tracing"
 	"github.com/cilium/tetragon/pkg/ktime"
 	"github.com/cilium/tetragon/pkg/logger"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
 	"github.com/cilium/tetragon/pkg/metrics/cgroupratemetrics"
 	"github.com/cilium/tetragon/pkg/observer"
 	"github.com/cilium/tetragon/pkg/option"
 	"github.com/cilium/tetragon/pkg/reader/notify"
+	"github.com/cilium/tetragon/pkg/sensors"
+	"github.com/cilium/tetragon/pkg/sensors/base"
 	"github.com/cilium/tetragon/pkg/sensors/program"
-	"github.com/sirupsen/logrus"
 )
 
 const (
-	aliveCnt = 5
+	aliveCnt            = 5
+	cleanupInterval     = time.Minute
+	cleanupInactiveTime = time.Minute
+	cgRateMaxEntries    = 32768 // this value could be fine tuned
 )
 
-var (
-	handle     *CgroupRate
-	handleLock sync.RWMutex
-)
+type globalState struct {
+	cgRateMap        *program.Map
+	cgRateOptionsMap *program.Map
+
+	handle *CgroupRate
+	mu     sync.RWMutex
+}
+
+var glSt globalState
 
 type cgroupQueue struct {
 	id    uint64
@@ -57,18 +69,18 @@ type cgroupQueue struct {
 
 type CgroupRate struct {
 	listener observer.Listener
-	log      logrus.FieldLogger
+	log      logger.FieldLogger
 	ch       chan *cgroupQueue
 	opts     *option.CgroupRate
 	hash     *program.Map
 	cgroups  map[uint64]string
+	cleanup  time.Duration
 }
 
 func newCgroupRate(
 	listener observer.Listener,
 	hash *program.Map,
 	opts *option.CgroupRate) *CgroupRate {
-
 	return &CgroupRate{
 		listener: listener,
 		log:      logger.GetLogger(),
@@ -81,39 +93,43 @@ func newCgroupRate(
 
 func NewCgroupRate(ctx context.Context,
 	listener observer.Listener,
-	hash *program.Map,
-	opts *option.CgroupRate) {
-
+	opts *option.CgroupRate) error {
 	if opts.Events == 0 || opts.Interval == 0 {
-		logger.GetLogger().Infof("Cgroup rate disabled (%d/%s)",
-			opts.Events, time.Duration(opts.Interval).String())
-		return
+		logger.GetLogger().Info(fmt.Sprintf("Cgroup rate disabled (%d/%s)", opts.Events, time.Duration(opts.Interval).String()))
+		return nil
 	}
 
-	handleLock.Lock()
-	defer handleLock.Unlock()
+	glSt.mu.Lock()
+	defer glSt.mu.Unlock()
+	if glSt.cgRateMap == nil {
+		return errors.New("cgrouprate has not been registered to base sensor")
+	}
 
-	handle = newCgroupRate(listener, hash, opts)
-	go handle.process(ctx)
+	glSt.handle = newCgroupRate(listener, glSt.cgRateMap, opts)
+	go glSt.handle.process(ctx)
+	return nil
 }
 
 func NewTestCgroupRate(listener observer.Listener,
 	hash *program.Map,
 	opts *option.CgroupRate) {
-
-	handle = newCgroupRate(listener, hash, opts)
+	glSt.handle = newCgroupRate(listener, hash, opts)
 }
 
 func (r *CgroupRate) notify(msg notify.Message) {
 	if err := r.listener.Notify(msg); err != nil {
-		r.log.WithError(err).Warn("failed to notify listener")
+		r.log.Warn("failed to notify listener", logfields.Error, err)
 	}
 }
 
 func (r *CgroupRate) process(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
-	r.log.Infof("Cgroup rate started (%d/%s)",
-		r.opts.Events, time.Duration(r.opts.Interval).String())
+	r.log.Info(fmt.Sprintf("Cgroup rate started (%d/%s)", r.opts.Events, time.Duration(r.opts.Interval).String()))
+
+	defer func() {
+		// cleanup
+		glSt.handle = nil
+	}()
 
 	for {
 		select {
@@ -165,6 +181,42 @@ func (r *CgroupRate) processCgroups() {
 
 	for _, id := range remove {
 		delete(r.cgroups, id)
+	}
+
+	r.cleanupCgroups(last)
+}
+
+func (r *CgroupRate) cleanupCgroups(curr time.Duration) {
+	if r.cleanup == 0 {
+		r.cleanup = curr
+		return
+	}
+	// Run the cleanup once per cleanupInterval time
+	if curr-r.cleanup < cleanupInterval {
+		return
+	}
+	r.cleanup = curr
+
+	hash := r.hash.MapHandle
+	key := processapi.CgroupRateKey{}
+	values := make([]processapi.CgroupRateValue, bpf.GetNumPossibleCPUs())
+
+	entries := hash.Iterate()
+	for entries.Next(&key, &values) {
+		remove := true
+		// Remove values that are inactive for longer than cleanupInactiveTime time
+		for _, val := range values {
+			if time.Duration(val.Time)+cleanupInactiveTime > curr {
+				remove = false
+			}
+		}
+		if remove {
+			if err := hash.Delete(key); err != nil {
+				cgroupratemetrics.CgroupRateTotalInc(cgroupratemetrics.DeleteFail)
+			} else {
+				cgroupratemetrics.CgroupRateTotalInc(cgroupratemetrics.Delete)
+			}
+		}
 	}
 }
 
@@ -225,14 +277,14 @@ func (r *CgroupRate) processCgroup(id uint64, cgroup string, last uint64) bool {
 // Called from event handlers to kick off the cgroup rate
 // periodical check for event's cgroup.
 func Check(kube *processapi.MsgK8s, ktime uint64) {
-	if handle == nil {
+	if glSt.handle == nil {
 		return
 	}
 
-	handleLock.RLock()
-	defer handleLock.RUnlock()
+	glSt.mu.RLock()
+	defer glSt.mu.RUnlock()
 
-	if handle == nil {
+	if glSt.handle == nil {
 		return
 	}
 
@@ -242,27 +294,76 @@ func Check(kube *processapi.MsgK8s, ktime uint64) {
 		name:  string(kube.Docker[:]),
 	}
 
-	handle.ch <- cq
+	glSt.handle.ch <- cq
 	cgroupratemetrics.CgroupRateTotalInc(cgroupratemetrics.Check)
 }
 
-func Config(optsMap *program.Map) {
-	if handle == nil {
+func Config() {
+	if glSt.handle == nil {
 		return
 	}
 
-	if optsMap.MapHandle == nil {
-		handle.log.Warn("failed to update cgroup rate options map")
+	if glSt.cgRateOptionsMap.MapHandle == nil {
+		glSt.handle.log.Warn("failed to update cgroup rate options map")
 		return
 	}
 
 	key := uint32(0)
 	opts := processapi.CgroupRateOptions{
-		Events:   handle.opts.Events,
-		Interval: handle.opts.Interval,
+		Events:   glSt.handle.opts.Events,
+		Interval: glSt.handle.opts.Interval,
 	}
 
-	if err := optsMap.MapHandle.Put(key, opts); err != nil {
+	if err := glSt.cgRateOptionsMap.MapHandle.Put(key, opts); err != nil {
 		cgroupratemetrics.CgroupRateTotalInc(cgroupratemetrics.UpdateFail)
 	}
+}
+
+func RegisterCgroupRate(sensor *sensors.Sensor) (*sensors.Sensor, error) {
+	if !option.CgroupRateEnabled() {
+		return sensor, nil
+	}
+
+	glSt.mu.Lock()
+	defer glSt.mu.Unlock()
+
+	if glSt.handle != nil {
+		return nil, errors.New("cgrouprate: handle is already set, need to cleanup first")
+	}
+
+	var rateProgs []*program.Program
+	var optsProgs []*program.Program
+	for _, p := range sensor.Progs {
+		if base.IsExecve(p) || base.IsFork(p) || base.IsExit(p) {
+			rateProgs = append(rateProgs, p)
+		}
+		if base.IsExecve(p) {
+			optsProgs = append(optsProgs, p)
+		}
+	}
+
+	if len(optsProgs) == 0 || len(rateProgs) == 0 {
+		return nil, errors.New("failed to find base programs")
+	}
+
+	cgRmdirProg := program.Builder(
+		"bpf_cgroup.o",
+		"cgroup/cgroup_rmdir",
+		"raw_tracepoint/cgroup_rmdir",
+		"tg_cgroup_rmdir",
+		"raw_tracepoint",
+	).SetPolicy(optsProgs[0].Policy)
+	rateProgs = append(rateProgs, cgRmdirProg)
+
+	glSt.cgRateMap = program.MapBuilder("cgroup_rate_map", rateProgs...)
+	glSt.cgRateMap.SetMaxEntries(cgRateMaxEntries)
+	glSt.cgRateOptionsMap = program.MapBuilder("cgroup_rate_options_map", optsProgs...)
+
+	sensor.Progs = append(sensor.Progs, cgRmdirProg)
+	sensor.Maps = append(sensor.Maps, glSt.cgRateMap, glSt.cgRateOptionsMap)
+	return sensor, nil
+}
+
+func init() {
+	base.RegisterExtensionAtInit("cgroup_rate", RegisterCgroupRate)
 }

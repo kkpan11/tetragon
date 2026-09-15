@@ -109,11 +109,9 @@ func startParseAndLog(
 	logPrefix string,
 	lp LineParser,
 ) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		parseAndLog(t, rd, logPrefix, lp)
-	}()
+	})
 }
 
 // ParseAndLogCmdOutput will log command output using t.Log, and also call the
@@ -128,6 +126,21 @@ func (cbp *CmdBufferedPipes) ParseAndLogCmdOutput(
 	startParseAndLog(t, &wg, cbp.StdoutRd, "stdout>", parseOut)
 	startParseAndLog(t, &wg, cbp.StderrRd, "stderr>", parseErr)
 	return &wg
+}
+
+func RunCmdAndLogOutput(t *testing.T, cmd *exec.Cmd) error {
+	cbp, err := NewCmdBufferedPipes(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cmd.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cbp.Close()
+	wg := cbp.ParseAndLogCmdOutput(t, nil, nil)
+	wg.Wait()
+	return cmd.Wait()
 }
 
 // MockPipedFile mocks the file being piped into stdin, similarly as what you

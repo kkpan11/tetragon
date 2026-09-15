@@ -4,6 +4,7 @@
 package caps
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,16 +14,17 @@ import (
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/api/processapi"
+	"github.com/cilium/tetragon/pkg/constants"
 	"github.com/cilium/tetragon/pkg/logger"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
 	"github.com/cilium/tetragon/pkg/option"
 	"github.com/cilium/tetragon/pkg/reader/namespace"
-	"golang.org/x/sys/unix"
 )
 
 var (
 	// Set default last capability based on upstream unix go library
-	cap_last_cap = int32(unix.CAP_LAST_CAP)
-	lastCapOnce  sync.Once
+	capLastCap  = int32(constants.CAP_LAST_CAP)
+	lastCapOnce sync.Once
 )
 
 // GetLastCap() Returns unix.CAP_LAST_CAP unless the kernel
@@ -31,39 +33,38 @@ func GetLastCap() int32 {
 	lastCapOnce.Do(func() {
 		d, err := os.ReadFile(filepath.Join(option.Config.ProcFS, "/sys/kernel/cap_last_cap"))
 		if err != nil {
-			logger.GetLogger().WithError(err).Warnf("Could not read kernel cap_last_cap, using default '%d' as cap_last_cap", cap_last_cap)
+			logger.GetLogger().Warn(fmt.Sprintf("Could not read kernel cap_last_cap, using default '%d' as cap_last_cap", capLastCap), logfields.Error, err)
 		}
 		val, err := strconv.ParseInt(strings.TrimRight(string(d), "\n"), 10, 32)
 		if err != nil {
-			logger.GetLogger().WithError(err).Warnf("Could not parse cap_last_cap, using default '%d' as cap_last_cap", cap_last_cap)
+			logger.GetLogger().Warn(fmt.Sprintf("Could not parse cap_last_cap, using default '%d' as cap_last_cap", capLastCap), logfields.Error, err)
 			return
 		}
 		// just silence some CodeQL
-		if val >= 0 && val < unix.CAP_LAST_CAP {
-			cap_last_cap = int32(val)
+		if val >= 0 && val < constants.CAP_LAST_CAP {
+			capLastCap = int32(val)
 		}
 	})
-	return cap_last_cap
+	return capLastCap
 }
 
 func isCapValid(capInt int32) bool {
-	if capInt >= 0 && capInt <= unix.CAP_LAST_CAP {
+	if capInt >= 0 && capInt <= constants.CAP_LAST_CAP {
 		return true
 	}
 
 	return false
 }
 
-// AreSubset() Checks if "a" is a subset of "set"
-// Rerturns true if all "a" capabilities are also in "set", otherwise
-// false.
+// AreSubset checks if "a" is a subset of "set". Returns true if all "a"
+// capabilities are also in "set", otherwise false.
 func AreSubset(a uint64, set uint64) bool {
-	return (!((a & ^uint64(set)) != 0))
+	return (a & set) == a
 }
 
 // capToMask() returns the mask of the corresponding u32
-func capToMask(cap int32) uint32 {
-	return uint32(1 << ((cap) & 31))
+func capToMask(capability int32) uint32 {
+	return uint32(1 << ((capability) & 31))
 }
 
 // GetCapsFullSet() Returns up to date (go unix library) full set.
@@ -91,7 +92,7 @@ func GetCapability(capInt int32) (string, error) {
 
 func GetCapabilities(capInt uint64) string {
 	var caps []string
-	for i := uint64(0); i < 64; i++ {
+	for i := range uint64(64) {
 		if (1<<i)&capInt != 0 {
 			caps = append(caps, capabilitiesString[i])
 		}
@@ -418,7 +419,7 @@ func GetPIDCaps(filename string) (uint32, uint64, uint64, uint64) {
 	getValue64Hex := func(line string) (uint64, error) {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
-			return 0, fmt.Errorf("Fields to few arguments")
+			return 0, errors.New("fields to few arguments")
 		}
 		pidField := fields[len(fields)-1]
 		pid, err := strconv.ParseUint(pidField, 16, 64)
@@ -428,7 +429,7 @@ func GetPIDCaps(filename string) (uint32, uint64, uint64, uint64) {
 	getValue32Int := func(line string) (uint32, error) {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
-			return 0, fmt.Errorf("Fields to few arguments")
+			return 0, errors.New("fields to few arguments")
 		}
 		pidField := fields[len(fields)-1]
 		pid, err := strconv.ParseUint(pidField, 10, 32)
@@ -437,11 +438,11 @@ func GetPIDCaps(filename string) (uint32, uint64, uint64, uint64) {
 
 	file, err := os.ReadFile(filename)
 	if err != nil {
-		logger.GetLogger().WithError(err).Warnf("ReadFile failed: %s", filename)
+		logger.GetLogger().Warn("ReadFile failed"+filename, logfields.Error, err)
 		return 0, 0, 0, 0
 	}
-	statuslines := strings.Split(string(file), "\n")
-	for _, line := range statuslines {
+	statuslines := strings.SplitSeq(string(file), "\n")
+	for line := range statuslines {
 		err = nil
 		if strings.Contains(line, "NStgid:") {
 			pid, err = getValue32Int(line)
@@ -456,7 +457,7 @@ func GetPIDCaps(filename string) (uint32, uint64, uint64, uint64) {
 			inheritable, err = getValue64Hex(line)
 		}
 		if err != nil {
-			logger.GetLogger().WithError(err).Warnf("ReadFile (%s) error: %s", line, filename)
+			logger.GetLogger().Warn(fmt.Sprintf("ReadFile (%s) error: %s", line, filename), logfields.Error, err)
 		}
 	}
 	return pid, permitted, effective, inheritable
@@ -464,7 +465,7 @@ func GetPIDCaps(filename string) (uint32, uint64, uint64, uint64) {
 
 func GetCapabilitiesTypes(capInt uint64) []tetragon.CapabilitiesType {
 	var caps []tetragon.CapabilitiesType
-	for i := uint64(0); i < 64; i++ {
+	for i := range uint64(64) {
 		if (1<<i)&capInt != 0 {
 			e := tetragon.CapabilitiesType(i)
 			caps = append(caps, e)

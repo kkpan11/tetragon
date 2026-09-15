@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 // This package contains an end-to-end test for event labels.
 package labels_test
 
@@ -10,14 +12,17 @@ import (
 	"testing"
 	"time"
 
+	"sigs.k8s.io/e2e-framework/pkg/envconf"
+	"sigs.k8s.io/e2e-framework/pkg/features"
+	"sigs.k8s.io/e2e-framework/third_party/helm"
+
+	"github.com/cilium/tetragon/tests/e2e/metricschecker"
+
 	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
 	sm "github.com/cilium/tetragon/pkg/matchers/stringmatcher"
 	"github.com/cilium/tetragon/tests/e2e/checker"
 	"github.com/cilium/tetragon/tests/e2e/helpers"
 	"github.com/cilium/tetragon/tests/e2e/runners"
-	"sigs.k8s.io/e2e-framework/pkg/envconf"
-	"sigs.k8s.io/e2e-framework/pkg/features"
-	"sigs.k8s.io/e2e-framework/third_party/helm"
 )
 
 // This holds our test environment which we get from calling runners.NewRunner().Setup()
@@ -40,7 +45,7 @@ func installDemoApp(labelsChecker *checker.RPCChecker) features.Func {
 			t.Fatalf("failed to update helm repo: %s", err)
 		}
 
-		for i := 0; i < demoAppRetry; i++ {
+		for range demoAppRetry {
 			if err := manager.RunInstall(
 				helm.WithName("otel-demo"),
 				helm.WithChart("open-telemetry/opentelemetry-demo"),
@@ -95,9 +100,6 @@ func TestMain(m *testing.M) {
 }
 
 func TestLabelsDemoApp(t *testing.T) {
-	// Must be called at the beginning of every test
-	runner.SetupExport(t)
-
 	labelsChecker := labelsEventChecker().WithEventLimit(5000).WithTimeLimit(5 * time.Minute)
 
 	// This starts labelsChecker and uses it to run event checks.
@@ -115,8 +117,13 @@ func TestLabelsDemoApp(t *testing.T) {
 	uninstall := features.New("Uninstall Demo App").
 		Assess("Uninstall", uninstallDemoApp()).Feature()
 
+	metricsChecker := metricschecker.NewMetricsChecker("labelsMetricsChecker")
+	metrics := features.New("Run Metrics Checks").
+		Assess("Run Metrics Checks", metricsChecker.Greater("tetragon_events_total", 0)).Feature()
+
 	// Spawn workload and run checker
 	runner.TestInParallel(t, runEventChecker, runWorkload)
+	runner.Test(t, metrics)
 	runner.Test(t, uninstall)
 }
 

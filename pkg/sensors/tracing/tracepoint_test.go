@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -15,30 +20,28 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cilium/ebpf"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
+
 	"github.com/cilium/tetragon/api/v1/tetragon"
-	"github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
 	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
+	"github.com/cilium/tetragon/pkg/config"
 	"github.com/cilium/tetragon/pkg/grpc/tracing"
 	"github.com/cilium/tetragon/pkg/jsonchecker"
 	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
 	"github.com/cilium/tetragon/pkg/kernels"
 	"github.com/cilium/tetragon/pkg/logger"
 	lc "github.com/cilium/tetragon/pkg/matchers/listmatcher"
-	sm "github.com/cilium/tetragon/pkg/matchers/stringmatcher"
-	smatcher "github.com/cilium/tetragon/pkg/matchers/stringmatcher"
+	"github.com/cilium/tetragon/pkg/matchers/stringmatcher"
 	"github.com/cilium/tetragon/pkg/observer/observertesthelper"
 	"github.com/cilium/tetragon/pkg/policyfilter"
 	"github.com/cilium/tetragon/pkg/reader/notify"
-	"github.com/cilium/tetragon/pkg/sensors"
 	testsensor "github.com/cilium/tetragon/pkg/sensors/test"
 	"github.com/cilium/tetragon/pkg/testutils"
+	tuo "github.com/cilium/tetragon/pkg/testutils/observer"
 	"github.com/cilium/tetragon/pkg/testutils/perfring"
+	"github.com/cilium/tetragon/pkg/testutils/policytest"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
-	"github.com/sirupsen/logrus"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"golang.org/x/sys/unix"
 
 	_ "github.com/cilium/tetragon/pkg/sensors/exec"
 )
@@ -47,11 +50,6 @@ var (
 	whenceBogusValue = 4444
 	fdBogusValue     = uint64(18446744073709551615) // -1
 )
-
-func TestMain(m *testing.M) {
-	ec := tus.TestSensorsRun(m, "SensorTracing")
-	os.Exit(ec)
-}
 
 // TestGenericTracepointSimple is a simple generic tracepoint test that creates a tracepoint for lseek()
 func TestGenericTracepointSimple(t *testing.T) {
@@ -81,17 +79,19 @@ func TestGenericTracepointSimple(t *testing.T) {
 		t.Fatalf("GetDefaultObserver error: %s", err)
 	}
 
-	sm := tus.GetTestSensorManager(ctx, t)
+	sm := tuo.GetTestSensorManager(t)
 	// create and add sensor
-	sensor, err := createGenericTracepointSensor(&spec, "GtpLseekTest", policyfilter.NoFilterID, "policyName", nil)
+	policyInfo, err := newPolicyInfoFromSpec("", "policyName", policyfilter.NoFilterID, &spec, nil)
+	require.NoError(t, err)
+	sensor, err := createGenericTracepointSensor(&spec, "GtpLseekTest", policyInfo, nil)
 	if err != nil {
 		t.Fatalf("failed to create generic tracepoint sensor: %s", err)
 	}
 	sm.AddAndEnableSensor(ctx, t, sensor, "GtpLseekTest")
 
 	tpChecker := ec.NewProcessTracepointChecker("").
-		WithSubsys(smatcher.Full("syscalls")).
-		WithEvent(smatcher.Full("sys_enter_lseek")).
+		WithSubsys(stringmatcher.Full("syscalls")).
+		WithEvent(stringmatcher.Full("sys_enter_lseek")).
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
@@ -105,14 +105,14 @@ func TestGenericTracepointSimple(t *testing.T) {
 	unix.Seek(-1, 0, whenceBogusValue)
 	time.Sleep(1000 * time.Millisecond)
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 // doTestGenericTracepointPidFilter is a utility function for doing generic
 // tracepoint tests. It filters events based on the test program's pid, so that
 // we get more predictable results.
 func doTestGenericTracepointPidFilter(t *testing.T, conf v1alpha1.TracepointSpec, selfOp func(), checkFn func(*tetragon.ProcessTracepoint) error) {
-	if _, err := os.Stat("/sys/kernel/debug/tracing/events/syscalls"); os.IsNotExist(err) {
+	if !testutils.CheckKernelTracingExists() {
 		t.Skip("cannot use syscall tracepoints (consider enabling CONFIG_FTRACE_SYSCALLS)")
 	}
 
@@ -145,9 +145,11 @@ func doTestGenericTracepointPidFilter(t *testing.T, conf v1alpha1.TracepointSpec
 		Lists:       []v1alpha1.ListSpec{},
 	}
 
-	sm := tus.GetTestSensorManager(ctx, t)
+	sm := tuo.GetTestSensorManager(t)
 	// create and add sensor
-	sensor, err := createGenericTracepointSensor(&spec, "GtpLseekTest", policyfilter.NoFilterID, "policyName", nil)
+	policyInfo, err := newPolicyInfoFromSpec("", "policyName", policyfilter.NoFilterID, &spec, nil)
+	require.NoError(t, err)
+	sensor, err := createGenericTracepointSensor(&spec, "GtpLseekTest", policyInfo, nil)
 	if err != nil {
 		t.Fatalf("failed to create generic tracepoint sensor: %s", err)
 	}
@@ -162,7 +164,7 @@ func doTestGenericTracepointPidFilter(t *testing.T, conf v1alpha1.TracepointSpec
 	t.Log("Marked test end")
 
 	tpEventsNr := 0
-	nextCheck := func(event ec.Event, _ *logrus.Logger) (bool, error) {
+	nextCheck := func(event ec.Event, _ *slog.Logger) (bool, error) {
 		switch tpEvent := event.(type) {
 		case *tetragon.ProcessTracepoint:
 			if err := checkFn(tpEvent); err != nil {
@@ -179,7 +181,7 @@ func doTestGenericTracepointPidFilter(t *testing.T, conf v1alpha1.TracepointSpec
 
 		}
 	}
-	finalCheck := func(_ *logrus.Logger) error {
+	finalCheck := func(_ *slog.Logger) error {
 		defer func() { tpEventsNr = 0 }()
 		// NB: in some cases we get more than one events. I think this
 		// might be due to -EINTR or similar return values.
@@ -220,10 +222,10 @@ func TestGenericTracepointPidFilterLseek(t *testing.T) {
 }
 
 func TestGenericTracepointArgFilterLseek(t *testing.T) {
-	fd_u := int32(100)
+	fdU := int32(100)
 	fd := 100
-	whence_u := uint64(whenceBogusValue)
-	whenceStr := fmt.Sprintf("%d", whenceBogusValue)
+	whenceU := uint64(whenceBogusValue)
+	whenceStr := strconv.Itoa(whenceBogusValue)
 	whence := whenceBogusValue
 
 	tracepointConf := v1alpha1.TracepointSpec{
@@ -265,7 +267,7 @@ func TestGenericTracepointArgFilterLseek(t *testing.T) {
 			return fmt.Errorf("unexpected first arg: %s", event.Args[0])
 		}
 		xwhence := arg0.SizeArg
-		if xwhence != whence_u {
+		if xwhence != whenceU {
 			return fmt.Errorf("unexpected arg val. got:%d expecting:%d", xwhence, whence)
 		}
 		arg1, ok := event.Args[1].GetArg().(*tetragon.KprobeArgument_IntArg)
@@ -273,7 +275,70 @@ func TestGenericTracepointArgFilterLseek(t *testing.T) {
 			return fmt.Errorf("unexpected first arg: %s", event.Args[1])
 		}
 		xfd := arg1.IntArg
-		if xfd != fd_u {
+		if xfd != fdU {
+			return fmt.Errorf("unexpected arg val. got:%d expecting:%d", xfd, fd)
+		}
+		return nil
+	}
+
+	doTestGenericTracepointPidFilter(t, tracepointConf, op, check)
+}
+
+func TestGenericTracepointArgFilterLseekIntType(t *testing.T) {
+	fdU := int32(100)
+	fd := 100
+	whenceU := int32(whenceBogusValue)
+	whenceStr := strconv.Itoa(whenceBogusValue)
+	whence := whenceBogusValue
+
+	tracepointConf := v1alpha1.TracepointSpec{
+		Subsystem: "syscalls",
+		Event:     "sys_enter_lseek",
+		Args: []v1alpha1.KProbeArg{
+			{
+				Index: 7, Type: "int", /* whence, forced generic int type */
+			},
+			{
+				Index: 5, Type: "sint32", /* fd */
+			},
+		},
+		Selectors: []v1alpha1.KProbeSelector{
+			{
+				MatchArgs: []v1alpha1.ArgSelector{
+					{
+						Index:    7,
+						Operator: "Equal",
+						Values:   []string{whenceStr},
+					},
+				},
+			},
+		},
+	}
+
+	op := func() {
+		t.Logf("Calling lseek...\n")
+		unix.Seek(fd, 0, whence)
+		unix.Seek(fd, 0, whence+1)
+	}
+
+	check := func(event *tetragon.ProcessTracepoint) error {
+		if len(event.Args) != 2 {
+			return fmt.Errorf("unexpected number of arguments: %d", len(event.Args))
+		}
+		arg0, ok := event.Args[0].GetArg().(*tetragon.KprobeArgument_IntArg)
+		if !ok {
+			return fmt.Errorf("unexpected first arg: %s", event.Args[0])
+		}
+		xwhence := arg0.IntArg
+		if xwhence != whenceU {
+			return fmt.Errorf("unexpected arg val. got:%d expecting:%d", xwhence, whence)
+		}
+		arg1, ok := event.Args[1].GetArg().(*tetragon.KprobeArgument_IntArg)
+		if !ok {
+			return fmt.Errorf("unexpected second arg: %s", event.Args[1])
+		}
+		xfd := arg1.IntArg
+		if xfd != fdU {
 			return fmt.Errorf("unexpected arg val. got:%d expecting:%d", xfd, fd)
 		}
 		return nil
@@ -286,7 +351,7 @@ func TestGenericTracepointMeta(t *testing.T) {
 	// We want to write to a file so we can filter by non-stdout fd and thus avoid
 	// catching all the writes to test logs
 	fd, err := syscall.Open("/tmp/testificate", syscall.O_CREAT|syscall.O_WRONLY, 0o644)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	defer func() { syscall.Unlink("/tmp/testificate") }()
 
 	tracepointConf := v1alpha1.TracepointSpec{
@@ -306,7 +371,7 @@ func TestGenericTracepointMeta(t *testing.T) {
 			MatchArgs: []v1alpha1.ArgSelector{{
 				Index:    5,
 				Operator: "eq",
-				Values:   []string{fmt.Sprint(fd)},
+				Values:   []string{strconv.Itoa(fd)},
 			}},
 		}},
 	}
@@ -331,7 +396,7 @@ func TestGenericTracepointMeta(t *testing.T) {
 		}
 		arg1 := string(arg1_.BytesArg)
 		if arg1 != "hello world" {
-			return fmt.Errorf("Arg does not match \"hello world\"")
+			return errors.New("Arg does not match \"hello world\"")
 		}
 		return nil
 	}
@@ -358,10 +423,10 @@ func TestGenericTracepointRawSyscall(t *testing.T) {
 		Subsystem: "raw_syscalls",
 		Event:     "sys_enter",
 		Args: []v1alpha1.KProbeArg{
-			v1alpha1.KProbeArg{
+			{
 				Index: 4, /* id */
 			},
-			v1alpha1.KProbeArg{
+			{
 				Index: 5, /* args */
 			},
 		},
@@ -371,7 +436,7 @@ func TestGenericTracepointRawSyscall(t *testing.T) {
 					{
 						Index:    4,
 						Operator: "Equal",
-						Values:   []string{fmt.Sprintf("%d", unix.SYS_LSEEK)},
+						Values:   []string{strconv.Itoa(unix.SYS_LSEEK)},
 					},
 				},
 			},
@@ -408,7 +473,7 @@ func TestGenericTracepointRawSyscall(t *testing.T) {
 
 		var err error
 		args := make([]uint64, 3)
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			args[i], err = getSizeArg(i + 1)
 			if err != nil {
 				return err
@@ -425,86 +490,8 @@ func TestGenericTracepointRawSyscall(t *testing.T) {
 	doTestGenericTracepointPidFilter(t, tracepointConf, op, check)
 }
 
-func TestLoadTracepointSensor(t *testing.T) {
-	var sensorProgs = []tus.SensorProg{
-		0: tus.SensorProg{Name: "generic_tracepoint_event", Type: ebpf.TracePoint},
-		1: tus.SensorProg{Name: "generic_tracepoint_arg", Type: ebpf.TracePoint},
-		2: tus.SensorProg{Name: "generic_tracepoint_process_event", Type: ebpf.TracePoint},
-		3: tus.SensorProg{Name: "generic_tracepoint_filter", Type: ebpf.TracePoint},
-		4: tus.SensorProg{Name: "generic_tracepoint_actions", Type: ebpf.TracePoint},
-		5: tus.SensorProg{Name: "generic_tracepoint_output", Type: ebpf.TracePoint},
-	}
-
-	var sensorMaps = []tus.SensorMap{
-		// all programs
-		tus.SensorMap{Name: "tp_heap", Progs: []uint{0, 1, 2, 3, 4, 5}},
-
-		// all but generic_tracepoint_output
-		tus.SensorMap{Name: "tp_calls", Progs: []uint{0, 1, 2, 3, 4}},
-
-		// only generic_tracepoint_event*
-		tus.SensorMap{Name: "buffer_heap_map", Progs: []uint{2}},
-
-		// all but generic_tracepoint_event,generic_tracepoint_filter
-		tus.SensorMap{Name: "retprobe_map", Progs: []uint{1, 2}},
-
-		// generic_tracepoint_output
-		tus.SensorMap{Name: "tcpmon_map", Progs: []uint{5}},
-
-		// all kprobe but generic_tracepoint_filter
-		tus.SensorMap{Name: "config_map", Progs: []uint{0, 2}},
-
-		// generic_tracepoint_event
-		tus.SensorMap{Name: "tg_conf_map", Progs: []uint{0}},
-	}
-
-	if kernels.EnableLargeProgs() {
-		// shared with base sensor
-		sensorMaps = append(sensorMaps, tus.SensorMap{Name: "execve_map", Progs: []uint{3, 4, 5}})
-	} else {
-		// shared with base sensor
-		sensorMaps = append(sensorMaps, tus.SensorMap{Name: "execve_map", Progs: []uint{3}})
-	}
-
-	readHook := `
-apiVersion: cilium.io/v1alpha1
-kind: TracingPolicy
-metadata:
-  name: "raw-syscalls"
-spec:
-  tracepoints:
-    - subsystem: "raw_syscalls"
-      event: "sys_enter"
-      # args: add both the syscall id, and the array with the arguments
-      args:
-        - index: 4
-        - index: 5
-`
-
-	var sens []*sensors.Sensor
-	var err error
-
-	readConfigHook := []byte(readHook)
-	err = os.WriteFile(testConfigFile, readConfigHook, 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
-	}
-	sens, err = observertesthelper.GetDefaultSensorsWithFile(t, testConfigFile, tus.Conf().TetragonLib)
-	if err != nil {
-		t.Fatalf("GetDefaultObserverWithFile error: %s", err)
-	}
-
-	tus.CheckSensorLoad(sens, sensorMaps, sensorProgs, t)
-
-	sensi := make([]sensors.SensorIface, 0, len(sens))
-	for _, s := range sens {
-		sensi = append(sensi, s)
-	}
-	sensors.UnloadSensors(sensi)
-}
-
 func TestTracepointCloneThreads(t *testing.T) {
-	testutils.CaptureLog(t, logger.GetLogger().(*logrus.Logger))
+	testutils.CaptureLog(t, logger.GetLogger())
 	var doneWG, readyWG sync.WaitGroup
 	defer doneWG.Wait()
 
@@ -541,9 +528,11 @@ func TestTracepointCloneThreads(t *testing.T) {
 		t.Fatalf("GetDefaultObserver error: %s", err)
 	}
 
-	sm := tus.GetTestSensorManager(ctx, t)
+	sm := tuo.GetTestSensorManager(t)
 	// create and add sensor
-	sensor, err := createGenericTracepointSensor(&spec, "GtpLseekTest", policyfilter.NoFilterID, "policyName", nil)
+	policyInfo, err := newPolicyInfoFromSpec("", "policyName", policyfilter.NoFilterID, &spec, nil)
+	require.NoError(t, err)
+	sensor, err := createGenericTracepointSensor(&spec, "GtpLseekTest", policyInfo, nil)
 	if err != nil {
 		t.Fatalf("failed to create generic tracepoint sensor: %s", err)
 	}
@@ -565,7 +554,7 @@ func TestTracepointCloneThreads(t *testing.T) {
 	cti.AssertPidsTids(t)
 
 	parentCheck := ec.NewProcessChecker().
-		WithBinary(smatcher.Suffix("threads-tester")).
+		WithBinary(stringmatcher.Suffix("threads-tester")).
 		WithPid(cti.ParentPid).
 		WithTid(cti.ParentTid)
 
@@ -576,13 +565,13 @@ func TestTracepointCloneThreads(t *testing.T) {
 		WithProcess(parentCheck)
 
 	child1Checker := ec.NewProcessChecker().
-		WithBinary(smatcher.Suffix("threads-tester")).
+		WithBinary(stringmatcher.Suffix("threads-tester")).
 		WithPid(cti.Child1Pid).
 		WithTid(cti.Child1Tid)
 
 	child1TpChecker := ec.NewProcessTracepointChecker("").
-		WithSubsys(smatcher.Full("syscalls")).
-		WithEvent(smatcher.Full("sys_enter_lseek")).
+		WithSubsys(stringmatcher.Full("syscalls")).
+		WithEvent(stringmatcher.Full("sys_enter_lseek")).
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
@@ -591,13 +580,13 @@ func TestTracepointCloneThreads(t *testing.T) {
 			)).WithProcess(child1Checker).WithParent(parentCheck)
 
 	thread1Checker := ec.NewProcessChecker().
-		WithBinary(smatcher.Suffix("threads-tester")).
+		WithBinary(stringmatcher.Suffix("threads-tester")).
 		WithPid(cti.Thread1Pid).
 		WithTid(cti.Thread1Tid)
 
 	thread1TpChecker := ec.NewProcessTracepointChecker("").
-		WithSubsys(smatcher.Full("syscalls")).
-		WithEvent(smatcher.Full("sys_enter_lseek")).
+		WithSubsys(stringmatcher.Full("syscalls")).
+		WithEvent(stringmatcher.Full("sys_enter_lseek")).
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
@@ -608,7 +597,7 @@ func TestTracepointCloneThreads(t *testing.T) {
 	checker := ec.NewUnorderedEventChecker(execCheck, child1TpChecker, thread1TpChecker, exitCheck)
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestTracepointForceType(t *testing.T) {
@@ -638,11 +627,7 @@ spec:
       type: "int32"
 `
 
-	lseekConfigHook := []byte(lseekConfigHook_)
-	err := os.WriteFile(testConfigFile, lseekConfigHook, 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
-	}
+	createCrdFile(t, lseekConfigHook_)
 
 	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
 	if err != nil {
@@ -673,7 +658,7 @@ spec:
 	cti.AssertPidsTids(t)
 
 	parentCheck := ec.NewProcessChecker().
-		WithBinary(smatcher.Suffix("threads-tester")).
+		WithBinary(stringmatcher.Suffix("threads-tester")).
 		WithPid(cti.ParentPid).
 		WithTid(cti.ParentTid)
 
@@ -684,14 +669,14 @@ spec:
 		WithProcess(parentCheck)
 
 	child1Checker := ec.NewProcessChecker().
-		WithBinary(smatcher.Suffix("threads-tester")).
+		WithBinary(stringmatcher.Suffix("threads-tester")).
 		WithPid(cti.Child1Pid).
 		WithTid(cti.Child1Tid)
 
 	child1TpChecker := ec.NewProcessTracepointChecker("").
-		WithSubsys(smatcher.Full("syscalls")).
-		WithEvent(smatcher.Full("sys_enter_lseek")).
-		WithMessage(sm.Full("System call lseek tracepoint test")).
+		WithSubsys(stringmatcher.Full("syscalls")).
+		WithEvent(stringmatcher.Full("sys_enter_lseek")).
+		WithMessage(stringmatcher.Full("System call lseek tracepoint test")).
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
@@ -700,14 +685,14 @@ spec:
 			)).WithProcess(child1Checker).WithParent(parentCheck)
 
 	thread1Checker := ec.NewProcessChecker().
-		WithBinary(smatcher.Suffix("threads-tester")).
+		WithBinary(stringmatcher.Suffix("threads-tester")).
 		WithPid(cti.Thread1Pid).
 		WithTid(cti.Thread1Tid)
 
 	thread1TpChecker := ec.NewProcessTracepointChecker("").
-		WithSubsys(smatcher.Full("syscalls")).
-		WithEvent(smatcher.Full("sys_enter_lseek")).
-		WithMessage(sm.Full("System call lseek tracepoint test")).
+		WithSubsys(stringmatcher.Full("syscalls")).
+		WithEvent(stringmatcher.Full("sys_enter_lseek")).
+		WithMessage(stringmatcher.Full("System call lseek tracepoint test")).
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
@@ -718,11 +703,11 @@ spec:
 	checker := ec.NewUnorderedEventChecker(execCheck, child1TpChecker, thread1TpChecker, exitCheck)
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestStringTracepoint(t *testing.T) {
-	testutils.CaptureLog(t, logger.GetLogger().(*logrus.Logger))
+	testutils.CaptureLog(t, logger.GetLogger())
 	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
 	defer cancel()
 
@@ -780,17 +765,86 @@ func TestStringTracepoint(t *testing.T) {
 	require.Equal(t, 1, countPizza, "expected events with 'pizzaisthebest'")
 }
 
-func testListSyscallsDupsRange(t *testing.T, checker *eventchecker.UnorderedEventChecker, configHook string) {
+func TestUInt16Tracepoint(t *testing.T) {
+	if !config.EnableLargeProgs() {
+		t.Skip("skipping test due to lack of large prog support which is required for uint16")
+	}
+
+	testutils.CaptureLog(t, logger.GetLogger())
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	spec := &v1alpha1.TracingPolicySpec{
+		Tracepoints: []v1alpha1.TracepointSpec{{
+			Subsystem: "tcp",
+			Event:     "tcp_destroy_sock",
+			Args: []v1alpha1.KProbeArg{{
+				Index: 5,
+				Type:  "uint16",
+			}, {
+				Index: 6,
+				Type:  "uint16",
+			}, {
+				Index: 8,
+				Type:  "uint32",
+			}, {
+				Index: 9,
+				Type:  "uint32",
+			}},
+			Selectors: []v1alpha1.KProbeSelector{{
+				MatchArgs: []v1alpha1.ArgSelector{{
+					Args:     []uint32{uint32(0)},
+					Operator: "Equal",
+					Values:   []string{"7777"},
+				}},
+			}, {
+				MatchArgs: []v1alpha1.ArgSelector{{
+					Args:     []uint32{uint32(0)},
+					Operator: "InRange",
+					Values:   []string{"7779:7780"},
+				}},
+			}},
+		}},
+	}
+
+	loadGenericSensorTest(t, spec)
+	t0 := time.Now()
+	loadElapsed := time.Since(t0)
+	t.Logf("loading sensors took: %s\n", loadElapsed)
+
+	count := 0
+	eventFn := func(ev notify.Message) error {
+		if tpEvent, ok := ev.(*tracing.MsgGenericTracepointUnix); ok {
+			if tpEvent.Event != "tcp_destroy_sock" {
+				return fmt.Errorf("unexpected tracepoint event, %s:%s", tpEvent.Subsys, tpEvent.Event)
+			}
+			count++
+		}
+		return nil
+	}
+
+	ops := func() {
+		for port := 7776; port <= 7781; port++ {
+			listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+			if err != nil {
+				panic(err)
+			}
+			listener.Close()
+		}
+	}
+
+	perfring.RunTest(t, ctx, ops, eventFn)
+	require.Equal(t, 3, count, "expected three events: one for each of 7777, 7779 and 7780")
+}
+
+func testListSyscallsDupsRange(t *testing.T, checker *ec.UnorderedEventChecker, configHook string, fentry bool) {
 	var doneWG, readyWG sync.WaitGroup
 	defer doneWG.Wait()
 
 	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
 	defer cancel()
 
-	err := os.WriteFile(testConfigFile, []byte(configHook), 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
-	}
+	createCrdFileFlag(t, configHook, fentry)
 
 	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
 	if err != nil {
@@ -804,7 +858,7 @@ func testListSyscallsDupsRange(t *testing.T, checker *eventchecker.UnorderedEven
 	}
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestTracepointListSyscallDupsRange(t *testing.T) {
@@ -860,12 +914,16 @@ spec:
 			WithArgs(ec.NewKprobeArgumentListMatcher().
 				WithOperator(lc.Ordered).
 				WithValues(
-					ec.NewKprobeArgumentChecker().WithSizeArg(syscall.SYS_DUP),
+					ec.NewKprobeArgumentChecker().WithSyscallId(mkSysIDChecker(t, unix.SYS_DUP)),
 					ec.NewKprobeArgumentChecker().WithSizeArg(uint64(i)),
 				))
 
 		checker.AddChecks(tpCheckerDup)
 	}
 
-	testListSyscallsDupsRange(t, checker, configHook)
+	testListSyscallsDupsRange(t, checker, configHook, false)
+}
+
+func TestTracepointResolve(t *testing.T) {
+	policytest.AllPolicyTests.DoObserverTest(t, "tracepoint-resolve", nil)
 }

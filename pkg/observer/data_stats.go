@@ -4,8 +4,13 @@
 package observer
 
 import (
-	"github.com/cilium/tetragon/pkg/metrics/consts"
+	"maps"
+	"slices"
+
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/cilium/tetragon/pkg/metrics"
+	"github.com/cilium/tetragon/pkg/metrics/consts"
 )
 
 type DataEventOp int
@@ -25,37 +30,51 @@ func (e DataEventOp) String() string {
 }
 
 var (
-	// Define a counter metric for data event statistics
-	DataEventStats = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace:   consts.MetricsNamespace,
-		Name:        "data_events_total",
-		Help:        "The number of data events by type. For internal use only.",
-		ConstLabels: nil,
-	}, []string{"event"})
+	// Constrained labels for event and status
+	eventLabel = metrics.ConstrainedLabel{
+		Name:   "event",
+		Values: slices.Collect(maps.Values(DataEventTypeStrings)),
+	}
+	statusLabel = metrics.ConstrainedLabel{
+		Name:   "status",
+		Values: []string{DataEventOpOk.String(), DataEventOpBad.String()},
+	}
 
-	DataEventSizeHist = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace:   consts.MetricsNamespace,
-		Name:        "data_event_size",
-		Help:        "The size of received data events.",
-		Buckets:     prometheus.LinearBuckets(1000, 2000, 20),
-		ConstLabels: nil,
-	}, []string{"op"})
+	// Define a counter metric for data event statistics
+	DataEventStats = metrics.MustNewCounter(
+		metrics.NewOpts(
+			consts.MetricsNamespace, "", "data_events_total",
+			"The number of data events by type. For internal use only.",
+			nil, []metrics.ConstrainedLabel{eventLabel}, nil,
+		),
+		nil,
+	)
+
+	DataEventSizeHist = metrics.MustNewHistogram(
+		metrics.HistogramOpts{
+			Opts: metrics.NewOpts(
+				consts.MetricsNamespace, "", "data_event_size",
+				"The size of received data events.",
+				nil, []metrics.ConstrainedLabel{statusLabel}, nil,
+			),
+			Buckets: prometheus.LinearBuckets(1000, 2000, 20),
+		},
+		nil,
+	)
 )
 
-func InitMetrics(registry *prometheus.Registry) {
-	registry.MustRegister(DataEventStats)
-	registry.MustRegister(DataEventSizeHist)
+func RegisterMetrics(group metrics.Group) {
+	group.MustRegister(DataEventStats)
+	group.MustRegister(DataEventSizeHist)
+}
 
+func InitMetrics() {
 	// Initialize metrics with labels
 	for _, ev := range DataEventTypeStrings {
 		DataEventStats.WithLabelValues(ev).Add(0)
 	}
 	DataEventSizeHist.WithLabelValues(DataEventOpOk.String())
 	DataEventSizeHist.WithLabelValues(DataEventOpBad.String())
-
-	// NOTES:
-	// * Don't confuse op in data_event_size with ops.OpCode
-	// * Don't confuse event in data_events_total with tetragon.EventType
 }
 
 type DataEventType int

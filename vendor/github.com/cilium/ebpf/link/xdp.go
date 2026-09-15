@@ -1,3 +1,5 @@
+//go:build !windows
+
 package link
 
 import (
@@ -51,7 +53,11 @@ func AttachXDP(opts XDPOptions) (Link, error) {
 		Flags:   uint32(opts.Flags),
 	})
 
-	return &xdpLink{*rawLink}, err
+	if err != nil {
+		return nil, fmt.Errorf("failed to attach link: %w", err)
+	}
+
+	return &xdpLink{*rawLink}, nil
 }
 
 type xdpLink struct {

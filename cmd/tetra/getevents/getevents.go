@@ -9,46 +9,55 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
+	"sort"
+	"time"
 
-	"github.com/cilium/tetragon/api/v1/tetragon"
-	"github.com/cilium/tetragon/cmd/tetra/common"
-	"github.com/cilium/tetragon/pkg/encoder"
-	"github.com/cilium/tetragon/pkg/logger"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+
+	"github.com/cilium/tetragon/pkg/option"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/cmd/tetra/common"
+	"github.com/cilium/tetragon/pkg/encoder"
 )
 
 type Opts struct {
-	Output        string
-	Color         string
-	IncludeFields []string
-	EventTypes    []string
-	ExcludeFields []string
-	Namespaces    []string
-	Namespace     []string // deprecated: use Namespaces
-	Processes     []string
-	Process       []string // deprecated: use Processes
-	Pods          []string
-	Pod           []string // deprecated: use Pods
-	Host          bool
-	Timestamps    bool
-	TTYEncode     string
-	StackTraces   bool
-	PolicyNames   []string
+	Output         *option.Enum
+	Color          *option.Enum
+	IncludeFields  []string
+	EventTypes     *option.SliceEnum
+	ExcludeFields  []string
+	Namespaces     []string
+	Namespace      []string // deprecated: use Namespaces
+	Processes      []string
+	Process        []string // deprecated: use Processes
+	Pods           []string
+	Pod            []string // deprecated: use Pods
+	Containers     []string
+	Host           bool
+	Timestamps     bool
+	TTYEncode      string
+	StackTraces    bool
+	ImaHash        bool
+	PolicyNames    []string
+	NamespaceRegex []string
+	CelExpression  []string
+	Reconnect      bool
+	ReconnectWait  time.Duration
 }
 
 var Options Opts
 
 // GetEncoder returns an encoder for an event stream based on configuration options.
-var GetEncoder = func(w io.Writer, colorMode encoder.ColorMode, timestamps bool, compact bool, tty string, stackTraces bool) encoder.EventEncoder {
+var GetEncoder = func(w io.Writer, colorMode encoder.ColorMode, timestamps bool, compact bool, tty string, stackTraces bool, imaHash bool) encoder.EventEncoder {
 	if tty != "" {
 		return encoder.NewTtyEncoder(w, tty)
 	}
 	if compact {
-		return encoder.NewCompactEncoder(w, colorMode, timestamps, stackTraces)
+		return encoder.NewCompactEncoder(w, colorMode, timestamps, stackTraces, imaHash)
 	}
 	return encoder.NewProtojsonEncoder(w)
 }
@@ -73,17 +82,27 @@ var GetFilter = func() *tetragon.Filter {
 	if len(Options.Pods) > 0 {
 		filter.PodRegex = Options.Pods
 	}
+	if len(Options.Containers) > 0 {
+		filter.ContainerNameRegex = Options.Containers
+	}
+
 	// Is used to filter on the event types i.e. PROCESS_EXEC, PROCESS_EXIT etc.
-	if len(Options.EventTypes) > 0 {
+	if len(Options.EventTypes.Values) > 0 {
 		var eventType tetragon.EventType
 
-		for _, v := range Options.EventTypes {
+		for _, v := range Options.EventTypes.Values {
 			eventType = tetragon.EventType(tetragon.EventType_value[v])
 			filter.EventSet = append(filter.EventSet, eventType)
 		}
 	}
 	if len(Options.PolicyNames) > 0 {
 		filter.PolicyNames = Options.PolicyNames
+	}
+	if len(Options.NamespaceRegex) > 0 {
+		filter.NamespaceRegex = Options.NamespaceRegex
+	}
+	if len(Options.CelExpression) > 0 {
+		filter.CelExpression = Options.CelExpression
 	}
 
 	return &filter
@@ -116,23 +135,23 @@ func getRequest(includeFields, excludeFields []string, filter *tetragon.Filter) 
 	}
 }
 
-func getEvents(ctx context.Context, client tetragon.FineGuidanceSensorsClient) {
+func getEvents(ctx context.Context, client tetragon.FineGuidanceSensorsClient) error {
 	request := getRequest(Options.IncludeFields, Options.ExcludeFields, GetFilter())
 	stream, err := client.GetEvents(ctx, request)
 	if err != nil {
-		logger.GetLogger().WithError(err).Fatal("Failed to call GetEvents")
+		return fmt.Errorf("failed to call GetEvents: %w", err)
 	}
-	eventEncoder := GetEncoder(os.Stdout, encoder.ColorMode(Options.Color), Options.Timestamps, Options.Output == "compact", Options.TTYEncode, Options.StackTraces)
+	eventEncoder := GetEncoder(os.Stdout, encoder.ColorMode(Options.Color.Value), Options.Timestamps, Options.Output.Value == "compact", Options.TTYEncode, Options.StackTraces, Options.ImaHash)
 	for {
 		res, err := stream.Recv()
 		if err != nil {
 			if !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled && !errors.Is(err, io.EOF) {
-				logger.GetLogger().WithError(err).Fatal("Failed to receive events")
+				return fmt.Errorf("failed to receive events: %w", err)
 			}
-			return
+			return nil
 		}
 		if err = eventEncoder.Encode(res); err != nil {
-			logger.GetLogger().WithError(err).WithField("event", res).Debug("Failed to encode event")
+			return fmt.Errorf("failed to encode event %#v: %w", res, err)
 		}
 	}
 }
@@ -156,24 +175,6 @@ redirection of events to the stdin. Examples:
   # Include only process and parent.pod fields
   tetra getevents -f process,parent.pod`,
 		PreRunE: func(_ *cobra.Command, _ []string) error {
-			if Options.Output != "json" && Options.Output != "compact" {
-				return fmt.Errorf("invalid value for %q flag: %s", common.KeyOutput, Options.Output)
-			}
-			if Options.Color != "auto" && Options.Color != "always" && Options.Color != "never" {
-				return fmt.Errorf("invalid value for %q flag: %s", "color", Options.Color)
-			}
-
-			for _, v := range Options.EventTypes {
-				if _, found := tetragon.EventType_value[v]; !found {
-					var supportedEventTypes string
-					for _, v := range tetragon.EventType_name {
-						supportedEventTypes += v + ", "
-					}
-					supportedEventTypes = strings.TrimSuffix(supportedEventTypes, ", ")
-					return fmt.Errorf("invalid value for %q flag: %s. Supported are %s", "event-types", v, supportedEventTypes)
-				}
-			}
-
 			// merge deprecated to new flags, appending since order does not matter
 			Options.Namespaces = append(Options.Namespace, Options.Namespaces...)
 			Options.Pods = append(Options.Pod, Options.Pods...)
@@ -181,23 +182,56 @@ redirection of events to the stdin. Examples:
 
 			return nil
 		},
-		Run: func(_ *cobra.Command, _ []string) {
-			fi, _ := os.Stdin.Stat()
-			if fi.Mode()&os.ModeNamedPipe != 0 {
+		RunE: func(_ *cobra.Command, _ []string) error {
+			fi, err := os.Stdin.Stat()
+			if err == nil && fi.Mode()&os.ModeCharDevice == 0 {
 				// read events from stdin
-				getEvents(context.Background(), newIOReaderClient(os.Stdin, common.Debug))
-				return
+				return getEvents(context.Background(), newIOReaderClient(os.Stdin, common.Debug))
 			}
-			// connect to server
-			common.CliRun(getEvents)
+
+			reconnect := Options.Reconnect
+			tryGetEvents := func() error {
+				// connect to server
+				c, err := common.NewClientWithDefaultContextAndAddress()
+				if err != nil {
+					return fmt.Errorf("failed create gRPC client: %w", err)
+				}
+				defer c.Close()
+				ret := getEvents(c.SignalCtx, c.Client)
+				if ctxErr := c.SignalCtx.Err(); ctxErr != nil && errors.Is(ctxErr, context.Canceled) {
+					// we got a signal, so we should not try to reconnect
+					reconnect = false
+				}
+				return ret
+			}
+
+			for {
+				err := tryGetEvents()
+				if !reconnect {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "getevents: err:%v retrying in %v\n", err, Options.ReconnectWait)
+				time.Sleep(Options.ReconnectWait)
+			}
+
 		},
 	}
 
+	// Prepare enum-like flags
+	Options.Output, _ = option.NewEnum([]string{"json", "compact"}, "json")
+	Options.Color, _ = option.NewEnum([]string{"auto", "always", "never"}, "auto")
+	supported := make([]string, 0, len(tetragon.EventType_value))
+	for name := range tetragon.EventType_value {
+		supported = append(supported, name)
+	}
+	sort.Strings(supported)
+	Options.EventTypes, _ = option.NewSliceEnum(supported, nil)
+
 	flags := cmd.Flags()
-	flags.StringVarP(&Options.Output, common.KeyOutput, "o", "json", "Output format. json or compact")
-	flags.StringVar(&Options.Color, "color", "auto", "Colorize compact output. auto, always, or never")
+	flags.VarP(Options.Output, common.KeyOutput, "o", "Output format "+Options.Output.Allowed())
+	flags.Var(Options.Color, "color", "Colorize compact output "+Options.Color.Allowed())
 	flags.StringSliceVarP(&Options.IncludeFields, "include-fields", "f", nil, "Include only fields in events")
-	flags.StringSliceVarP(&Options.EventTypes, "event-types", "e", nil, "Include only events of given types")
+	flags.VarP(Options.EventTypes, "event-types", "e", "Include only events of given types")
 	flags.StringSliceVarP(&Options.ExcludeFields, "exclude-fields", "F", nil, "Exclude fields from events")
 
 	flags.StringSliceVarP(&Options.Namespace, "namespace", "n", nil, "Get events by Kubernetes namespace")
@@ -208,6 +242,9 @@ redirection of events to the stdin. Examples:
 	flags.StringSliceVar(&Options.Processes, "processes", nil, "Get events by processes name regex")
 	flags.MarkHidden("processes")
 
+	flags.StringSliceVar(&Options.Containers, "containers", nil, "Get events by container name regex")
+	flags.MarkHidden("containers")
+
 	flags.StringSliceVar(&Options.Pod, "pod", nil, "Get events by pod name regex")
 	flags.StringSliceVar(&Options.Pods, "pods", nil, "Get events by pods name regex")
 	flags.MarkHidden("pods")
@@ -216,6 +253,11 @@ redirection of events to the stdin. Examples:
 	flags.BoolVar(&Options.Timestamps, "timestamps", false, "Include timestamps in compact output")
 	flags.StringVarP(&Options.TTYEncode, "tty-encode", "t", "", "Encode terminal data by file path (all other events will be ignored)")
 	flags.BoolVar(&Options.StackTraces, "stack-traces", true, "Include stack traces in compact output")
+	flags.BoolVar(&Options.ImaHash, "ima-hash", true, "Include ima hashes in compact output")
 	flags.StringSliceVar(&Options.PolicyNames, "policy-names", nil, "Get events by tracing policy names")
+	flags.StringSliceVar(&Options.NamespaceRegex, "namespace-regex", nil, "Get events by namespace name regex")
+	flags.StringSliceVar(&Options.CelExpression, "cel-expression", nil, "Get events satisfying the CEL expression")
+	flags.BoolVar(&Options.Reconnect, "reconnect", false, "Keep trying to connect even if an error occurred")
+	flags.DurationVar(&Options.ReconnectWait, "reconnect-wait", 2*time.Second, "wait time before attempting to reconnect")
 	return &cmd
 }

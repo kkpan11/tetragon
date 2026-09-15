@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 // This package contains a simple test skeleton that can be copied, pasted, and modified
 // to create new Tetragon e2e tests.
 package skeleton_test
@@ -12,14 +14,17 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/e2e-framework/pkg/envconf"
+	"sigs.k8s.io/e2e-framework/pkg/features"
+
+	"github.com/cilium/tetragon/tests/e2e/metricschecker"
+
 	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
 	sm "github.com/cilium/tetragon/pkg/matchers/stringmatcher"
 	"github.com/cilium/tetragon/tests/e2e/checker"
 	"github.com/cilium/tetragon/tests/e2e/helpers"
 	"github.com/cilium/tetragon/tests/e2e/runners"
-	"k8s.io/klog/v2"
-	"sigs.k8s.io/e2e-framework/pkg/envconf"
-	"sigs.k8s.io/e2e-framework/pkg/features"
 )
 
 // This holds our test environment which we get from calling runners.NewRunner().Setup()
@@ -44,18 +49,14 @@ func TestMain(m *testing.M) {
 	// 2. After the cluster is configured and running, query the minimum kernel versions
 	//    supported by all nodes and set this as a variable in the test context.
 	//
-	// 3. Register a hook at the start of every test that installs Cilium into the
-	//    cluster with some default options (unless -tetragon.install-cilium=false is set
-	//    on thhe command line).
-	//
-	// 4. Register a hook at the start of every test that installs Tetragon into the
+	// 3. Register a hook at the start of every test that installs Tetragon into the
 	//    cluster with some default options.
 	//
-	// 5. Register a hook at the start of every test that port forwards Tetragon metrics
+	// 4. Register a hook at the start of every test that port forwards Tetragon metrics
 	//    and gRPC ports for all pods. These port forwards are registered in the test
 	//    context for later retrieval.
 	//
-	// 6. Register a hook at the end of every test that dumps information about the
+	// 5. Register a hook at the end of every test that dumps information about the
 	//    cluster and running event checkers. This information is only dumped if the test
 	//    fails or if -tetragon.keep-export=true is set on the command line.
 	//
@@ -84,13 +85,12 @@ func TestMain(m *testing.M) {
 }
 
 func TestSkeletonBasic(t *testing.T) {
-	// Must be called at the beginning of every test
-	runner.SetupExport(t)
-
 	// Grab the minimum kernel version in all cluster nodes and define an RPC checker with it
 	kversion := helpers.GetMinKernelVersion(t, runner.Environment)
-	// Create an curl event checker with a limit or 10 events or 30 seconds, whichever comes first
-	curlChecker := curlEventChecker(kversion).WithEventLimit(100).WithTimeLimit(30 * time.Second)
+	// Create an curl event checker with a limit or 200 events or 120 seconds, whichever comes first
+	curlChecker := curlEventChecker(kversion).WithEventLimit(200).WithTimeLimit(120 * time.Second)
+
+	metricsChecker := metricschecker.NewMetricsChecker("skeletonMetricsChecker")
 
 	// Define test features here. These can be used to perform actions like:
 	// - Spawning an event checker and running checks
@@ -103,8 +103,8 @@ func TestSkeletonBasic(t *testing.T) {
 
 	// This feature waits for curlChecker to start then runs a custom workload.
 	runWorkload := features.New("Run Workload").
-		/* Wait up to 30 seconds for the event checker to start before continuing */
-		Assess("Wait for Checker", curlChecker.Wait(30*time.Second)).
+		/* Wait up to 60 seconds for the event checker to start before continuing */
+		Assess("Wait for Checker", curlChecker.Wait(60*time.Second)).
 		/* Run the workload */
 		Assess("Run Workload", func(ctx context.Context, _ *testing.T, c *envconf.Config) context.Context {
 			ctx, err := helpers.LoadCRDString(namespace, curlPod, true)(ctx, c)
@@ -114,6 +114,7 @@ func TestSkeletonBasic(t *testing.T) {
 			}
 			return ctx
 		}).
+		Assess("Run Metrics Checks", metricsChecker.Greater("tetragon_events_total", 0)).
 		Assess("Uninstall policy", func(ctx context.Context, _ *testing.T, c *envconf.Config) context.Context {
 			ctx, err := helpers.UnloadCRDString(namespace, curlPod, true)(ctx, c)
 			if err != nil {

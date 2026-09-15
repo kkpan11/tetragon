@@ -105,7 +105,7 @@ events encoded in JSON as shown here,
 </p>
 </details>
 
-Will only highlight a few important fields here. For a full specification of events see the Reference
+We will only highlight a few important fields here. For a full specification of events see the Reference
 section. All events in Tetragon contain a `process_exec` block to identify the process generating the
 event. For execution events this is the primary block. For [Tracing Policy]({{< ref "/docs/concepts/tracing-policy" >}}) events the
 hook that generated the event will attach further data to this. The `process_exec` event provides
@@ -114,8 +114,8 @@ in a Kubernetes cluster  `process_exec.process.pod`. The binary and args being e
 the event here `process_exec.process.binary` and `process_exec.process.args`. Finally, a `node_name`
 and `time` provide the location and time for the event and will be present in all event types.
 
-A default deployment writes the JSON log to `/var/run/cilium/tetragon/tetragon.log` where it can
-be exported through normal log collection tooling, e.g. 'fluentd', logstash, etc.. The file will
+A default deployment writes the JSON log to `/var/log/tetragon/tetragon.log` where it can
+be exported through normal log collection tooling, e.g. fluentd, logstash, etc. The file will
 be rotated and compressed by default. See [Helm Options] for details on how to customize this location.
 
 #### Export Filtering
@@ -128,7 +128,7 @@ logical AND of sibling expressions within a filter object. As a concrete
 example, suppose we had the following filter configuration:
 
 ```json
-{"event_set": ["PROCESS_EXEC", "PROCESS_EXIT"], "namespace": "foo"}
+{"event_set": ["PROCESS_EXEC", "PROCESS_EXIT"], "namespace": ["foo"]}
 {"event_set": ["PROCESS_KPROBE"]}
 ```
 
@@ -146,24 +146,42 @@ in cases where two filter configurations match on the same event.
 You can configure export filters using the provided helm options, command line
 flags, or environment variables.
 
+{{< caution >}}
+The `denylist` and `allowlist` filters mentioned above only apply to events
+exported as JSON files (e.g., through a configured `file` sink). These filters
+do not affect events streamed via the gRPC API, which are consumed by tools
+like the `tetra` CLI. You will still see unfiltered events when using the
+`tetra` CLI, even if those events would be filtered out by `denylist` or
+`allowlist` for JSON export.
+{{< /caution >}}
+
 ##### List of Process Event Filters
+
+The type for each filter attribute can be determined by referring to the 
+[events.proto](https://github.com/cilium/tetragon/blob/main/api/v1/tetragon/events.proto#L38) file.
 
 | Filter | Description | 
 | ------ | ----------- |
-| `event_set` | Filter process events by event types. Supported types include: `PROCESS_EXEC`, `PROCESS_EXIT`, `PROCESS_KPROBE`, `PROCESS_UPROBE`, `PROCESS_TRACAEPOINT`, `PROCESS_LOADER` |
+| `event_set` | Filter process events by event types. Supported types include: `PROCESS_EXEC`, `PROCESS_EXIT`, `PROCESS_KPROBE`, `PROCESS_UPROBE`, `PROCESS_TRACEPOINT`, `PROCESS_LOADER` |
 | `binary_regex` | Filter process events by a list of regular expressions of process binary names (e.g. `"^/home/kubernetes/bin/kubelet$"`). You can find the full syntax [here](https://github.com/google/re2/wiki/Syntax). | 
 | `health_check` | Filter process events if their binary names match Kubernetes liveness / readiness probe commands of their corresponding pods. | 
 | `namespace` | Filter by Kubernetes pod namespaces. An empty string (`""`) filters processes that do not belong to any pod namespace. | 
+| `namespace_regex` | Filter by Kubernetes pod namespace using a list of regular expressions. You can find the full syntax [here](https://github.com/google/re2/wiki/Syntax). | 
 | `pid` | Filter by process PID. | 
 | `pid_set` | Like `pid` but also includes processes that are descendants of the listed PIDs. | 
 | `pod_regex` | Filter by pod name using a list of regular expressions. You can find the full syntax [here](https://github.com/google/re2/wiki/Syntax). | 
-| `arguments_regex` | Filter by pod name using a list of regular expressions. You can find the full syntax [here](https://github.com/google/re2/wiki/Syntax). | 
+| `arguments_regex` | Filter by process arguments using a list of regular expressions. You can find the full syntax [here](https://github.com/google/re2/wiki/Syntax). | 
 | `labels` | Filter events by pod labels using [Kubernetes label selector syntax](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors) Note that this filter never matches events without the pod field (i.e. host process events). |
 | `policy_names` | Filter events by tracing policy names. |
 | `capabilities` | Filter events by Linux process capability. |
+| `cel_expression` | Filter using CEL expressions. CEL filters support IP and CIDR notation extensions from the k8s project. See https://pkg.go.dev/k8s.io/apiserver/pkg/cel/library#IP and https://pkg.go.dev/k8s.io/apiserver/pkg/cel/library#CIDR for details. |
 | `parent_binary_regex` | Filter process events by a list of regular expressions of parent process binary names (e.g. `"^/home/kubernetes/bin/kubelet$"`). You can find the full syntax [here](https://github.com/google/re2/wiki/Syntax). | 
+| `parent_arguments_regex` | Filter by parent process arguments using a list of regular expressions. You can find the full syntax [here](https://github.com/google/re2/wiki/Syntax). | 
+| `container_id` | Filter by the container ID in the process.docker field using RE2 regular expression syntax: https://github.com/google/re2/wiki/Syntax | 
+| `in_init_tree` | Filter containerized processes based on whether they are descendants of the container's init process. This can be used, for example, to watch for processes injected into a container via docker exec, kubectl exec, or similar mechanisms. | 
+| `ancestor_binary_regex` | Filter process events by a list of regular expressions of ancestor processes' binary names (e.g. `"^/home/kubernetes/bin/kubelet$"`). You can find the full syntax [here](https://github.com/google/re2/wiki/Syntax). | 
 
-#### Field Filtering 
+#### Field Filtering
 
 In some cases, it is not desirable to include all of the fields exported in
 Tetragon events by default. In these cases, you can use field filters to
@@ -179,8 +197,8 @@ only the `process.binary`, `parent.binary`, and `pod.name` fields.
 
 By default, a field filter applies to all process events, although you
 can control this behaviour with the `"event_set"` key. For example, you
-can apply a field filter to `PROCESS_CONNECT` and `PROCESS_CLOSE` events
-by specifying `"event_set":["PROCESS_CONNECT","PROCESS_CLOSE"]` in the
+can apply a field filter to `PROCESS_KPROBE` and `PROCESS_TRACEPOINT` events
+by specifying `"event_set":["PROCESS_KPROBE","PROCESS_TRACEPOINT"]` in the
 filter definition.
 
 Each field filter has an `"action"` that determines what the filter
@@ -206,9 +224,9 @@ Since Tetragon traces the entire system, event exports might sometimes contain
 sensitive information (for example, a secret passed via a command line argument
 to a process). To prevent this information from being exfiltrated via Tetragon
 JSON export, Tetragon provides a mechanism called Redaction Filters which can be
-used to string patterns to redact from exported process arguments. These filters are written
-in JSON and passed to the Tetragon agent via the `--redaction-filters` command
-line flag or the `redactionFilters` Helm value.
+used to specify string patterns to redact from exported process arguments and environment
+variables. These filters are written in JSON and passed to the Tetragon agent via
+the `--redaction-filters` command line flag or the `redactionFilters` Helm value.
 
 To perform redactions, redaction filters define RE2 regular expressions in the
 `redact` field. Any capture groups in these RE2 regular expressions are redacted and
@@ -226,7 +244,7 @@ characters. For instance `\Wpasswd\W?` would be written as `{"redact": "\\Wpassw
 {{< /warning >}}
 
 For more control, you can select which binary or binaries should have their
-arguments redacted with the `binary_regex` field.
+arguments or environment variables redacted with the `binary_regex` field.
 
 As a concrete example, the following will redact all passwords passed to
 processes with the `"--password"` argument:
@@ -247,6 +265,34 @@ We can also redact these as follows:
 
 With both of the above redaction filters in place, we are now redacting all
 password arguments.
+
+Another example is to redact `SSHPASS` environment variable with:
+
+```json
+{"redact": ["(?:SSHPASS=)+(\\S+)"]}
+```
+
+Now, an event that contains the string `"SSHPASS=password"` would have that string
+replaced with `"SSHPASS=*****"`.
+
+Optionally, you can specify a custom replacement string using the `redact_str`
+field to replace the default `"*****"`.
+This is useful for distinguishing different redaction rules in alerts:
+
+```json
+{"redact": ["--password(?:\\\\s+|=)(\\\\S*)"], "redact_str": "<redacted:password>"}
+```
+
+Now, an event that contains the string `"--password=foo"` would have that string
+replaced with `"--password=<redacted:password>"`.
+
+```json
+{"redact": ["(?i)--private[-_]?key(?:\\\\s+|=)(\\\\S+)"], "redact_str": "<redacted:private-key>"}
+{"redact": ["(?i)[a-z][a-z0-9+.-]*://[^\\\\s:/@]*:([^\\\\s@/]+)@"], "redact_str": "<redacted:url-credential>"}
+```
+
+It's also possible to store only requested environment variables with
+'--filter-environment-variables VAR1[,VAR2..]' option.
 
 ### `tetra` CLI
 
@@ -273,7 +319,7 @@ filter by a specific binary and/or pod do the following,
 kubectl logs -n kube-system -l app.kubernetes.io/name=tetragon -c export-stdout -f | tetra getevents -o compact --processes curl --pod xwing
 ```
 
-Will filter and report just the relevant events.
+This will filter and report just the relevant events.
 
 ```
 🚀 process default/xwing /usr/bin/curl https://ebpf.io/applications/#tetragon
@@ -283,13 +329,13 @@ Will filter and report just the relevant events.
 ### gRPC
 
 In addition Tetragon can expose a gRPC endpoint listeners may attach to. The
-gRPC is exposed by default helm install on `localhost:54321`, but the address
-can be configured  with the `--server-address` option. This can be
+gRPC is exposed by default helm install on `unix:///var/run/tetragon/tetragon.sock`,
+but the address can be configured  with the `--server-address` option. This can be
 set from helm with the `tetragon.grpc.address` flag or disabled completely if
 needed with `tetragon.grpc.enabled`.
 
 ```shell
-helm install tetragon cilium/tetragon -n kube-system --set tetragon.grpc.enabled=true --set tetragon.grpc.address=localhost:54321
+helm install tetragon cilium/tetragon -n kube-system --set tetragon.grpc.enabled=true --set tetragon.grpc.address=unix:///var/run/tetragon/tetragon.sock
 ```
 
 An example gRPC endpoint is the Tetra CLI when its not piped JSON output directly,

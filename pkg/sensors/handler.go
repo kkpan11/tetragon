@@ -4,11 +4,22 @@
 package sensors
 
 import (
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"sync"
 
-	slimv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
 	"github.com/cilium/tetragon/pkg/policyfilter"
 	"github.com/cilium/tetragon/pkg/tracingpolicy"
+)
+
+const (
+	BaseSensorName = "__base__"
+	sensorsDomain  = "sensors"
 )
 
 type handler struct {
@@ -17,6 +28,7 @@ type handler struct {
 
 	nextPolicyID uint64
 	pfState      policyfilter.State
+	muLoad       sync.Mutex
 }
 
 func newHandler(
@@ -36,6 +48,18 @@ func newHandler(
 	}, nil
 }
 
+func (h *handler) load(col *collection) error {
+	h.muLoad.Lock()
+	defer h.muLoad.Unlock()
+	return col.load(h.bpfDir)
+}
+
+func (h *handler) unload(col *collection, unpin bool) error {
+	h.muLoad.Lock()
+	defer h.muLoad.Unlock()
+	return col.unload(unpin)
+}
+
 func (h *handler) allocPolicyID() uint64 {
 	ret := h.nextPolicyID
 	h.nextPolicyID++
@@ -49,66 +73,38 @@ func SensorsFromPolicy(tp tracingpolicy.TracingPolicy, filterID policyfilter.Pol
 
 // revive:enable:exported
 
-// updatePolicyFilter will update the policyfilter state so that filtering for
-// i) namespaced policies and ii) pod label filters happens.
-//
-// It returns:
-//
-//	policyfilter.NoFilterID, nil if no filtering is needed
-//	policyfilter.PolicyID(tpID), nil if filtering is needed and policyfilter has been successfully set up
-//	_, err if an error occurred
-func (h *handler) updatePolicyFilter(tp tracingpolicy.TracingPolicy, tpID uint64) (policyfilter.PolicyID, error) {
-	var namespace string
-	if tpNs, ok := tp.(tracingpolicy.TracingPolicyNamespaced); ok {
-		namespace = tpNs.TpNamespace()
+// registerNewCollection allocates a policy ID for op and adds the resulting
+// collection to the map.
+// Should be called with h.collections.mu locked (for writing).
+func (h *handler) registerNewCollection(op *tracingPolicyAdd) (*collection, error) {
+	collections := h.collections.c
+	// allow overriding an existing policy collection that holds no BPF state:
+	// one that resulted in an error during the loading state, or one that was
+	// skipped on this node
+	if col, exists := collections[op.ck]; exists && col.state != LoadErrorState && col.state != SkippedState {
+		return nil, fmt.Errorf("failed to add tracing policy %s, a sensor collection with the key already exists", op.ck)
 	}
 
-	var podSelector *slimv1.LabelSelector
-	if ps := tp.TpSpec().PodSelector; ps != nil {
-		if len(ps.MatchLabels)+len(ps.MatchExpressions) > 0 {
-			podSelector = ps
-		}
+	col := &collection{
+		name:            op.ck.name,
+		tracingpolicy:   op.tp,
+		tracingpolicyID: h.allocPolicyID(),
 	}
-
-	var containerSelector *slimv1.LabelSelector
-	if ps := tp.TpSpec().ContainerSelector; ps != nil {
-		if len(ps.MatchLabels)+len(ps.MatchExpressions) > 0 {
-			containerSelector = ps
-		}
-	}
-
-	// we do not call AddPolicy unless filtering is actually needed. This
-	// means that if policyfilter is disabled
-	// (option.Config.EnablePolicyFilter is false) then loading the policy
-	// will only fail if filtering is required.
-	if namespace == "" && podSelector == nil && containerSelector == nil {
-		return policyfilter.NoFilterID, nil
-	}
-
-	filterID := policyfilter.PolicyID(tpID)
-	if err := h.pfState.AddPolicy(filterID, namespace, podSelector, containerSelector); err != nil {
-		return policyfilter.NoFilterID, err
-	}
-	return filterID, nil
+	collections[op.ck] = col
+	return col, nil
 }
 
 func (h *handler) addTracingPolicy(op *tracingPolicyAdd) error {
 	h.collections.mu.Lock()
 	defer h.collections.mu.Unlock()
-	collections := h.collections.c
-	// allow overriding existing policy collection that resulted in an error
-	// during the loading state
-	if col, exists := collections[op.ck]; exists && col.state != LoadErrorState {
-		return fmt.Errorf("failed to add tracing policy %s, a sensor collection with the key already exists", op.ck)
+	col, err := h.registerNewCollection(op)
+	if err != nil {
+		return err
 	}
-	tpID := h.allocPolicyID()
-
-	col := collection{
-		name:            op.ck.name,
-		tracingpolicy:   op.tp,
-		tracingpolicyID: uint64(tpID),
+	if op.state == SkippedState {
+		col.state = SkippedState
+		return nil
 	}
-	collections[op.ck] = &col
 
 	// update policy filter state before loading the sensors of the policy.
 	//
@@ -119,7 +115,7 @@ func (h *handler) addTracingPolicy(op *tracingPolicyAdd) error {
 	// to work if no filtering is needed. A sensor that does not support
 	// policyfilter should return an error on PolicyHandler if a filter id
 	// other than filterID is passed.
-	filterID, err := h.updatePolicyFilter(op.tp, tpID)
+	filterID, err := h.updatePolicyFilter(op.tp, col.tracingpolicyID)
 	if err != nil {
 		col.err = err
 		col.state = LoadErrorState
@@ -135,19 +131,33 @@ func (h *handler) addTracingPolicy(op *tracingPolicyAdd) error {
 	}
 	col.sensors = make([]SensorIface, 0, len(sensors))
 	col.sensors = append(col.sensors, sensors...)
+	if op.state == DisabledState {
+		col.state = DisabledState
+		return nil
+	}
 	col.state = LoadingState
+
+	notAllowedReasons := make([]string, 0, len(col.sensors))
+	for _, s := range col.sensors {
+		notAllowedReason := s.DisableNotAllowed()
+		if notAllowedReason != "" {
+			notAllowedReasons = append(notAllowedReasons, notAllowedReason)
+		}
+	}
+	col.disableNotAllowed = strings.Join(notAllowedReasons, "; ")
 
 	// unlock so that policyLister can access the collections (read-only) while we are loading.
 	h.collections.mu.Unlock()
-	err = col.load(h.bpfDir)
+	err = h.load(col)
 	h.collections.mu.Lock()
 
 	if err != nil {
 		col.err = err
 		col.state = LoadErrorState
+		col.destroy(true)
 		return err
 	}
-	col.state = EnabledState
+	col.state = col.getEnabledStateType()
 	return nil
 }
 
@@ -164,7 +174,7 @@ func (h *handler) deleteTracingPolicy(op *tracingPolicyDelete) error {
 	// that the collection is gone
 	h.collections.mu.Unlock()
 
-	col.destroy()
+	col.destroy(true)
 
 	filterID := policyfilter.PolicyID(col.policyfilterID)
 	err := h.pfState.DelPolicy(filterID)
@@ -175,23 +185,20 @@ func (h *handler) deleteTracingPolicy(op *tracingPolicyDelete) error {
 	return nil
 }
 
-func (h *handler) disableTracingPolicy(op *tracingPolicyDisable) error {
-	h.collections.mu.Lock()
-	defer h.collections.mu.Unlock()
-	collections := h.collections.c
-	col, exists := collections[op.ck]
-	if !exists {
-		return fmt.Errorf("tracing policy %s does not exist", op.ck)
+// should be called with h.collections.mu locked (for writing)
+func (h *handler) doDisableTracingPolicy(col *collection) error {
+	if !col.isEnabled() {
+		return fmt.Errorf("tracing policy %s is not enabled", col.name)
 	}
 
-	if col.state != EnabledState {
-		return fmt.Errorf("tracing policy %s is not enabled", op.ck)
+	if col.disableNotAllowed != "" {
+		return fmt.Errorf("tracing policy %s cannot be disabled: %s", col.name, col.disableNotAllowed)
 	}
 
 	col.state = UnloadingState
 	// unlock so that policyLister can access the collections (read-only) while we are unloading.
 	h.collections.mu.Unlock()
-	err := col.unload()
+	err := h.unload(col, true)
 	h.collections.mu.Lock()
 
 	if err != nil {
@@ -206,33 +213,64 @@ func (h *handler) disableTracingPolicy(op *tracingPolicyDisable) error {
 	return nil
 }
 
-func (h *handler) enableTracingPolicy(op *tracingPolicyEnable) error {
-	h.collections.mu.Lock()
-	defer h.collections.mu.Unlock()
-	collections := h.collections.c
-	col, exists := collections[op.ck]
-	if !exists {
-		return fmt.Errorf("tracing policy %s does not exist", op.ck)
-	}
-
+// should be called with h.collections.mu locked (for writing)
+func (h *handler) doEnableTracingPolicy(col *collection) error {
 	if col.state != DisabledState {
-		return fmt.Errorf("tracing policy %s is not disabled", op.ck)
+		return fmt.Errorf("tracing policy %s is not disabled", col.name)
 	}
 
 	col.state = LoadingState
 	// unlock so that policyLister can access the collections (read-only) while we are loading.
 	h.collections.mu.Unlock()
-	err := col.load(h.bpfDir)
+	err := h.load(col)
 	h.collections.mu.Lock()
 
 	if err != nil {
 		col.state = LoadErrorState
 		col.err = fmt.Errorf("failed to enable tracing policy %q: %w", col.name, err)
+		col.destroy(true)
 		return col.err
 	}
 
-	col.state = EnabledState
+	col.state = col.getEnabledStateType()
 	return nil
+}
+
+func (h *handler) configureTracingPolicy(
+	ck collectionKey,
+	mode *tetragon.TracingPolicyMode,
+	enable *bool,
+) error {
+	h.collections.mu.Lock()
+	defer h.collections.mu.Unlock()
+	collections := h.collections.c
+	col, exists := collections[ck]
+	if !exists {
+		return fmt.Errorf("tracing policy %s does not exist", ck)
+	}
+
+	// a skipped policy has no sensors and no BPF maps to configure
+	if col.state == SkippedState {
+		return fmt.Errorf("tracing policy %s is skipped: it is not loaded on this node", ck)
+	}
+
+	var err error
+
+	// change mode of policy
+	if mode != nil {
+		err = errors.Join(err, col.setMode(*mode))
+	}
+
+	// enable or disable policy
+	if enable != nil {
+		if *enable {
+			err = errors.Join(err, h.doEnableTracingPolicy(col))
+		} else {
+			err = errors.Join(err, h.doDisableTracingPolicy(col))
+		}
+	}
+
+	return err
 }
 
 func (h *handler) addSensor(op *sensorAdd) error {
@@ -240,7 +278,7 @@ func (h *handler) addSensor(op *sensorAdd) error {
 	defer h.collections.mu.Unlock()
 	collections := h.collections.c
 	// Treat sensors as cluster-wide operations
-	ck := collectionKey{op.name, ""}
+	ck := collectionKey{op.name, "", sensorsDomain}
 	if _, exists := collections[ck]; exists {
 		return fmt.Errorf("sensor %s already exists", ck)
 	}
@@ -251,13 +289,21 @@ func (h *handler) addSensor(op *sensorAdd) error {
 	return nil
 }
 
-func removeAllSensors(h *handler) {
+func removeAllSensors(h *handler, unpin bool) {
 	h.collections.mu.Lock()
 	defer h.collections.mu.Unlock()
 	collections := h.collections.c
 	for ck, col := range collections {
-		col.destroy()
-		delete(collections, ck)
+		if col.name == BaseSensorName {
+			// Base sensor always unloaded last
+			defer func(ck collectionKey, col *collection) {
+				col.destroy(unpin)
+				delete(collections, ck)
+			}(ck, col)
+		} else {
+			col.destroy(unpin)
+			delete(collections, ck)
+		}
 	}
 }
 
@@ -267,7 +313,7 @@ func (h *handler) removeSensor(op *sensorRemove) error {
 			return fmt.Errorf("removeSensor called with all flag and sensor name %s",
 				op.name)
 		}
-		removeAllSensors(h)
+		removeAllSensors(h, op.unpin)
 		return nil
 	}
 
@@ -275,43 +321,41 @@ func (h *handler) removeSensor(op *sensorRemove) error {
 	defer h.collections.mu.Unlock()
 	collections := h.collections.c
 	// Treat sensors as cluster-wide operations
-	ck := collectionKey{op.name, ""}
+	ck := collectionKey{op.name, "", sensorsDomain}
 	col, exists := collections[ck]
 	if !exists {
 		return fmt.Errorf("sensor %s does not exist", ck)
 	}
 
-	col.destroy()
+	col.destroy(true)
 	delete(collections, ck)
 	return nil
 }
 
 func (h *handler) enableSensor(op *sensorEnable) error {
 	h.collections.mu.Lock()
-	defer h.collections.mu.Unlock()
 	collections := h.collections.c
 	// Treat sensors as cluster-wide operations
-	ck := collectionKey{op.name, ""}
+	ck := collectionKey{op.name, "", sensorsDomain}
 	col, exists := collections[ck]
+	h.collections.mu.Unlock()
 	if !exists {
 		return fmt.Errorf("sensor %s does not exist", ck)
 	}
-
-	return col.load(h.bpfDir)
+	return h.load(col)
 }
 
 func (h *handler) disableSensor(op *sensorDisable) error {
 	h.collections.mu.Lock()
-	defer h.collections.mu.Unlock()
 	collections := h.collections.c
 	// Treat sensors as cluster-wide operations
-	ck := collectionKey{op.name, ""}
+	ck := collectionKey{op.name, "", sensorsDomain}
 	col, exists := collections[ck]
+	h.collections.mu.Unlock()
 	if !exists {
 		return fmt.Errorf("sensor %s does not exist", ck)
 	}
-
-	return col.unload()
+	return h.unload(col, true)
 }
 
 func (h *handler) listSensors(op *sensorList) error {
@@ -333,12 +377,141 @@ func (h *handler) listSensors(op *sensorList) error {
 	return nil
 }
 
+func (h *handler) listOverheads() ([]ProgOverhead, error) {
+	h.collections.mu.RLock()
+	defer h.collections.mu.RUnlock()
+	collections := h.collections.c
+
+	overheads := []ProgOverhead{}
+
+	for ck, col := range collections {
+		for _, s := range col.sensors {
+			ret, ok := s.Overhead()
+			if !ok {
+				continue
+			}
+			for _, ovh := range ret {
+				ovh.Namespace = ck.namespace
+				ovh.Policy = ck.name
+				overheads = append(overheads, ovh)
+			}
+		}
+	}
+
+	return overheads, nil
+}
+
+func (h *handler) listDomains() []string {
+	h.collections.mu.RLock()
+	defer h.collections.mu.RUnlock()
+	collections := h.collections.c
+
+	domains := make(map[string]struct{})
+	for ck := range collections {
+		// Skip internal sensorsDomain
+		if ck.domain != sensorsDomain {
+			domains[ck.domain] = struct{}{}
+		}
+	}
+	return slices.Sorted(maps.Keys(domains))
+}
+
+func (h *handler) listPolicies(domain string) []*tetragon.TracingPolicyStatus {
+	h.collections.mu.RLock()
+	defer h.collections.mu.RUnlock()
+	collections := h.collections.c
+
+	ret := make([]*tetragon.TracingPolicyStatus, 0, len(collections))
+	for ck, col := range collections {
+		if col.tracingpolicy == nil {
+			continue
+		}
+
+		if domain != "" && ck.domain != domain {
+			continue
+		}
+
+		col.tracingpolicy.TpSpec()
+		pol := tetragon.TracingPolicyStatus{
+			Id:           col.tracingpolicyID,
+			Name:         ck.name,
+			Enabled:      col.isEnabled(), //nolint:staticcheck // Keep populating the deprecated field for API compatibility.
+			FilterId:     col.policyfilterID,
+			State:        col.state.ToTetragonState(),
+			Mode:         col.mode(),
+			Stats:        col.stats(),
+			Domain:       ck.domain,
+			HookStatuses: []*tetragon.HookStatus{},
+		}
+
+		if col.err != nil {
+			pol.Error = col.err.Error()
+		}
+
+		pol.Namespace = col.tracingpolicy.TpNamespace()
+
+		for _, sens := range col.sensors {
+			pol.Sensors = append(pol.Sensors, sens.GetName())
+			pol.KernelMemoryBytes += uint64(sens.TotalMemlock())
+			pol.HookStatuses = append(pol.HookStatuses, sens.HookStatus()...)
+		}
+
+		ret = append(ret, &pol)
+	}
+
+	return ret
+}
+
+func (h *handler) listCollections(policyOnly bool) []*Collection {
+	h.collections.mu.RLock()
+	defer h.collections.mu.RUnlock()
+	collections := h.collections.c
+
+	ret := make([]*Collection, 0)
+	for _, col := range collections {
+		var (
+			tpName string
+			err    string
+			tpSpec *v1alpha1.TracingPolicySpec
+		)
+		// deep copy fields to avoid locking issues
+		if col.tracingpolicy != nil {
+			tpSpec = col.tracingpolicy.TpSpec().DeepCopy()
+			tpName = col.tracingpolicy.TpName()
+		} else if policyOnly {
+			continue
+		}
+		mode := col.mode()
+		if col.err != nil {
+			err = col.err.Error()
+		}
+		ret = append(ret, &Collection{
+			Name:              col.name,
+			TracingpolicyName: tpName,
+			TracingpolicySpec: tpSpec,
+			TracingpolicyMode: mode,
+			TracingpolicyID:   col.tracingpolicyID,
+			PolicyfilterID:    col.policyfilterID,
+			State:             col.state,
+			Err:               err,
+		})
+	}
+	return ret
+}
+
 func sensorsFromPolicyHandlers(tp tracingpolicy.TracingPolicy, filterID policyfilter.PolicyID) ([]SensorIface, error) {
 	var sensors []SensorIface
 	for n, s := range registeredPolicyHandlers {
 		sensor, err := s.PolicyHandler(tp, filterID)
 		if err != nil {
-			return nil, fmt.Errorf("policy handler '%s' failed loading policy '%s': %w", n, tp.TpName(), err)
+			var destroyErr error
+			for _, s := range sensors {
+				if dErr := s.Destroy(true); dErr != nil {
+					destroyErr = errors.Join(destroyErr, dErr)
+				}
+			}
+			mainErr := fmt.Errorf("policy handler '%s' failed loading policy '%s': %w", n, tp.TpName(), err)
+			return nil, errors.Join(mainErr, destroyErr)
 		}
 		if sensor == nil {
 			continue
@@ -346,5 +519,6 @@ func sensorsFromPolicyHandlers(tp tracingpolicy.TracingPolicy, filterID policyfi
 		sensors = append(sensors, sensor)
 	}
 
+	sortSensors(sensors)
 	return sensors, nil
 }

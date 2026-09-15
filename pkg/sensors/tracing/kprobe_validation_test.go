@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 import (
 	"testing"
 
-	"github.com/cilium/tetragon/pkg/kernels"
+	"github.com/stretchr/testify/require"
+
+	"github.com/cilium/tetragon/pkg/bpf"
+	"github.com/cilium/tetragon/pkg/build"
+	"github.com/cilium/tetragon/pkg/config"
+	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
+	"github.com/cilium/tetragon/pkg/option"
+	"github.com/cilium/tetragon/pkg/policyfilter"
 	"github.com/cilium/tetragon/pkg/sensors"
 	"github.com/cilium/tetragon/pkg/tracingpolicy"
-	"github.com/stretchr/testify/assert"
 )
 
 func checkCrd(t *testing.T, crd string) error {
@@ -18,14 +26,12 @@ func checkCrd(t *testing.T, crd string) error {
 		t.Fatalf("failed to parse tracingpolicy: %s", err)
 	}
 
-	_, err = sensors.GetMergedSensorFromParserPolicy(tp)
+	_, err = sensors.SensorsFromPolicy(tp, policyfilter.NoFilterID)
 	return err
 }
 
 func TestKprobeValidationListWrongSyscallName(t *testing.T) {
-
 	// messed up syscall name in the list
-
 	crd := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -42,13 +48,11 @@ spec:
 `
 
 	err := checkCrd(t, crd)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestKprobeValidationListWrongOverride(t *testing.T) {
-
 	// override on non override-able functions in list
-
 	crd := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -70,13 +74,11 @@ spec:
 `
 
 	err := checkCrd(t, crd)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestKprobeValidationListWrongName(t *testing.T) {
-
 	// wrong list name reference in kprobe's call
-
 	crd := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -94,13 +96,11 @@ spec:
 `
 
 	err := checkCrd(t, crd)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestKprobeValidationListGeneratedSyscallsNotEmpty(t *testing.T) {
-
 	// not empty values for generated syscalls list
-
 	crd := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -118,13 +118,11 @@ spec:
 `
 
 	err := checkCrd(t, crd)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestKprobeValidationListGeneratedFtraceNotEmpty(t *testing.T) {
-
 	// not empty values for generated ftrace list
-
 	crd := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -142,13 +140,11 @@ spec:
 `
 
 	err := checkCrd(t, crd)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestKprobeValidationListGeneratedFtraceNoPattern(t *testing.T) {
-
 	// no pattern specified for generated ftrace list
-
 	crd := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -163,12 +159,10 @@ spec:
 `
 
 	err := checkCrd(t, crd)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 func TestKprobeValidationWrongSyscallName(t *testing.T) {
-
 	// messed up syscall name in kprobe's call
-
 	crd := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -180,13 +174,11 @@ spec:
 `
 
 	err := checkCrd(t, crd)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestKprobeValidationWrongOverride(t *testing.T) {
-
 	// override on non override-able functions in list
-
 	crd := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -202,13 +194,11 @@ spec:
 `
 
 	err := checkCrd(t, crd)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestKprobeValidationNonSyscallOverride(t *testing.T) {
-
 	// override on non syscall (non override-able) function
-
 	crd := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -228,34 +218,89 @@ spec:
 `
 
 	err := checkCrd(t, crd)
-	assert.Error(t, err)
+	require.Error(t, err)
 
 }
 
-func TestKprobeValidationMissingReturnArg(t *testing.T) {
+func forceLargeProgs(t *testing.T) {
+	t.Helper()
 
-	// missing returnArg while having return: true
+	origForceLargeProgs := option.Config.ForceLargeProgs
+	origForceSmallProgs := option.Config.ForceSmallProgs
+	option.Config.ForceLargeProgs = true
+	option.Config.ForceSmallProgs = false
+	t.Cleanup(func() {
+		option.Config.ForceLargeProgs = origForceLargeProgs
+		option.Config.ForceSmallProgs = origForceSmallProgs
+	})
+}
 
-	crd := `
-apiVersion: cilium.io/v1alpha1
-kind: TracingPolicy
-metadata:
-  name: "missing-returnarg"
-spec:
-  kprobes:
-  - call: "sys_openat"
-    return: true
-    syscall: true
-`
+func TestKprobeValidationReturnArgActionSocketTracking(t *testing.T) {
+	forceLargeProgs(t)
 
-	err := checkCrd(t, crd)
-	assert.Error(t, err)
+	tests := []struct {
+		name   string
+		action string
+	}{
+		{name: "tracksock", action: "TrackSock"},
+		{name: "untracksock", action: "UntrackSock"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kp := &v1alpha1.KProbeSpec{
+				Call:            "sys_dup",
+				Syscall:         true,
+				Return:          true,
+				ReturnArg:       &v1alpha1.KProbeArg{Index: 0, Type: "int"},
+				ReturnArgAction: tt.action,
+			}
+			in := &addKprobeIn{policyName: "return-arg-action-" + tt.name}
+
+			id, err := addKprobe("sys_dup", 0, kp, in, hasMaps{})
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				_, err := genericKprobeTable.RemoveEntry(id)
+				require.NoError(t, err)
+			})
+		})
+	}
+}
+
+func TestKprobeValidationReturnArgActionPost(t *testing.T) {
+	forceLargeProgs(t)
+
+	kp := &v1alpha1.KProbeSpec{
+		Call:            "sys_dup",
+		Syscall:         true,
+		Return:          true,
+		ReturnArg:       &v1alpha1.KProbeArg{Index: 0, Type: "int"},
+		ReturnArgAction: "Post",
+	}
+	in := &addKprobeIn{policyName: "return-arg-action-post"}
+
+	_, err := addKprobe("sys_dup", 0, kp, in, hasMaps{})
+	require.ErrorContains(t, err, "omit returnArgAction or use 'TrackSock'/'UntrackSock'")
+}
+
+func TestKprobeValidationReturnArgActionInvalid(t *testing.T) {
+	forceLargeProgs(t)
+
+	kp := &v1alpha1.KProbeSpec{
+		Call:            "sys_dup",
+		Syscall:         true,
+		Return:          true,
+		ReturnArg:       &v1alpha1.KProbeArg{Index: 0, Type: "int"},
+		ReturnArgAction: "Bogus",
+	}
+	in := &addKprobeIn{policyName: "return-arg-action-invalid"}
+
+	_, err := addKprobe("sys_dup", 0, kp, in, hasMaps{})
+	require.ErrorContains(t, err, "ReturnArgAction type 'Bogus' unsupported")
 }
 
 func TestKprobeLTOp(t *testing.T) {
-
 	// missing returnArg while having return: true
-
 	crd := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -272,21 +317,19 @@ spec:
       - index: 0
         operator: "LT"
         values:
-        - 0
+        - "0"
 `
 
 	err := checkCrd(t, crd)
-	if kernels.EnableLargeProgs() {
-		assert.NoError(t, err)
+	if config.EnableLargeProgs() {
+		require.NoError(t, err)
 	} else {
-		assert.Error(t, err)
+		require.Error(t, err)
 	}
 }
 
 func TestKprobeGTOp(t *testing.T) {
-
 	// missing returnArg while having return: true
-
 	crd := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -303,19 +346,21 @@ spec:
       - index: 0
         operator: "GT"
         values:
-        - 0
+        - "0"
 `
 
 	err := checkCrd(t, crd)
-	if kernels.EnableLargeProgs() {
-		assert.NoError(t, err)
+	if config.EnableLargeProgs() {
+		require.NoError(t, err)
 	} else {
-		assert.Error(t, err)
+		require.Error(t, err)
 	}
 }
 
 // Test that tracing policy max tags
 func TestTracingPolicyTagsMax(t *testing.T) {
+	// NB: validation tests require k8s
+	build.SkipIfK8sDisabled(t)
 	// Ensure that CRD fail if tags > 16
 	crd1 := `
 apiVersion: cilium.io/v1alpha1
@@ -353,11 +398,33 @@ spec:
  `
 
 	_, err := tracingpolicy.FromYAML(crd1)
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	_, err = tracingpolicy.FromYAML(crd2)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	_, err = tracingpolicy.FromYAML(crd3)
-	assert.NoError(t, err)
+	require.NoError(t, err)
+}
+
+func TestKprobeMultiSymbolInstancesFail(t *testing.T) {
+	if !bpf.HasKprobeMulti() {
+		t.Skip("Test requires kprobe multi")
+	}
+
+	crd := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "multiple-symbols"
+spec:
+  kprobes:
+  - call: sys_prctl
+    syscall: true
+  - call: sys_prctl
+    syscall: true
+`
+
+	err := checkCrd(t, crd)
+	require.Error(t, err)
 }

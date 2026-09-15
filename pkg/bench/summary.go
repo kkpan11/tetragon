@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package bench
 
 import (
@@ -9,13 +11,15 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
-	"github.com/cilium/tetragon/pkg/metrics/kprobemetrics"
-	"github.com/cilium/tetragon/pkg/metrics/ringbufmetrics"
 	"github.com/fatih/color"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+
+	"github.com/cilium/tetragon/pkg/metrics/kprobemetrics"
+	"github.com/cilium/tetragon/pkg/observer"
 )
 
 // Summary gathers benchmark results. Serializes to JSON.
@@ -76,14 +80,15 @@ func (s *Summary) PrettyPrint() {
 
 	if !s.Args.Baseline {
 		fmt.Printf("Ring buffer:        received=%d, lost=%d, errors=%d\n",
-			getCounterValue(ringbufmetrics.PerfEventReceived),
-			getCounterValue(ringbufmetrics.PerfEventLost),
-			getCounterValue(ringbufmetrics.PerfEventErrors))
+			getCounterValue(observer.RingbufReceived),
+			getCounterValue(observer.RingbufLost),
+			getCounterValue(observer.RingbufErrors))
 
-		mergePushed := getCounterValue(kprobemetrics.MergePushed)
-		mergeOkTotal := getCounterValue(kprobemetrics.MergeOkTotal)
+		mergePushed := getCounterValue(kprobemetrics.MergePushed.WithLabelValues())
+		mergeOkTotal := int(kprobemetrics.TotalMergeOk())
+		mergeErrorTotal := int(kprobemetrics.TotalMergeError())
 		fmt.Printf("Merged events:      pushed=%d, ok=%d, errors=%d\n",
-			mergePushed, mergeOkTotal, mergePushed-mergeOkTotal)
+			mergePushed, mergeOkTotal, mergeErrorTotal)
 	}
 
 	fmt.Println("BPF statistics:")
@@ -139,16 +144,16 @@ func (s *Summary) CSVPrint(path, name string) error {
 			fmt.Sprintf("%v", s.TetragonCPUUsage.UserTime),
 			fmt.Sprintf("%d", s.TetragonCPUUsage.UserTime),
 		},
-		{"Tetragon MaxRss", fmt.Sprintf("%d", s.TetragonCPUUsage.MaxRss)},
-		{"Tetragon ContextSwitches", fmt.Sprintf("%d", s.TetragonCPUUsage.ContextSwitches)},
+		{"Tetragon MaxRss", strconv.FormatInt(s.TetragonCPUUsage.MaxRss, 10)},
+		{"Tetragon ContextSwitches", strconv.FormatInt(s.TetragonCPUUsage.ContextSwitches, 10)},
 	}
 	w.WriteAll(records)
 
 	if !s.Args.Baseline {
 		records = [][]string{
-			{"Received", fmt.Sprintf("%d", getCounterValue(ringbufmetrics.PerfEventReceived))},
-			{"Lost", fmt.Sprintf("%d", getCounterValue(ringbufmetrics.PerfEventLost))},
-			{"Errors", fmt.Sprintf("%d", getCounterValue(ringbufmetrics.PerfEventErrors))},
+			{"Received", strconv.Itoa(getCounterValue(observer.RingbufReceived))},
+			{"Lost", strconv.Itoa(getCounterValue(observer.RingbufLost))},
+			{"Errors", strconv.Itoa(getCounterValue(observer.RingbufErrors))},
 		}
 		w.WriteAll(records)
 	}

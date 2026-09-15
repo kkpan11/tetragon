@@ -62,6 +62,9 @@ func (s *Structural) Pattern() string {
 }
 
 func (s *Structural) Items() common.Schema {
+	if s.Structural.Items == nil {
+		return nil
+	}
 	return &Structural{Structural: s.Structural.Items}
 }
 
@@ -226,7 +229,6 @@ func (s *Structural) XListMapKeys() []string {
 func (s *Structural) AllOf() []common.Schema {
 	var res []common.Schema
 	for _, subSchema := range s.Structural.ValueValidation.AllOf {
-		subSchema := subSchema
 		res = append(res, nestedValueValidationToStructural(&subSchema))
 	}
 	return res
@@ -235,7 +237,6 @@ func (s *Structural) AllOf() []common.Schema {
 func (s *Structural) AnyOf() []common.Schema {
 	var res []common.Schema
 	for _, subSchema := range s.Structural.ValueValidation.AnyOf {
-		subSchema := subSchema
 		res = append(res, nestedValueValidationToStructural(&subSchema))
 	}
 	return res
@@ -244,7 +245,6 @@ func (s *Structural) AnyOf() []common.Schema {
 func (s *Structural) OneOf() []common.Schema {
 	var res []common.Schema
 	for _, subSchema := range s.Structural.ValueValidation.OneOf {
-		subSchema := subSchema
 		res = append(res, nestedValueValidationToStructural(&subSchema))
 	}
 	return res
@@ -279,11 +279,18 @@ func nestedValueValidationToStructural(nvv *schema.NestedValueValidation) *Struc
 		newProperties[k] = *nestedValueValidationToStructural(&v).Structural
 	}
 
+	var newAdditionalProperties *schema.StructuralOrBool
+	if nvv.AdditionalProperties != nil {
+		newAdditionalProperties = &schema.StructuralOrBool{Structural: nestedValueValidationToStructural(nvv.AdditionalProperties).Structural}
+	}
+
 	return &Structural{
 		Structural: &schema.Structural{
-			Items:           newItems,
-			Properties:      newProperties,
-			ValueValidation: &nvv.ValueValidation,
+			Items:                newItems,
+			Properties:           newProperties,
+			AdditionalProperties: newAdditionalProperties,
+			ValueValidation:      &nvv.ValueValidation,
+			ValidationExtensions: nvv.ValidationExtensions,
 		},
 	}
 }

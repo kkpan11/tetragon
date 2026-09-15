@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package main
 
 import (
@@ -11,8 +13,10 @@ import (
 	"path/filepath"
 
 	"github.com/cilium/little-vm-helper/pkg/images"
+	"github.com/cilium/little-vm-helper/pkg/slogger"
+	"github.com/cilium/little-vm-helper/pkg/step"
+
 	"github.com/cilium/tetragon/pkg/vmtests"
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -22,7 +26,6 @@ var (
 )
 
 func buildFilesystemActions(fs []QemuFS, tmpDir string) ([]images.Action, error) {
-
 	actions := make([]images.Action, 0, len(fs)+1)
 
 	var b bytes.Buffer
@@ -62,7 +65,6 @@ After=network.target
 ExecStart=%s
 Type=oneshot
 # https://www.freedesktop.org/software/systemd/man/systemd.exec.html
-# StandardOutput=file:%s
 StandardOutput=tty
 # StandardOutput=journal+console
 
@@ -70,8 +72,9 @@ StandardOutput=tty
 WantedBy=multi-user.target
 `
 
-func buildTesterService(rcnf *RunConf, tmpDir string) ([]images.Action, error) {
-	service := fmt.Sprintf(tetragonTesterService, TetragonTesterVmBin, rcnf.testerOut)
+func buildTesterService(tmpDir string) ([]images.Action, error) {
+	execStart := TetragonTesterVmBin + " gotest"
+	service := fmt.Sprintf(tetragonTesterService, execStart)
 	var b bytes.Buffer
 	b.WriteString(service)
 
@@ -99,7 +102,7 @@ func buildTesterService(rcnf *RunConf, tmpDir string) ([]images.Action, error) {
 	return actions, nil
 }
 
-func buildTesterActions(rcnf *RunConf, tmpDir string) ([]images.Action, error) {
+func buildTesterActions(rcnf *GoTestConf, tmpDir string) ([]images.Action, error) {
 	absTesterBin, err := filepath.Abs(TetragonTesterBin)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tetragon-tester full path: %w", err)
@@ -110,13 +113,13 @@ func buildTesterActions(rcnf *RunConf, tmpDir string) ([]images.Action, error) {
 
 	// NB: need to do this before we marshal the configuration
 	if rcnf.btfFile != "" {
-		absBtfFile, err := filepath.Abs(rcnf.btfFile)
+		absBTFFile, err := filepath.Abs(rcnf.btfFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get btf file full path: %w", err)
 		}
 		ret = append(ret, images.Action{
 			Op: &images.CopyInCommand{
-				LocalPath: absBtfFile,
+				LocalPath: absBTFFile,
 				RemoteDir: "/boot/",
 			},
 		})
@@ -141,7 +144,7 @@ func buildTesterActions(rcnf *RunConf, tmpDir string) ([]images.Action, error) {
 	})
 
 	if !rcnf.useTetragonTesterInit && !rcnf.justBoot {
-		acts, err := buildTesterService(rcnf, tmpDir)
+		acts, err := buildTesterService(tmpDir)
 		if err != nil {
 			return nil, err
 		}
@@ -198,8 +201,20 @@ func buildNetActions(tmpDir string) ([]images.Action, error) {
 	return ret, nil
 }
 
-func buildTestImage(log *logrus.Logger, rcnf *RunConf) error {
+type NoNetworkCommand struct{}
 
+func (rc *NoNetworkCommand) ActionOpName() string {
+	return "no-network"
+}
+
+func (rc *NoNetworkCommand) ToSteps(s *images.StepConf) ([]step.Step, error) {
+	return []step.Step{&images.VirtCustomizeStep{
+		StepConf: s,
+		Args:     []string{"--no-network"},
+	}}, nil
+}
+
+func buildTestImage(log slogger.Logger, rcnf *GoTestConf) error {
 	imagesDir, baseImage := filepath.Split(rcnf.baseImageFilename)
 
 	tmpDir, err := os.MkdirTemp("", "tetragon-vmtests-")
@@ -224,6 +239,7 @@ func buildTestImage(log *logrus.Logger, rcnf *RunConf) error {
 	}
 
 	actions := []images.Action{
+		{Op: &NoNetworkCommand{}},
 		{Op: &images.SetHostnameCommand{Hostname: rcnf.vmName}},
 		{Op: &images.AppendLineCommand{
 			File: "/etc/sysctl.d/local.conf",

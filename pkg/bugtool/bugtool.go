@@ -7,6 +7,7 @@ package bugtool
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -14,39 +15,45 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/cilium/ebpf"
+	gopssignal "github.com/google/gops/signal"
+	"github.com/vishvananda/netlink"
+	"go.uber.org/multierr"
+
 	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/cmd/tetra/common"
 	"github.com/cilium/tetragon/pkg/defaults"
+	"github.com/cilium/tetragon/pkg/dump"
 	"github.com/cilium/tetragon/pkg/logger"
 	"github.com/cilium/tetragon/pkg/policyfilter"
-	gopssignal "github.com/google/gops/signal"
-	"go.uber.org/multierr"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
-	"github.com/sirupsen/logrus"
-	"github.com/vishvananda/netlink"
+	"github.com/cilium/tetragon/pkg/sensors/base"
+	"github.com/cilium/tetragon/pkg/sensors/exec/execvemap"
 )
 
 // InitInfo contains information about how Tetragon was initialized.
 type InitInfo struct {
 	ExportFname string `json:"export_fname"`
 	LibDir      string `json:"lib_dir"`
-	BtfFname    string `json:"btf_fname"`
+	BTFFname    string `json:"btf_fname"`
 	ServerAddr  string `json:"server_address"`
 	MetricsAddr string `json:"metrics_address"`
 	GopsAddr    string `json:"gops_address"`
 	MapDir      string `json:"map_dir"`
 	BpfToolPath string `json:"bpftool_path"`
 	GopsPath    string `json:"gops_path"`
+	MaxRecvSize int    `json:"max_recv_size"`
+	PID         int    `json:"pid"`
 }
 
 // LoadInitInfo returns the InitInfo by reading the info file from its default location
@@ -62,14 +69,14 @@ func SaveInitInfo(info *InitInfo) error {
 func doLoadInitInfo(fname string) (*InitInfo, error) {
 	f, err := os.Open(fname)
 	if err != nil {
-		logger.GetLogger().WithField("infoFile", fname).Warn("failed to open file")
+		logger.GetLogger().Warn("failed to open file", "infoFile", fname)
 		return nil, err
 	}
 	defer f.Close()
 
 	var info InitInfo
 	if err := json.NewDecoder(f).Decode(&info); err != nil {
-		logger.GetLogger().WithField("infoFile", fname).Warn("failed to read information from file")
+		logger.GetLogger().Warn("failed to read information from file", "infoFile", fname)
 		return nil, err
 	}
 
@@ -83,7 +90,7 @@ func doSaveInitInfo(fname string, info *InitInfo) error {
 		logger.GetLogger().Warn("failed to locate bpftool binary, on bugtool debugging ensure you have bpftool installed")
 	} else {
 		info.BpfToolPath = bpftool
-		logger.GetLogger().WithField("bpftool", info.BpfToolPath).Info("Successfully detected bpftool path")
+		logger.GetLogger().Info("Successfully detected bpftool path", "bpftool", info.BpfToolPath)
 	}
 
 	gops, err := exec.LookPath("gops")
@@ -91,38 +98,80 @@ func doSaveInitInfo(fname string, info *InitInfo) error {
 		logger.GetLogger().Warn("failed to locate gops binary, on bugtool debugging ensure you have gops installed")
 	} else {
 		info.GopsPath = gops
-		logger.GetLogger().WithField("gops", info.GopsPath).Info("Successfully detected gops path")
+		logger.GetLogger().Info("Successfully detected gops path", "gops", info.GopsPath)
 	}
 
 	// Create DefaultRunDir if it does not already exist
 	if err := os.MkdirAll(defaults.DefaultRunDir, 0755); err != nil {
-		logger.GetLogger().WithField("infoFile", fname).Warn("failed to directory exists")
+		logger.GetLogger().Warn("failed to directory exists", "infoFile", fname)
 		return err
 	}
 	f, err := os.OpenFile(fname, os.O_WRONLY|os.O_CREATE, 0744)
 	if err != nil {
-		logger.GetLogger().WithField("infoFile", fname).Warn("failed to create file")
+		logger.GetLogger().Warn("failed to create file", "infoFile", fname)
 		return err
 	}
 	defer f.Close()
 
 	if err := f.Truncate(0); err != nil {
-		logger.GetLogger().WithField("infoFile", fname).Warn("failed to truncate file")
+		logger.GetLogger().Warn("failed to truncate file", "infoFile", fname)
 		return err
 	}
 
 	if err := json.NewEncoder(f).Encode(info); err != nil {
-		logger.GetLogger().WithField("infoFile", fname).Warn("failed to write information to file")
+		logger.GetLogger().Warn("failed to write information to file", "infoFile", fname)
 		return err
 	}
 
 	return nil
 }
 
+// SaveExtraFiles writes a map of extra files (name -> path) to the bugtool
+// extra files JSON file. The daemon calls this at startup so the CLI can
+// discover additional files at bugtool time, even if the daemon has crashed.
+func SaveExtraFiles(files map[string]string) error {
+	if err := os.MkdirAll(defaults.DefaultRunDir, 0755); err != nil {
+		return fmt.Errorf("creating run dir: %w", err)
+	}
+	f, err := os.OpenFile(defaults.BugtoolExtraFiles, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("creating extra files file: %w", err)
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(files); err != nil {
+		return fmt.Errorf("encoding extra files: %w", err)
+	}
+	return nil
+}
+
+// LoadExtraFiles reads the map of extra files previously written by
+// SaveExtraFiles. Returns nil (not an error) if the file does not exist,
+// since not all deployments produce extra files.
+func LoadExtraFiles() (map[string]string, error) {
+	return doLoadExtraFiles(defaults.BugtoolExtraFiles)
+}
+
+func doLoadExtraFiles(fname string) (map[string]string, error) {
+	f, err := os.Open(fname)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("opening extra files file: %w", err)
+	}
+	defer f.Close()
+	var files map[string]string
+	if err := json.NewDecoder(f).Decode(&files); err != nil {
+		return nil, fmt.Errorf("decoding extra files: %w", err)
+	}
+	return files, nil
+}
+
 type bugtoolInfo struct {
 	info      *InitInfo
 	prefixDir string
 	multiLog  MultiLog
+	tarWriter *tar.Writer
 }
 
 func doTarAddBuff(tarWriter *tar.Writer, fname string, buff *bytes.Buffer) error {
@@ -135,6 +184,7 @@ func doTarAddBuff(tarWriter *tar.Writer, fname string, buff *bytes.Buffer) error
 
 	if err := tarWriter.WriteHeader(&logHdr); err != nil {
 		logger.GetLogger().Error("failed to write log buffer tar header")
+		return err
 	}
 
 	_, err := io.Copy(tarWriter, buff)
@@ -144,20 +194,20 @@ func doTarAddBuff(tarWriter *tar.Writer, fname string, buff *bytes.Buffer) error
 	return err
 }
 
-func (s *bugtoolInfo) tarAddBuff(tarWriter *tar.Writer, fname string, buff *bytes.Buffer) error {
+func (s *bugtoolInfo) tarAddBuff(fname string, buff *bytes.Buffer) error {
 	name := filepath.Join(s.prefixDir, fname)
-	return doTarAddBuff(tarWriter, name, buff)
+	return doTarAddBuff(s.tarWriter, name, buff)
 }
 
-func (s *bugtoolInfo) tarAddJson(tarWriter *tar.Writer, fname string, obj interface{}) error {
+func (s *bugtoolInfo) TarAddJson(fname string, obj any) error {
 	b, err := json.Marshal(obj)
 	if err != nil {
 		return err
 	}
-	return s.tarAddBuff(tarWriter, fname, bytes.NewBuffer(b))
+	return s.tarAddBuff(fname, bytes.NewBuffer(b))
 }
 
-func (s *bugtoolInfo) tarAddFile(tarWriter *tar.Writer, fnameSrc string, fnameDst string) error {
+func (s *bugtoolInfo) tarAddFile(fnameSrc string, fnameDst string) error {
 	fileSrc, err := os.Open(fnameSrc)
 	if err != nil {
 		s.multiLog.WithField("path", fnameSrc).Warn("failed to open file")
@@ -178,22 +228,34 @@ func (s *bugtoolInfo) tarAddFile(tarWriter *tar.Writer, fnameSrc string, fnameDs
 	}
 	hdr.Name = filepath.Join(s.prefixDir, fnameDst)
 
-	if err := tarWriter.WriteHeader(hdr); err != nil {
+	if err := s.tarWriter.WriteHeader(hdr); err != nil {
 		s.multiLog.Warn("failed to write tar header")
 		return err
 	}
 
-	_, err = io.Copy(tarWriter, fileSrc)
+	_, err = io.Copy(s.tarWriter, fileSrc)
 	if err != nil {
-		s.multiLog.WithField("fnameSrc", fnameSrc).Warn("error copying data from source file")
+		s.multiLog.WithError(err).WithField("fnameSrc", fnameSrc).Warn("error copying data from source file")
 		return err
 	}
 
 	return nil
 }
 
-// Bugtool gathers information and writes it as a tar archive in the given filename
-func Bugtool(outFname string, bpftool string, gops string) error {
+type Commander interface {
+	ExecCmd(dstFname string, cmdName string, cmdArgs ...string) error
+}
+
+type GRPCer interface {
+	TarAddJson(fname string, obj any) error
+}
+
+type CommandAction func(Commander) error
+type GRPCAction func(GRPCer) error
+
+// Bugtool gathers information and writes it as a tar archive in the given filename.
+// Additional command or grpc calls can be enqueued through last 2 params.
+func Bugtool(outFname string, bpftool string, gops string, maxRecvSize int, commandActions []CommandAction, grpcActions []GRPCAction) error {
 	info, err := LoadInitInfo()
 	if err != nil {
 		return err
@@ -207,23 +269,25 @@ func Bugtool(outFname string, bpftool string, gops string) error {
 		info.GopsPath = gops
 	}
 
-	return doBugtool(info, outFname)
+	info.MaxRecvSize = maxRecvSize
+
+	return doBugtool(info, outFname, commandActions, grpcActions)
 }
 
-func doBugtool(info *InitInfo, outFname string) error {
+func doBugtool(info *InitInfo, outFname string, commandActions []CommandAction, grpcActions []GRPCAction) error {
 	// we log into two logs, one is the standard one and another one is a
 	// buffer that we are going to include as a file into the bugtool archive.
-	bugtoolLogger := logrus.New()
 	logBuff := new(bytes.Buffer)
-	bugtoolLogger.Out = logBuff
-	logrus.SetLevel(logrus.InfoLevel)
+	bugtoolLogger := slog.New(slog.NewTextHandler(logBuff, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 	multiLog := MultiLog{
-		Logs: []logrus.FieldLogger{
+		Logs: []logger.FieldLogger{
 			logger.GetLogger(),
 			bugtoolLogger,
 		},
 	}
-	prefixDir := fmt.Sprintf("tetragon-bugtool-%s", time.Now().Format("20060102150405"))
+	prefixDir := "tetragon-bugtool-" + time.Now().Format("20060102150405")
 
 	outFile, err := os.Create(outFname)
 	if err != nil {
@@ -241,34 +305,57 @@ func doBugtool(info *InitInfo, outFname string) error {
 	gzWriter := gzip.NewWriter(outFile)
 	defer gzWriter.Close()
 
-	tarWriter := tar.NewWriter(gzWriter)
+	si.tarWriter = tar.NewWriter(gzWriter)
 	defer func() {
-		defer tarWriter.Close()
-		si.tarAddBuff(tarWriter, "tetragon-bugtool.log", logBuff)
+		defer si.tarWriter.Close()
+		si.tarAddBuff("tetragon-bugtool.log", logBuff)
 	}()
 
-	si.addInitInfo(tarWriter)
-	si.addLibFiles(tarWriter)
-	si.addBtfFile(tarWriter)
-	si.addTetragonLog(tarWriter)
-	si.addMetrics(tarWriter)
-	si.execCmd(tarWriter, "dmesg.out", "dmesg")
-	si.addTcInfo(tarWriter)
-	si.addBpftoolInfo(tarWriter)
-	si.addGopsInfo(tarWriter)
-	si.dumpPolicyFilterMap(tarWriter)
-	si.addGrpcInfo(tarWriter)
+	si.addInitInfo()
+	si.addLibFiles()
+	si.addBTFFile()
+	si.addTetragonLog()
+	si.addMetrics()
+	si.ExecCmd("dmesg.out", "dmesg")
+	si.addTcInfo()
+	si.addBpftoolInfo()
+	if si.info.GopsAddr == "" {
+		si.multiLog.Info("Skipping gops dump info as daemon is running without gops, use --gops-address to enable gops")
+	} else {
+		si.addGopsInfo()
+		si.addPProfInfo()
+	}
+	si.dumpPolicyFilterMap()
+	si.addProcessCache()
+	si.addExecveMap()
+	si.addGrpcInfo()
+	si.addPmapOut()
+	si.addMemCgroupStats()
+	si.addBPFMapsStats()
+	si.addTracefsTraceFile()
+	si.addExtraFiles()
+
+	// Additional command actions
+	for _, action := range commandActions {
+		action(&si)
+	}
+
+	// Additional grpc actions
+	for _, action := range grpcActions {
+		action(&si)
+	}
+
 	return nil
 }
 
-func (s *bugtoolInfo) addInitInfo(tarWriter *tar.Writer) error {
+func (s *bugtoolInfo) addInitInfo() error {
 	s.multiLog.Info("saving init info")
 	buff := new(bytes.Buffer)
 	if err := json.NewEncoder(buff).Encode(s.info); err != nil {
 		s.multiLog.Warn("failed to serialze init info")
 		return err
 	}
-	return s.tarAddBuff(tarWriter, "tetragon-info.json", buff)
+	return s.tarAddBuff("tetragon-info.json", buff)
 }
 
 // addLibFiles adds all files under the hubble lib directory to the archive.
@@ -276,7 +363,7 @@ func (s *bugtoolInfo) addInitInfo(tarWriter *tar.Writer) error {
 // Currently, this includes the bpf files and potentially the btf file if it is stored there.  If
 // there are files that we do not want to add, we can filter them out, but for now we can just grab
 // everything.
-func (s *bugtoolInfo) addLibFiles(tarWriter *tar.Writer) error {
+func (s *bugtoolInfo) addLibFiles() error {
 	s.multiLog.WithField("libDir", s.info.LibDir).Info("retrieving lib directory")
 	return filepath.Walk(
 		s.info.LibDir,
@@ -299,7 +386,7 @@ func (s *bugtoolInfo) addLibFiles(tarWriter *tar.Writer) error {
 			// symlinks if they point within the directory we are archiving, but since
 			// we do not use them, there is currently no reason for the complexity.
 			mode := info.Mode()
-			if !(mode.IsRegular() || mode.IsDir()) {
+			if !mode.IsRegular() && !mode.IsDir() {
 				s.multiLog.WithField("path", path).Warn("not a regular file, ignoring")
 				return nil
 			}
@@ -317,7 +404,7 @@ func (s *bugtoolInfo) addLibFiles(tarWriter *tar.Writer) error {
 			// fix filename
 			hdr.Name = filepath.Join(s.prefixDir, "lib", strings.TrimPrefix(path, s.info.LibDir))
 
-			if err := tarWriter.WriteHeader(hdr); err != nil {
+			if err := s.tarWriter.WriteHeader(hdr); err != nil {
 				s.multiLog.WithField("path", path).Warn("failed to write tar header")
 				return nil
 			}
@@ -333,7 +420,7 @@ func (s *bugtoolInfo) addLibFiles(tarWriter *tar.Writer) error {
 				return nil
 			}
 			defer file.Close()
-			_, err = io.Copy(tarWriter, file)
+			_, err = io.Copy(s.tarWriter, file)
 			if err != nil {
 				s.multiLog.WithField("path", path).Warn("error copying data from file")
 				return nil
@@ -342,15 +429,15 @@ func (s *bugtoolInfo) addLibFiles(tarWriter *tar.Writer) error {
 		})
 }
 
-// addBtfFile adds the btf file to the archive.
-func (s *bugtoolInfo) addBtfFile(tarWriter *tar.Writer) error {
-	btfFname, err := filepath.EvalSymlinks(s.info.BtfFname)
-	if err != nil && s.info.BtfFname != "" {
-		s.multiLog.WithField("btfFname", s.info.BtfFname).Warnf("error resolving btf file: %s", err)
+// addBTFFile adds the btf file to the archive.
+func (s *bugtoolInfo) addBTFFile() error {
+	btfFname, err := filepath.EvalSymlinks(s.info.BTFFname)
+	if err != nil && s.info.BTFFname != "" {
+		s.multiLog.WithField("btfFname", s.info.BTFFname).Warnf("error resolving btf file: %s", err)
 		return err
 	}
 
-	if s.info.BtfFname == "" {
+	if s.info.BTFFname == "" {
 		s.multiLog.Warnf("no btf filename in tetragon config, attempting to fall back to /sys/kernel/btf/vmlinux")
 		btfFname = "/sys/kernel/btf/vmlinux"
 	}
@@ -360,7 +447,7 @@ func (s *bugtoolInfo) addBtfFile(tarWriter *tar.Writer) error {
 		return nil
 	}
 
-	err = s.tarAddFile(tarWriter, btfFname, "btf")
+	err = s.tarAddFile(btfFname, "btf")
 	if err == nil {
 		s.multiLog.WithField("btfFname", btfFname).Info("btf file added")
 	}
@@ -368,13 +455,13 @@ func (s *bugtoolInfo) addBtfFile(tarWriter *tar.Writer) error {
 }
 
 // addTetragonLog adds the tetragon log file to the archive
-func (s *bugtoolInfo) addTetragonLog(tarWriter *tar.Writer) error {
+func (s *bugtoolInfo) addTetragonLog() error {
 	if s.info.ExportFname == "" {
 		s.multiLog.Info("no export file specified")
 		return nil
 	}
 
-	err := s.tarAddFile(tarWriter, s.info.ExportFname, "tetragon.log")
+	err := s.tarAddFile(s.info.ExportFname, "tetragon.log")
 	if err == nil {
 		s.multiLog.WithField("exportFname", s.info.ExportFname).Info("tetragon log file added")
 	}
@@ -382,7 +469,7 @@ func (s *bugtoolInfo) addTetragonLog(tarWriter *tar.Writer) error {
 }
 
 // addMetrics adds the output of metrics in the tar file
-func (s *bugtoolInfo) addMetrics(tarWriter *tar.Writer) error {
+func (s *bugtoolInfo) addMetrics() error {
 	// nothing to do if metrics server is not running
 	if s.info.MetricsAddr == "" {
 		return nil
@@ -408,13 +495,13 @@ func (s *bugtoolInfo) addMetrics(tarWriter *tar.Writer) error {
 
 	buff := new(bytes.Buffer)
 	if _, err = buff.ReadFrom(resp.Body); err != nil {
-		s.multiLog.Warn("error in reading metrics server response: %s", err)
+		s.multiLog.WithError(err).Warn("error in reading metrics server response")
 	}
-	return s.tarAddBuff(tarWriter, "metrics", buff)
+	return s.tarAddBuff("metrics", buff)
 }
 
-// execCmd executes a command and saves its output (both stdout and stderr) to a file in the tar archive
-func (s *bugtoolInfo) execCmd(tarWriter *tar.Writer, dstFname string, cmdName string, cmdArgs ...string) error {
+// ExecCmd executes a command and saves its output (both stdout and stderr) to a file in the tar archive
+func (s *bugtoolInfo) ExecCmd(dstFname string, cmdName string, cmdArgs ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, cmdName, cmdArgs...)
@@ -465,16 +552,16 @@ func (s *bugtoolInfo) execCmd(tarWriter *tar.Writer, dstFname string, cmdName st
 	}
 	s.multiLog.WithField("cmd", cmd).WithField("ret", errStr).WithField("dstFname", dstFname).Info("executed command")
 
-	ret := s.tarAddBuff(tarWriter, dstFname, outbuff)
+	ret := s.tarAddBuff(dstFname, outbuff)
 	if errbuff.Len() > 0 {
-		errstderr := s.tarAddBuff(tarWriter, dstFname+".err", errbuff)
+		errstderr := s.tarAddBuff(dstFname+".err", errbuff)
 		ret = multierr.Append(ret, errstderr)
 	}
 	return ret
 }
 
 // addTcInfo adds information about tc filters on the devices
-func (s *bugtoolInfo) addTcInfo(tarWriter *tar.Writer) error {
+func (s *bugtoolInfo) addTcInfo() error {
 	links, err := netlink.LinkList()
 	if err != nil {
 		s.multiLog.WithError(err).Warn("listing devices failed")
@@ -487,15 +574,15 @@ func (s *bugtoolInfo) addTcInfo(tarWriter *tar.Writer) error {
 	// and also provides additional information that may be useful.
 	for _, link := range links {
 		linkName := link.Attrs().Name
-		s.execCmd(tarWriter, fmt.Sprintf("tc-info.%s.ingress", linkName), "tc", "filter", "show", "dev", linkName, "ingress")
-		s.execCmd(tarWriter, fmt.Sprintf("tc-info.%s.egress", linkName), "tc", "filter", "show", "dev", linkName, "egress")
+		s.ExecCmd(fmt.Sprintf("tc-info.%s.ingress", linkName), "tc", "filter", "show", "dev", linkName, "ingress")
+		s.ExecCmd(fmt.Sprintf("tc-info.%s.egress", linkName), "tc", "filter", "show", "dev", linkName, "egress")
 	}
 
 	return err
 }
 
 // addBpftoolInfo adds information about loaded eBPF maps and programs
-func (s *bugtoolInfo) addBpftoolInfo(tarWriter *tar.Writer) {
+func (s *bugtoolInfo) addBpftoolInfo() {
 	if s.info.BpfToolPath == "" {
 		s.multiLog.Warn("Failed to locate bpftool, please install it and specify its path")
 		return
@@ -506,17 +593,12 @@ func (s *bugtoolInfo) addBpftoolInfo(tarWriter *tar.Writer) {
 		s.multiLog.WithError(err).Warn("Failed to locate bpftool. Please install it or specify its path, see 'bugtool --help'")
 		return
 	}
-	s.execCmd(tarWriter, "bpftool-maps.json", s.info.BpfToolPath, "map", "show", "-j")
-	s.execCmd(tarWriter, "bpftool-progs.json", s.info.BpfToolPath, "prog", "show", "-j")
-	s.execCmd(tarWriter, "bpftool-cgroups.json", s.info.BpfToolPath, "cgroup", "tree", "-j")
+	s.ExecCmd("bpftool-maps.json", s.info.BpfToolPath, "map", "show", "-j")
+	s.ExecCmd("bpftool-progs.json", s.info.BpfToolPath, "prog", "show", "-j")
+	s.ExecCmd("bpftool-cgroups.json", s.info.BpfToolPath, "cgroup", "tree", "-j")
 }
 
-func (s *bugtoolInfo) getPProf(tarWriter *tar.Writer, file string) error {
-	if s.info.GopsAddr == "" {
-		s.multiLog.Info("Skipping gops dump info as daemon is running without gops, use --gops-address to enable gops")
-		return nil
-	}
-
+func (s *bugtoolInfo) getPProf(file string, gopsSignal byte) error {
 	s.multiLog.WithField("gops-address", s.info.GopsAddr).Info("Contacting gops server for pprof dump")
 
 	conn, err := net.Dial("tcp", s.info.GopsAddr)
@@ -524,26 +606,43 @@ func (s *bugtoolInfo) getPProf(tarWriter *tar.Writer, file string) error {
 		s.multiLog.WithField("gops-address", s.info.GopsAddr).WithError(err).Warn("Failed to contact gops server")
 		return err
 	}
+	defer conn.Close()
 
-	buf := []byte{gopssignal.HeapProfile}
+	buf := []byte{gopsSignal}
 	if _, err := conn.Write(buf); err != nil {
-		s.multiLog.WithField("gops-address", s.info.GopsAddr).WithError(err).Warn("Failed to send gops pprof-heap command")
+		s.multiLog.WithField("gops-address", s.info.GopsAddr).WithField("file", file).WithError(err).Warn("Failed to send gops pprof command")
 		return err
 	}
 
 	buff := new(bytes.Buffer)
 	if _, err = buff.ReadFrom(conn); err != nil {
-		s.multiLog.WithField("gops-address", s.info.GopsAddr).WithError(err).Warn("Failed reading gops pprof-heap response")
+		s.multiLog.WithField("gops-address", s.info.GopsAddr).WithField("file", file).WithError(err).Warn("Failed reading gops pprof response")
 	}
-	return s.tarAddBuff(tarWriter, file, buff)
+	return s.tarAddBuff(file, buff)
 }
 
-func (s *bugtoolInfo) addGopsInfo(tarWriter *tar.Writer) {
-	if s.info.GopsAddr == "" {
-		s.multiLog.Info("Skipping gops dump info as daemon is running without gops, use --gops-address to enable gops")
-		return
+func (s *bugtoolInfo) addPProfInfo() {
+	profiles := map[string]byte{
+		"cpu":  gopssignal.CPUProfile,
+		"heap": gopssignal.HeapProfile,
 	}
 
+	for name, signal := range profiles {
+		err := s.getPProf("gops.pprof-"+name, signal)
+		if err != nil {
+			s.multiLog.
+				WithField("profile", name).
+				WithError(err).
+				Warn("Failed to dump gops pprof")
+		} else {
+			s.multiLog.
+				WithField("profile", name).
+				Info("Successfully dumped gops pprof")
+		}
+	}
+}
+
+func (s *bugtoolInfo) addGopsInfo() {
 	if s.info.GopsPath == "" {
 		s.multiLog.WithField("gops-address", s.info.GopsAddr).Warn("Failed to locate gops. Please install it or specify its path, see 'bugtool --help'")
 		return
@@ -557,18 +656,12 @@ func (s *bugtoolInfo) addGopsInfo(tarWriter *tar.Writer) {
 
 	s.multiLog.WithField("gops-address", s.info.GopsAddr).WithField("gops-path", s.info.GopsPath).Info("Dumping gops information")
 
-	s.execCmd(tarWriter, "gops.stack", s.info.GopsPath, "stack", s.info.GopsAddr)
-	s.execCmd(tarWriter, "gops.stats", s.info.GopsPath, "stats", s.info.GopsAddr)
-	s.execCmd(tarWriter, "gops.memstats", s.info.GopsPath, "memstats", s.info.GopsAddr)
-	err = s.getPProf(tarWriter, "gops.pprof-heap")
-	if err != nil {
-		s.multiLog.WithField("gops-address", s.info.GopsAddr).WithField("gops-path", s.info.GopsPath).WithError(err).Warn("Failed to dump gops pprof-heap")
-	} else {
-		s.multiLog.WithField("gops-address", s.info.GopsAddr).WithField("gops-path", s.info.GopsPath).Info("Successfully dumped gops pprof-heap")
-	}
+	s.ExecCmd("gops.stack", s.info.GopsPath, "stack", s.info.GopsAddr)
+	s.ExecCmd("gops.stats", s.info.GopsPath, "stats", s.info.GopsAddr)
+	s.ExecCmd("gops.memstats", s.info.GopsPath, "memstats", s.info.GopsAddr)
 }
 
-func (s *bugtoolInfo) dumpPolicyFilterMap(tarWriter *tar.Writer) error {
+func (s *bugtoolInfo) dumpPolicyFilterMap() error {
 	fname := path.Join(s.info.MapDir, policyfilter.MapName)
 	m, err := policyfilter.OpenMap(fname)
 	if err != nil {
@@ -581,37 +674,274 @@ func (s *bugtoolInfo) dumpPolicyFilterMap(tarWriter *tar.Writer) error {
 		s.multiLog.WithError(err).Warnf("failed to dump policyfilter map")
 		return err
 	}
-	return s.tarAddJson(tarWriter, policyfilter.MapName+".json", obj)
+	return s.TarAddJson(policyfilter.MapName+".json", obj)
 }
 
-func (s *bugtoolInfo) addGrpcInfo(tarWriter *tar.Writer) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	conn, err := grpc.DialContext(
-		ctx,
-		s.info.ServerAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-	)
+func (s *bugtoolInfo) addExecveMap() error {
+	fname := path.Join(s.info.MapDir, base.ExecveMap.Name)
+	m, err := ebpf.LoadPinnedMap(fname, &ebpf.LoadPinOptions{
+		ReadOnly: true,
+	})
 	if err != nil {
-		s.multiLog.Warnf("failed to connect to %s: %v", s.info.ServerAddr, err)
+		s.multiLog.WithError(err).Warnf("failed to open execve map")
+		return err
+	}
+	defer m.Close()
+
+	iter := m.Iterate()
+
+	var key execvemap.ExecveKey
+	var val execvemap.ExecveValue
+	buff := new(bytes.Buffer)
+	for iter.Next(&key, &val) {
+		fmt.Fprintf(buff, "%d %+v\n", key, val)
+	}
+
+	if err := iter.Err(); err != nil {
+		s.multiLog.WithError(err).Warnf("error iterating execve map")
+		return err
+	}
+
+	filename := base.ExecveMap.Name + ".out"
+	s.multiLog.Infof("dumped execve map in %s", filename)
+	return s.tarAddBuff(filename, buff)
+}
+
+func (s *bugtoolInfo) addProcessCache() error {
+	c, err := common.NewClient(context.Background(), s.info.ServerAddr, 5*time.Second)
+	if err != nil {
+		s.multiLog.WithError(err).Warnf("failed to create gRPC client to %s", s.info.ServerAddr)
+		return err
+	}
+	defer c.Close()
+
+	processes, err := dump.GetProcessCacheForDump(c.Ctx, c.Client, s.info.MaxRecvSize, false, false)
+	if err != nil {
+		s.multiLog.WithError(err).Warn("failed to dump process cache")
+		return err
+	}
+
+	buff := new(bytes.Buffer)
+	for _, p := range processes {
+		b, err := p.MarshalJSON()
+		if err != nil {
+			s.multiLog.WithError(err).Warn("failed to marshal process")
+			continue
+		}
+		buff.Write(b)
+		buff.WriteByte('\n')
+	}
+
+	s.multiLog.Infof("dumped process cache in %s", "processcache.json")
+	return s.tarAddBuff("processcache.json", buff)
+}
+
+func (s *bugtoolInfo) addGrpcInfo() {
+	c, err := common.NewClient(context.Background(), s.info.ServerAddr, 5*time.Second)
+	if err != nil {
+		s.multiLog.Warnf("failed to create gRPC client to %s: %v", s.info.ServerAddr, err)
 		return
 	}
-	defer conn.Close()
-	client := tetragon.NewFineGuidanceSensorsClient(conn)
+	defer c.Close()
 
-	res, err := client.ListTracingPolicies(ctx, &tetragon.ListTracingPoliciesRequest{})
+	res, err := c.Client.ListTracingPolicies(c.Ctx, &tetragon.ListTracingPoliciesRequest{})
 	if err != nil || res == nil {
 		s.multiLog.Warnf("failed to list tracing policies: %v", err)
 		return
 	}
 
 	fname := "tracing-policies.json"
-	err = s.tarAddJson(tarWriter, fname, res)
+	err = s.TarAddJson(fname, res)
 	if err != nil {
 		s.multiLog.Warnf("failed to dump tracing policies: %v", err)
 		return
 	}
 
 	s.multiLog.Infof("dumped tracing policies in %s", fname)
+}
+
+func (s bugtoolInfo) addPmapOut() error {
+	pmap, err := exec.LookPath("pmap")
+	if err != nil {
+		s.multiLog.WithError(err).Warn("Failed to locate pmap. Please install it.")
+		return fmt.Errorf("failed to locate pmap: %w", err)
+	}
+
+	s.ExecCmd("pmap.out", pmap, "-x", strconv.Itoa(s.info.PID))
+	return nil
+}
+
+func findCgroupMountPath(r io.Reader, unified bool, controller string) (string, error) {
+	cgroupName := "cgroup"
+	if unified {
+		cgroupName = "cgroup2"
+	}
+
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && (fields[2] == cgroupName) {
+			if unified || !unified && strings.HasSuffix(fields[1], controller) {
+				return fields[1], nil
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("error reading /proc/mounts: %w", err)
+	}
+
+	return "", errors.New("cgroup filesystem not found")
+}
+
+func FindCgroupMountPath(unified bool, controller string) (string, error) {
+	file, err := os.Open("/proc/mounts")
+	if err != nil {
+		return "", fmt.Errorf("failed to open /proc/mounts: %w", err)
+	}
+	defer file.Close()
+	return findCgroupMountPath(file, unified, controller)
+}
+
+func findMemoryCgroupPath(r io.Reader) (bool, string, error) {
+	var unified bool
+	var memoryCgroupPath string
+
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// '/proc/$PID/cgroup' lists a process's cgroup membership. If legacy cgroup is
+		// in use in the system, this file may contain multiple lines, one for each
+		// hierarchy. The entry for cgroup v2 is always in the format '0::$PATH'.
+		if strings.HasPrefix(line, "0::/") {
+			unified = true
+			memoryCgroupPath = strings.TrimPrefix(line, "0::")
+
+			// we don't break here because we want to consider cases in which
+			// cgroup v2 line is before other cgroup v1 lines and we want to
+			// consider hybrid as v1, not sure it can happen in real life
+			continue
+		}
+
+		// Parsing for cgroup v1, consider hybrid as v1
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) == 3 {
+			if parts[1] == "memory" {
+				unified = false
+				memoryCgroupPath = parts[2]
+				break
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return false, "", fmt.Errorf("failed reading /proc/self/cgroup: %w", err)
+	}
+
+	return unified, memoryCgroupPath, nil
+}
+
+func FindMemoryCgroupPath() (unified bool, memoryCgroupPath string, err error) {
+	file, err := os.Open("/proc/self/cgroup")
+	if err != nil {
+		return false, "", fmt.Errorf("failed to open /proc/self/cgroup: %w", err)
+	}
+	defer file.Close()
+	return findMemoryCgroupPath(file)
+}
+
+func (s bugtoolInfo) addMemCgroupStats() error {
+	unifiedCgroup, memoryCgroupPath, err := FindMemoryCgroupPath()
+	if err != nil {
+		s.multiLog.WithError(err).Warn("failed finding the memory cgroup path")
+		return fmt.Errorf("failed to find memory cgroup path: %w", err)
+	}
+
+	cgroupMountPath, err := FindCgroupMountPath(unifiedCgroup, "memory")
+	if err != nil {
+		s.multiLog.WithError(err).Warn("failed to find cgroup mount path")
+		return fmt.Errorf("failed to find cgroup mount path: %w", err)
+	}
+
+	cgroupPath := filepath.Join(cgroupMountPath, memoryCgroupPath)
+
+	// can't use s.tarAddFile here unfortunately because it is using io.Copy
+	// based on the size retrieved from the stat of the file, and cgroup fs
+	// files have size equal to 0
+	readAndWrite := func(cgroupBasePath string, file string) error {
+		buf, err := os.ReadFile(filepath.Join(cgroupBasePath, file))
+		if err != nil {
+			s.multiLog.WithError(err).WithField("file", file).Warn("failed to read cgroup file")
+			return fmt.Errorf("failed to read file %s: %w", file, err)
+		}
+		err = s.tarAddBuff(file, bytes.NewBuffer(buf))
+		if err != nil {
+			return fmt.Errorf("failed to add buffer: %w", err)
+		}
+		s.multiLog.WithField("file", file).Info("cgroup file added")
+		return nil
+	}
+
+	if unifiedCgroup {
+		readAndWrite(cgroupPath, "memory.current")
+		readAndWrite(cgroupPath, "memory.stat")
+	} else {
+		err := readAndWrite(cgroupPath, "memory.usage_in_bytes")
+		if err != nil {
+			// Before cgroup namespace, /proc/pid/cgroup mapping was broken, so
+			// Docker back in the days mounted the cgroup hierarchy flat in the
+			// containerfs.  For compatibility, it still does that for cgroup v1.
+			// See more https://lewisgaul.co.uk/blog/coding/2022/05/13/cgroups-intro/#cgroups-and-containers
+			cgroupPath = cgroupMountPath
+			s.multiLog.WithField("cgroupPath", cgroupPath).Info("retrying to read cgroup file from a different legacy path")
+			readAndWrite(cgroupPath, "memory.usage_in_bytes")
+		}
+		readAndWrite(cgroupPath, "memory.kmem.usage_in_bytes")
+		readAndWrite(cgroupPath, "memory.stat")
+	}
+
+	return nil
+}
+
+func (s bugtoolInfo) addBPFMapsStats() error {
+	out, err := RunMapsChecks(TetragonBPFFS)
+	if err != nil {
+		s.multiLog.WithError(err).Warn("failed to run BPF maps checks")
+		return fmt.Errorf("failed to run BPF maps checks: %w", err)
+	}
+
+	const file = "debugmaps.json"
+	err = s.TarAddJson(file, out)
+	if err != nil {
+		s.multiLog.WithError(err).Warn("failed to add the BPF maps checks to the tar archive")
+		return err
+	}
+	s.multiLog.WithField("file", file).Info("BPF maps checks added")
+	return nil
+}
+
+func (s *bugtoolInfo) addTracefsTraceFile() {
+	err := s.ExecCmd("trace", "cat", "/sys/kernel/tracing/trace")
+	if err != nil {
+		s.multiLog.Warnf("failed to get trace file: %v", err)
+	}
+}
+
+func (s *bugtoolInfo) addExtraFiles() {
+	extraFiles, err := LoadExtraFiles()
+	if err != nil {
+		s.multiLog.WithError(err).Warn("failed to load extra files list")
+		return
+	}
+	for name, path := range extraFiles {
+		if path == "" {
+			continue
+		}
+		s.multiLog.WithField("name", name).WithField("path", path).Info("adding extra file")
+		if err := s.tarAddFile(path, name); err != nil {
+			s.multiLog.WithField("name", name).WithField("path", path).WithError(err).Warn("failed to add extra file")
+		}
+	}
 }

@@ -4,23 +4,16 @@
 package exec
 
 import (
-	"syscall"
-
 	"github.com/cilium/tetragon/pkg/api"
-	"golang.org/x/sys/unix"
 )
 
 // TODO: Harmonize these with the API docs (Flags field in tetragon.Process)
 var FlagStrings = map[uint32]string{
-	api.EventExecve: "execve",
-	// nolint We still want to support this even though it's deprecated
-	api.EventExecveAt:              "execveat",
+	api.EventExecve:                "execve",
 	api.EventProcFS:                "procFS",
-	api.EventTruncFilename:         "truncFilename",
+	api.EventErrorEnvs:             "errorEnvs",
 	api.EventTruncArgs:             "truncArgs",
-	api.EventTaskWalk:              "taskWalk",
 	api.EventMiss:                  "miss",
-	api.EventNeedsAUID:             "auid",
 	api.EventErrorFilename:         "errorFilename",
 	api.EventErrorArgs:             "errorArgs",
 	api.EventNoCWDSupport:          "nocwd",
@@ -29,23 +22,21 @@ var FlagStrings = map[uint32]string{
 	api.EventClone:                 "clone",
 	api.EventErrorCgroupName:       "errorCgroupName",
 	api.EventErrorCgroupId:         "errorCgroupID",
-	api.EventErrorCgroupKn:         "errorCgroupKn",
 	api.EventErrorCgroupSubsysCgrp: "errorCgroupSubsysCgrp",
 	api.EventErrorCgroupSubsys:     "errorCgroupSubsys",
 	api.EventErrorCgroups:          "errorCgroups",
 	api.EventErrorPathComponents:   "errorPathResolutionCwd",
+	api.EventDataFilename:          "dataFilename",
+	api.EventDataArgs:              "dataArgs",
+	api.EventInInitTree:            "inInitTree",
 }
 
 var flagsOrdered = []uint32{
 	api.EventExecve,
-	// nolint We still want to support this even though it's deprecated
-	api.EventExecveAt,
 	api.EventProcFS,
-	api.EventTruncFilename,
+	api.EventErrorEnvs,
 	api.EventTruncArgs,
-	api.EventTaskWalk,
 	api.EventMiss,
-	api.EventNeedsAUID,
 	api.EventErrorFilename,
 	api.EventErrorArgs,
 	api.EventNoCWDSupport,
@@ -54,11 +45,13 @@ var flagsOrdered = []uint32{
 	api.EventClone,
 	api.EventErrorCgroupName,
 	api.EventErrorCgroupId,
-	api.EventErrorCgroupKn,
 	api.EventErrorCgroupSubsysCgrp,
 	api.EventErrorCgroupSubsys,
 	api.EventErrorCgroups,
 	api.EventErrorPathComponents,
+	api.EventDataFilename,
+	api.EventDataArgs,
+	api.EventInInitTree,
 }
 
 func DecodeCommonFlags(flags uint32) []string {
@@ -70,11 +63,4 @@ func DecodeCommonFlags(flags uint32) []string {
 		}
 	}
 	return s
-}
-
-func Signal(s uint32) string {
-	if s == 0 {
-		return ""
-	}
-	return unix.SignalName(syscall.Signal(s))
 }

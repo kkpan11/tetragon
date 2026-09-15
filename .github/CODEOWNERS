@@ -1,18 +1,31 @@
 # Request a review from the Tetragon team on any PR
-* @cilium/tetragon
+* @cilium/tetragon-reviewers
 
 # Request a review from William when codegen is edited
-/cmd/protoc-gen-go-tetragon/ @willfindlay
+/cmd/protoc-gen-go-tetragon/ @will-isovalent @cilium/tetragon-reviewers
+# Request a review from William when protobuf infra is edited
+/api/* @will-isovalent @cilium/tetragon-reviewers
 
-# Request a review from William when CI is edited
-/.github/workflows/ @willfindlay @cilium/tetragon
+# Request a review from tetragon-bpf team on any bpf related changes
+/bpf/ @cilium/tetragon-bpf
+/pkg/bpf/ @cilium/tetragon-bpf
+/pkg/btf/ @cilium/tetragon-bpf
+# Also request a review from kkourt when core sensor files are modified
+/pkg/sensors/ @kkourt @cilium/tetragon-bpf
 
-# Request a review from kkourt when core sensor files are modified
-/pkg/src/sensors/ @kkourt
+# Request a review from the tetragon-windows team on any windows changes
+*_windows.go @cilium/tetragon-windows @cilium/tetragon-reviewers
+/.github/workflows/windows-build-smoke-test.yml @cilium/tetragon-windows
+/bpf/windows/ @cilium/tetragon-windows
+# Do not request tetragon-windows reviews for vendored Windows files.
+**/vendor/**/*_windows.go @cilium/tetragon-reviewers
 
-# Request a review from mtardy when anything from docs is modified but do not
-# block on approval from anyone in the tetragon team
-/docs/ @mtardy @cilium/tetragon
-# Exclude some docs generated files from mtardy ownership
-/docs/content/en/docs/reference/grpc-api.md @cilium/tetragon
-/docs/content/en/docs/reference/helm-chart.md @cilium/tetragon
+# Request a review from the tetragon-docs team on any doc changes
+/docs/ @cilium/tetragon-docs
+/*.md @cilium/tetragon-docs
+# Exclude some docs generated files from specific tetragon-docs ownership
+/docs/content/en/docs/reference/helm-chart.md @cilium/tetragon-reviewers
+/docs/content/en/docs/reference/grpc-api.md @cilium/tetragon-reviewers
+/docs/content/en/docs/reference/metrics.md @cilium/tetragon-reviewers
+/docs/data/tetragon_flags.yaml @cilium/tetragon-reviewers
+/docs/content/en/docs/reference/tracing-policy.md @cilium/tetragon-reviewers

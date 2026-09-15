@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 import (
@@ -10,6 +12,8 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
@@ -22,7 +26,6 @@ import (
 	"github.com/cilium/tetragon/pkg/observer/observertesthelper"
 	"github.com/cilium/tetragon/pkg/testutils"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
-	"github.com/stretchr/testify/assert"
 
 	_ "github.com/cilium/tetragon/pkg/sensors/exec"
 )
@@ -103,7 +106,7 @@ func TestKprobeNSChanges(t *testing.T) {
 		kprobeChecker,
 	)
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func testKprobeCapChanges(t *testing.T, spec string, op string, value string) {
@@ -186,7 +189,7 @@ func testKprobeCapChanges(t *testing.T, spec string, op string, value string) {
 	)
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestKprobeCapChangesIn(t *testing.T) {

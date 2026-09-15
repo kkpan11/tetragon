@@ -4,8 +4,13 @@
 package cgroupratemetrics
 
 import (
-	"github.com/cilium/tetragon/pkg/metrics/consts"
+	"maps"
+	"slices"
+
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/cilium/tetragon/pkg/metrics"
+	"github.com/cilium/tetragon/pkg/metrics/consts"
 )
 
 type CgroupRateType int
@@ -15,8 +20,10 @@ const (
 	ThrottleStop
 	LookupFail
 	UpdateFail
+	DeleteFail
 	Check
 	Process
+	Delete
 )
 
 var totalLabelValues = map[CgroupRateType]string{
@@ -24,8 +31,10 @@ var totalLabelValues = map[CgroupRateType]string{
 	ThrottleStop:  "throttle_stop",
 	LookupFail:    "lookup_fail",
 	UpdateFail:    "update_fail",
+	DeleteFail:    "delete_fail",
 	Check:         "check",
 	Process:       "process",
+	Delete:        "delete",
 }
 
 func (e CgroupRateType) String() string {
@@ -33,16 +42,18 @@ func (e CgroupRateType) String() string {
 }
 
 var (
-	CgroupRateTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace:   consts.MetricsNamespace,
-		Name:        "cgroup_rate_total",
-		Help:        "The total number of Tetragon cgroup rate counters. For internal use only.",
-		ConstLabels: nil,
-	}, []string{"type"})
+	CgroupRateTotal = metrics.MustNewCounter(
+		metrics.NewOpts(
+			consts.MetricsNamespace, "", "cgroup_rate_total",
+			"The total number of Tetragon cgroup rate counters. For internal use only.",
+			nil, []metrics.ConstrainedLabel{{Name: "type", Values: slices.Collect(maps.Values(totalLabelValues))}}, nil,
+		),
+		nil,
+	)
 )
 
-func InitMetrics(registry *prometheus.Registry) {
-	registry.MustRegister(CgroupRateTotal)
+func RegisterMetrics(group metrics.Group) {
+	group.MustRegister(CgroupRateTotal)
 }
 
 // Get a new handle on an ErrorTotal metric for an ErrorType

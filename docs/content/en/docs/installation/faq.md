@@ -15,10 +15,96 @@ for up to date information. Not all Tetragon features work with older kernel
 versions. BPF evolves rapidly and we recommend you use the most recent stable
 kernel possible to get the most out of Tetragon's features.
 
+{{< caution >}}
+For arm64 kernels 4.19 and 5.4, some features, like reading exec arguments,
+might not work properly because of a
+[kernel bug](https://lore.kernel.org/stable/20230522203352.738576-1-jolsa@kernel.org/).
+The bug fix was rejected from stable kernels by maintainers. For full
+functionality on arm64, we recommend using kernel 5.10 or later.
+{{< /caution >}}
+
 Note that Tetragon needs [BTF support]({{< ref "/docs/installation/faq#tetragon-failed-to-start-complaining-about-a-missing-btf-file">}})
 which might take some work on older kernels.
 
 ### What are the Linux kernel configuration options needed to run Tetragon?
+
+Tetragon requires specific kernel configuration options to function properly.
+You can verify your kernel configuration and runtime capabilities using the
+following approaches.
+
+#### Check kernel configuration with `tetra probe config`
+
+As a first step to verify your kernel configuration, you can use the
+`tetra probe config` command. This will output a list of detected kernel
+features relevant to Tetragon. Missing features can indicate that your kernel
+is not configured correctly.
+
+```shell
+tetra probe config
+```
+
+The output should be similar to this:
+
+```
+ONFIG_AUDIT:y
+CONFIG_AUDITSYSCALL:y
+CONFIG_BPF:y
+CONFIG_BPF_EVENTS:y
+CONFIG_BPF_JIT:y
+CONFIG_BPF_JIT_DEFAULT_ON:y
+CONFIG_BPF_KPROBE_OVERRIDE:y
+CONFIG_BPF_SYSCALL:y
+CONFIG_CGROUPS:y
+CONFIG_DEBUG_INFO_BTF:y
+CONFIG_DEBUG_INFO_BTF_MODULES:y
+CONFIG_FTRACE_SYSCALLS:y
+CONFIG_HAVE_BPF_JIT:n
+CONFIG_HAVE_EBPF_JIT:y
+CONFIG_SECURITY:y
+```
+
+#### Probe features at runtime with `tetra probe`
+
+To probe if your kernel has sufficient features turned on at runtime, you can
+run `tetra probe`, this command requires root privileges, notably to load probe
+BPF programs:
+
+```shell
+sudo tetra probe
+```
+
+You can also run this command directly from the tetragon container image on a
+Kubernetes cluster node. For example:
+
+```shell
+kubectl run bpf-probe --image=quay.io/cilium/tetragon-ci:latest \
+    --privileged --restart=Never -it --rm --command -- tetra probe
+```
+
+The output should be similar to this (with boolean values depending on your
+actual configuration):
+
+```
+override_return: true
+buildid: true
+kprobe_multi: false
+uprobe_multi false
+fmodret: true
+fmodret_syscall: true
+signal: true
+large: true
+link_pin: true
+lsm: false
+missed_stats_kprobe_multi: false
+missed_stats_kprobe: false
+batch_update: true
+uprobe_refctroff: true
+audit_loginuid: true
+probe_write_user: true
+uprobe_regs_change: false
+```
+
+#### List of required kernel configurations
 
 This is the list of needed configuration options, note that this might evolve
 quickly with new Tetragon features:
@@ -63,31 +149,12 @@ CGROUP_FAVOR_DYNMODS=y  (optional)  >= 6.0
   association issues.
 ```
 
-At runtime, to probe if your kernel has sufficient features turned on, you can
-run `tetra` with root privileges with the `probe` command:
-
-```shell
-sudo tetra probe
+If the system is still on the old Cgroupv1 interface and the running kernel version
+is >= 6.11 then these kernel config options are required:
 ```
-
-You can also run this command directly from the tetragon container image on a
-Kubernetes cluster node. For example:
-
-```shell
-kubectl run bpf-probe --image=quay.io/cilium/tetragon-ci:latest --privileged --restart=Never -it --rm --command -- tetra probe
-```
-
-The output should be similar to this (with boolean values depending on your
-actual configuration):
-
-```
-override_return: true
-buildid: true
-kprobe_multi: false
-fmodret: true
-fmodret_syscall: true
-signal: true
-large: true
+# CGROUPv1 Process tracking on kernels >= 6.11
+CONFIG_MEMCG_V1=y
+CONFIG_CPUSETS_V1=y
 ```
 
 ### Tetragon failed to start complaining about a missing BTF file
@@ -179,4 +246,32 @@ CONFIG_DEBUG_INFO_BTF_MODULES=y
 $ docker run -it --rm --privileged --pid=host ubuntu \
     nsenter -t 1 -m -u -n -i sh -c 'ls -la /sys/kernel/btf/vmlinux'
 -r--r--r--    1 root     root       4988627 Nov 21 20:33 /sys/kernel/btf/vmlinux
+```
+
+### Why Tetragon fails with "operation not permitted" when loading BPF programs {#kernel-lockdown}
+
+This error indicates that Linux Kernel Lockdown is preventing BPF programs from loading.
+Kernel Lockdown is a security feature designed to prevent even the root user from modifying
+the kernel or reading its internal secrets. It operates in two distinct modes:
+
+- Integrity: Prevents the user from modifying the running kernel. For example, it blocks
+  writing to `/dev/mem` or loading unsigned kernel modules.
+- Confidentiality: Includes all integrity protections but goes further by preventing the user
+  from reading information from the kernel that could reveal secrets.
+
+On systems with Kernel Lockdown enabled in `confidentiality` mode, Tetragon will fail with `EPERM`.
+To fix this, use `integrity` mode.
+
+You can verify the Lockdown status in the Tetragon startup logs.
+A warning is printed when `confidentiality` mode is active:
+
+```
+level=warn msg="Kernel Lockdown is in 'confidentiality' mode; Tetragon will fail to load BPF programs. See https://tetragon.io/docs/installation/faq/#kernel-lockdown for details."
+level=info msg="Tetragon current security context" SELinux=unconfined AppArmor=unconfined Smack="" Lockdown=confidentiality
+```
+
+You can also check the status of the Kernel Lockdown by running:
+
+```shell
+cat /sys/kernel/security/lockdown
 ```

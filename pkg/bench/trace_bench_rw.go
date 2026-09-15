@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package bench
 
 import (
@@ -105,14 +107,10 @@ func (src traceBenchRw) Run(ctx context.Context, _ *Arguments, _ *Summary) error
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
-	var i uint
-
-	for i = 0; i < *rwThreads; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range uint(*rwThreads) {
+		wg.Go(func() {
 			src.benchRwWorker(ctx)
-		}()
+		})
 	}
 
 	return nil
@@ -150,6 +148,7 @@ spec:
     - index: 2
       type: "size_t"
     returnArg:
+      index: 0
       type: "size_t"
     selectors:
     - matchPIDs:

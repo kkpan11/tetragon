@@ -2,8 +2,7 @@
 title: "Tetragon Observability Policies"
 weight: 3
 description: >
-  Library of policies that implement Tetragon observability and runtime enforcement.
-  mechanisms.
+  Library of policies that implement Tetragon observability mechanisms.
 ---
 
 
@@ -29,9 +28,8 @@ description: >
 
 ### Networking
 
-- [Network Activity of SSH daemon]({{< ref "#ssh" >}})
+- [Network Activity of SSH daemon]({{< ref "#ssh-network" >}})
 - [Outbound Connections]({{< ref "#egress-connections" >}})
-
 
 # Observability Policies
 
@@ -159,7 +157,7 @@ No policy needs to be loaded, standard process execution observability is suffic
 ### Example jq Filter
 
 ```shell
-jq 'select(.process_exec != null) | select(.process_exec.process.binary_properties != null) | select(.process_exec.process.binary_properties.privileges_changed != null) | "\(.time) \(.process_exec.process.pod.namespace) \(.process_exec.process.pod.name) \(.process_exec.process.binary) \(.process_exec.process.arguments) uid=\(.process_exec.process.process_credentials.uid) euid=\(.process_exec.process.process_credentials.euid)  gid=\(.process_exec.process.process_credentials.gid) egid=\(.process_exec.process.process_credentials.egid) caps=\(.process_exec.process.cap) binary_properties=\(.process_exec.process.binary_properties)"''
+jq 'select(.process_exec != null) | select(.process_exec.process.binary_properties != null) | select(.process_exec.process.binary_properties.privileges_changed != null) | "\(.time) \(.process_exec.process.pod.namespace) \(.process_exec.process.pod.name) \(.process_exec.process.binary) \(.process_exec.process.arguments) uid=\(.process_exec.process.process_credentials.uid) euid=\(.process_exec.process.process_credentials.euid)  gid=\(.process_exec.process.process_credentials.gid) egid=\(.process_exec.process.process_credentials.egid) caps=\(.process_exec.process.cap) binary_properties=\(.process_exec.process.binary_properties)"'
 ```
 
 ### Example Output
@@ -405,6 +403,12 @@ jq 'select(.process_kprobe != null) | select(.process_kprobe.function_name | tes
 "2023-11-01T02:56:54.926403604Z /usr/bin/bpftool prog list programType:BPF_PROG_TYPE_SOCKET_FILTER programInsn:2"
 ```
 
+### Kernel compatibility
+
+The `security_bpf_map_alloc` hook was
+[renamed to `security_bpf_map_create` in Linux 6.9](https://github.com/torvalds/linux/commit/a2431c7eabcf).
+The example policy already includes both hooks with `ignore.callNotFound: true` to support both kernels.
+
 ## Kernel Module Audit Trail {#kernel-module}
 
 ### Description
@@ -457,7 +461,7 @@ jq 'select(.process_loader != null) | "\(.time) \(.process_loader.process.pod.na
 "2023-10-31T19:42:33.065233159Z default/xwing /usr/bin/curl https://ebpf.io /usr/lib/x86_64-linux-gnu/libssl.so.3"
 ```
 
-## SSHd connection monitoring {#ssh-network}
+## Network Activity of SSH daemon {#ssh-network}
 
 ### Description
 

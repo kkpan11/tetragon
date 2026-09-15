@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 import (
-	"os"
 	"testing"
 
 	"github.com/cilium/ebpf"
+	"github.com/stretchr/testify/assert"
+
 	"github.com/cilium/tetragon/pkg/bpf"
 	"github.com/cilium/tetragon/pkg/observer/observertesthelper"
 	"github.com/cilium/tetragon/pkg/sensors"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
-	"github.com/stretchr/testify/assert"
 )
 
 type testMap struct {
@@ -23,13 +25,10 @@ type testMap struct {
 func runConfig(t *testing.T, config string, fn func(string, int)) {
 	var err error
 
-	err = os.WriteFile(testConfigFile, []byte(config), 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
-	}
+	createCrdFile(t, config)
 
 	sens, err := observertesthelper.GetDefaultSensorsWithFile(t, testConfigFile,
-		tus.Conf().TetragonLib)
+		tus.Conf().TetragonLib, observertesthelper.WithKeepCollection())
 	if err != nil {
 		t.Fatalf("GetDefaultObserverWithFile error: %s", err)
 	}
@@ -78,6 +77,7 @@ func TestMaxEntries(t *testing.T) {
 			{"enforcer_data", 1},
 			{"stack_trace_map", 1},
 			{"ratelimit_map", 1},
+			{"override_tasks", 1},
 		}, `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -90,45 +90,13 @@ spec:
 `)
 	})
 
-	t.Run("fdinstall_map", func(t *testing.T) {
-		run(t, []testMap{
-			{"fdinstall_map", fdInstallMapMaxEntries},
-			{"enforcer_data", 1},
-			{"stack_trace_map", 1},
-			{"ratelimit_map", 1},
-		}, `
-apiVersion: cilium.io/v1alpha1
-kind: TracingPolicy
-metadata:
-  name: "syswritefollowfdpsswd"
-spec:
-  kprobes:
-  - call: "fd_install"
-    syscall: false
-    args:
-    - index: 0
-      type: int
-    - index: 1
-      type: "file"
-    selectors:
-    - matchArgs:
-      - index: 1
-        operator: "Equal"
-        values:
-        - "/tmp/test"
-      matchActions:
-      - action: FollowFD
-        argFd: 0
-        argName: 1
-`)
-	})
-
 	t.Run("stack_trace_map", func(t *testing.T) {
 		run(t, []testMap{
 			{"fdinstall_map", 1},
 			{"enforcer_data", 1},
 			{"stack_trace_map", stackTraceMapMaxEntries},
 			{"ratelimit_map", 1},
+			{"override_tasks", 1},
 		}, `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -152,6 +120,7 @@ spec:
 			{"enforcer_data", 1},
 			{"stack_trace_map", 1},
 			{"ratelimit_map", ratelimitMapMaxEntries},
+			{"override_tasks", 1},
 		}, `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -189,6 +158,7 @@ spec:
 			{"enforcer_data", enforcerMapMaxEntries},
 			{"stack_trace_map", 1},
 			{"ratelimit_map", 1},
+			{"override_tasks", 1},
 		}, `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
@@ -223,6 +193,41 @@ spec:
       - action: "NotifyEnforcer"
         argError: -1
         argSig: 9
+`)
+	})
+
+	t.Run("override_tasks", func(t *testing.T) {
+		if !bpf.HasOverrideHelper() {
+			t.Skip("skipping test, neither bpf_override_return nor fmod_ret for syscalls is available")
+		}
+
+		run(t, []testMap{
+			{"fdinstall_map", 1},
+			{"enforcer_data", 1},
+			{"stack_trace_map", 1},
+			{"ratelimit_map", 1},
+			{"override_tasks", overrideMapMaxEntries},
+		}, `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "override-example"
+spec:
+  kprobes:
+  - call: "sys_symlinkat"
+    syscall: true
+    args:
+    - index: 0
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "/etc/passwd"
+      matchActions:
+      - action: Override
+        argError: -1
 `)
 	})
 }

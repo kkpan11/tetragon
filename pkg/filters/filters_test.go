@@ -8,18 +8,21 @@ import (
 	"os"
 	"testing"
 
-	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
-	"github.com/cilium/tetragon/api/v1/tetragon"
-	"github.com/cilium/tetragon/pkg/option"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/event"
+	"github.com/cilium/tetragon/pkg/option"
 )
 
 func TestMain(m *testing.M) {
 	// Needed for cap filters
 	option.Config.EnableProcessCred = true
+	option.Config.EnableProcessAncestors = true
 
 	code := m.Run()
 	os.Exit(code)
@@ -33,9 +36,10 @@ func TestParseFilterList(t *testing.T) {
 {"pid_set":[1]}
 {"event_set":["PROCESS_EXEC", "PROCESS_EXIT", "PROCESS_KPROBE", "PROCESS_TRACEPOINT"]}
 {"arguments_regex":["^--version$","^-a -b -c$"]}
-{"capabilities": {"effective": {"all": ["CAP_BPF", "CAP_SYS_ADMIN"]}}}`
+{"capabilities": {"effective": {"all": ["CAP_BPF", "CAP_SYS_ADMIN"]}}}
+{"cel_expression": ["process_exec.process.bad_field_name == 'curl'"]}`
 	filterProto, err := ParseFilterList(f, true)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	if diff := cmp.Diff(
 		[]*tetragon.Filter{
 			{Namespace: []string{"kube-system", ""}},
@@ -50,6 +54,7 @@ func TestParseFilterList(t *testing.T) {
 					All: []tetragon.CapabilitiesType{tetragon.CapabilitiesType_CAP_BPF, tetragon.CapabilitiesType_CAP_SYS_ADMIN},
 				},
 			}},
+			{CelExpression: []string{"process_exec.process.bad_field_name == 'curl'"}},
 		},
 		filterProto,
 		cmpopts.IgnoreUnexported(tetragon.Filter{}),
@@ -60,12 +65,12 @@ func TestParseFilterList(t *testing.T) {
 		t.Errorf("filter mismatch (-want +got):\n%s", diff)
 	}
 	_, err = ParseFilterList("invalid filter json", true)
-	assert.Error(t, err)
+	require.Error(t, err)
 	filterProto, err = ParseFilterList("", true)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Empty(t, filterProto)
 	filterProto, err = ParseFilterList(`{"pid_set":[1]}`, false)
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Empty(t, filterProto)
 }
 
@@ -77,8 +82,8 @@ func TestEventTypeFilterMatch(t *testing.T) {
 	}}
 
 	fl, err := BuildFilterList(context.Background(), f, []OnBuildFilter{&EventTypeFilter{}})
-	assert.NoError(t, err)
-	ev := v1.Event{
+	require.NoError(t, err)
+	ev := event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Pod: &tetragon.Pod{Namespace: "kube-system"}}},
@@ -96,8 +101,8 @@ func TestEventTypeFilterNoMatch(t *testing.T) {
 	}}
 
 	fl, err := BuildFilterList(context.Background(), f, []OnBuildFilter{&EventTypeFilter{}})
-	assert.NoError(t, err)
-	ev := v1.Event{
+	require.NoError(t, err)
+	ev := event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Pod: &tetragon.Pod{Namespace: "kube-system"}}},

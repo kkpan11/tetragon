@@ -20,17 +20,23 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/remotecommand"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
+	klog "k8s.io/klog/v2"
 	cr "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/k8s/watcher"
 )
@@ -94,7 +100,11 @@ func (r *Resources) Create(ctx context.Context, obj k8s.Object, opts ...CreateOp
 		fn(createOptions)
 	}
 
-	o := &cr.CreateOptions{Raw: createOptions}
+	o := &cr.CreateOptions{
+		Raw:          createOptions,
+		DryRun:       createOptions.DryRun,
+		FieldManager: createOptions.FieldManager,
+	}
 
 	return r.client.Create(ctx, obj, o)
 }
@@ -107,8 +117,29 @@ func (r *Resources) Update(ctx context.Context, obj k8s.Object, opts ...UpdateOp
 		fn(updateOptions)
 	}
 
-	o := &cr.UpdateOptions{Raw: updateOptions}
+	o := &cr.UpdateOptions{
+		Raw:          updateOptions,
+		DryRun:       updateOptions.DryRun,
+		FieldManager: updateOptions.FieldManager,
+	}
 	return r.client.Update(ctx, obj, o)
+}
+
+// UpdateSubresource updates the subresource of the object
+func (r *Resources) UpdateSubresource(ctx context.Context, obj k8s.Object, subresource string, opts ...UpdateOption) error {
+	updateOptions := &metav1.UpdateOptions{}
+	for _, fn := range opts {
+		fn(updateOptions)
+	}
+
+	uo := cr.UpdateOptions{Raw: updateOptions}
+	o := &cr.SubResourceUpdateOptions{UpdateOptions: uo}
+	return r.client.SubResource(subresource).Update(ctx, obj, o)
+}
+
+// UpdateStatus updates the status of the object
+func (r *Resources) UpdateStatus(ctx context.Context, obj k8s.Object, opts ...UpdateOption) error {
+	return r.UpdateSubresource(ctx, obj, "status", opts...)
 }
 
 type DeleteOption func(*metav1.DeleteOptions)
@@ -119,12 +150,18 @@ func (r *Resources) Delete(ctx context.Context, obj k8s.Object, opts ...DeleteOp
 		fn(deleteOptions)
 	}
 
-	o := &cr.DeleteOptions{Raw: deleteOptions}
+	o := &cr.DeleteOptions{
+		Raw:                deleteOptions,
+		GracePeriodSeconds: deleteOptions.GracePeriodSeconds,
+		Preconditions:      deleteOptions.Preconditions,
+		PropagationPolicy:  deleteOptions.PropagationPolicy,
+		DryRun:             deleteOptions.DryRun,
+	}
 	return r.client.Delete(ctx, obj, o)
 }
 
 func WithGracePeriod(gpt time.Duration) DeleteOption {
-	t := gpt.Milliseconds()
+	t := int64(gpt.Seconds())
 	return func(do *metav1.DeleteOptions) { do.GracePeriodSeconds = &t }
 }
 
@@ -142,7 +179,22 @@ func (r *Resources) List(ctx context.Context, objs k8s.ObjectList, opts ...ListO
 		fn(listOptions)
 	}
 
-	o := &cr.ListOptions{Raw: listOptions}
+	ls, err := labels.Parse(listOptions.LabelSelector)
+	if err != nil {
+		return err
+	}
+	fs, err := fields.ParseSelector(listOptions.FieldSelector)
+	if err != nil {
+		return err
+	}
+
+	o := &cr.ListOptions{
+		Raw:           listOptions,
+		FieldSelector: fs,
+		LabelSelector: ls,
+		Continue:      listOptions.Continue,
+		Limit:         listOptions.Limit,
+	}
 	if r.namespace != "" {
 		o.Namespace = r.namespace
 	}
@@ -159,15 +211,15 @@ func WithFieldSelector(sel string) ListOption {
 }
 
 func WithTimeout(to time.Duration) ListOption {
-	t := to.Milliseconds()
+	t := int64(to.Seconds())
 	return func(lo *metav1.ListOptions) { lo.TimeoutSeconds = &t }
 }
 
 // PatchOption is used to provide additional arguments to the Patch call.
 type PatchOption func(*metav1.PatchOptions)
 
-// Patch patches portion of object `orig` with data from object `patch`
-func (r *Resources) Patch(ctx context.Context, objs k8s.Object, patch k8s.Patch, opts ...PatchOption) error {
+// Patch patches portion of object `obj` with data from object `patch`
+func (r *Resources) Patch(ctx context.Context, obj k8s.Object, patch k8s.Patch, opts ...PatchOption) error {
 	patchOptions := &metav1.PatchOptions{}
 
 	for _, fn := range opts {
@@ -176,8 +228,33 @@ func (r *Resources) Patch(ctx context.Context, objs k8s.Object, patch k8s.Patch,
 
 	p := cr.RawPatch(patch.PatchType, patch.Data)
 
-	o := &cr.PatchOptions{Raw: patchOptions}
-	return r.client.Patch(ctx, objs, p, o)
+	o := &cr.PatchOptions{
+		Raw:          patchOptions,
+		DryRun:       patchOptions.DryRun,
+		Force:        patchOptions.Force,
+		FieldManager: patchOptions.FieldManager,
+	}
+	return r.client.Patch(ctx, obj, p, o)
+}
+
+// PatchSubresource patches portion of object `obj` with data from object `patch`
+func (r *Resources) PatchSubresource(ctx context.Context, obj k8s.Object, subresource string, patch k8s.Patch, opts ...PatchOption) error {
+	patchOptions := &metav1.PatchOptions{}
+
+	for _, fn := range opts {
+		fn(patchOptions)
+	}
+
+	p := cr.RawPatch(patch.PatchType, patch.Data)
+
+	po := cr.PatchOptions{Raw: patchOptions}
+	o := &cr.SubResourcePatchOptions{PatchOptions: po}
+	return r.client.SubResource(subresource).Patch(ctx, obj, p, o)
+}
+
+// PatchStatus patches portion of object `obj` with data from object `patch`
+func (r *Resources) PatchStatus(ctx context.Context, objs k8s.Object, patch k8s.Patch, opts ...PatchOption) error {
+	return r.PatchSubresource(ctx, objs, "status", patch, opts...)
 }
 
 // Annotate attach annotations to an existing resource objec
@@ -194,7 +271,7 @@ func (r *Resources) GetScheme() *runtime.Scheme {
 	return r.scheme
 }
 
-// GetClient return the controller-runtime client instance
+// GetControllerRuntimeClient return the controller-runtime client instance
 func (r *Resources) GetControllerRuntimeClient() cr.Client {
 	return r.client
 }
@@ -252,4 +329,127 @@ func (r *Resources) ExecInPod(ctx context.Context, namespaceName, podName, conta
 	}
 
 	return nil
+}
+
+type matcher[T any] func([]T) (T, error)
+
+type predicate[T any] func(T) bool
+
+func match[T any](pred predicate[T], err error) matcher[T] {
+	return func(values []T) (T, error) {
+		for _, value := range values {
+			if pred(value) {
+				return value, nil
+			}
+		}
+
+		var notFound T
+		return notFound, err
+	}
+}
+
+func matchByIndex[T any](idx int, err error) matcher[T] {
+	return func(items []T) (T, error) {
+		if idx >= len(items) {
+			var notFound T
+			return notFound, fmt.Errorf("%w: index %d is out of range with length %d", err, idx, len(items))
+		}
+
+		return items[idx], nil
+	}
+}
+
+var (
+	errPodNotFound       = errors.New("pod not found")
+	errContainerNotFound = errors.New("container not found")
+)
+
+type deploymentOptions struct {
+	podMatcher       matcher[v1.Pod]
+	containerMatcher matcher[v1.Container]
+}
+
+// DeploymentOption extends the default behavior of [ExecInDeployment].
+type DeploymentOption func(*deploymentOptions)
+
+// WithDeploymentPod selects the pod that matches the given condition.
+func WithDeploymentPod(pred predicate[v1.Pod]) DeploymentOption {
+	return func(opts *deploymentOptions) {
+		opts.podMatcher = match(pred, errPodNotFound)
+	}
+}
+
+// WithDeploymentPodIndex selects the pod at the given index.
+func WithDeploymentPodIndex(idx int) DeploymentOption {
+	return func(opts *deploymentOptions) {
+		opts.podMatcher = matchByIndex[v1.Pod](idx, errPodNotFound)
+	}
+}
+
+// WithDeploymentContainer selects the container that matches the given condition.
+func WithDeploymentContainer(pred predicate[v1.Container]) DeploymentOption {
+	return func(opts *deploymentOptions) {
+		opts.containerMatcher = match(pred, errContainerNotFound)
+	}
+}
+
+// WithDeploymentContainerIndex selects the container at the given index.
+func WithDeploymentContainerIndex(idx int) DeploymentOption {
+	return func(opts *deploymentOptions) {
+		opts.containerMatcher = matchByIndex[v1.Container](idx, errContainerNotFound)
+	}
+}
+
+// WithDeploymentContainerName selects the container with the given name.
+func WithDeploymentContainerName(name string) DeploymentOption {
+	return func(opts *deploymentOptions) {
+		opts.containerMatcher = match(
+			func(c v1.Container) bool { return c.Name == name },
+			fmt.Errorf("%w: name %q", errContainerNotFound, name),
+		)
+	}
+}
+
+// ExecInDeployment runs the given command in a container belonging to the deployment with the given name.
+// By default, it selects the first container of the first pod.
+//
+// Pod and container selection can be customized using [WithDeploymentPod], [WithDeploymentContainer],
+// or related functions.
+func (r *Resources) ExecInDeployment(ctx context.Context, namespaceName, deploymentName string, command []string, stdout, stderr *bytes.Buffer, opts ...DeploymentOption) error {
+	options := deploymentOptions{}
+	defaultOpts := []DeploymentOption{WithDeploymentPodIndex(0), WithDeploymentContainerIndex(0)}
+	for _, fn := range append(defaultOpts, opts...) {
+		fn(&options)
+	}
+
+	var deployment appsv1.Deployment
+	if err := r.Get(ctx, deploymentName, namespaceName, &deployment); err != nil {
+		return err
+	}
+
+	sel, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
+	if err != nil {
+		return err
+	}
+
+	var pods v1.PodList
+	if err := r.client.List(ctx, &pods, cr.InNamespace(namespaceName), cr.MatchingLabelsSelector{Selector: sel}); err != nil {
+		return err
+	}
+
+	pod, err := options.podMatcher(pods.Items)
+	if err != nil {
+		return err
+	}
+
+	container, err := options.containerMatcher(pod.Spec.Containers)
+	if err != nil {
+		return err
+	}
+
+	return r.ExecInPod(ctx, namespaceName, pod.Name, container.Name, command, stdout, stderr)
+}
+
+func init() {
+	log.SetLogger(klog.NewKlogr())
 }

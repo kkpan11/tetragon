@@ -11,33 +11,27 @@ on:
 jobs:
   build:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-20.04, actuated-arm64-4cpu-8gb ]
+        os: [ ubuntu-24.04, ubuntu-24.04-arm64, ubuntu-26.04 ]
     steps:
     - name: Checkout code
-      uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         path: go/src/github.com/cilium/tetragon/
 
     - name: Install Go
-      uses: actions/setup-go@cdcb36043654635271a94b9a6d1392de5bb323a7 # v5.0.1
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         # renovate: datasource=golang-version depName=go
-        go-version: '1.22.5'
-
-    - name: Install dependencies x86
-      run: |
-        sudo apt-get update
-        sudo apt-get -y install libc6-dev-i386
-      if: ${{ matrix.os == 'ubuntu-20.04' }}
+        go-version: '1.27.1'
 
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get -y install libelf-dev netcat-traditional libcap-dev gcc
+        sudo apt-get -y install libelf-dev netcat-traditional libcap-dev gcc pahole llvm
 
         sudo sed -i '/secure_path/d' /etc/sudoers
         sudo sed -i '/env_reset/d' /etc/sudoers
@@ -46,8 +40,19 @@ jobs:
         echo `which llc`
         echo `clang --version`
 
+
+    - name: Install dependencies x86
+      run: |
+        sudo apt-get -y install libc6-dev-i386
+      if: ${{ !endsWith(matrix.os, 'arm64') }}
+
+    - name: Install dependencies ARM
+      run: |
+        sudo apt-get -y install gcc-arm-linux-gnueabihf
+      if: ${{ endsWith(matrix.os, 'arm64') }}
+
     - name: Install bpftool
-      uses: mtardy/setup-bpftool@adeab4f9332cc28db56064a93911860d0775665b # v1.0.3
+      uses: mtardy/setup-bpftool@9bc044304197616a6321d452e04cc059e006d8e2 # v1.0.4
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -57,6 +62,10 @@ jobs:
         make verify
 
     - name: Run go tests
+      # ubuntu-26.04 ships Rust coreutils behind symlinks, which breaks the
+      # matchBinaries tests expecting /usr/bin paths, see
+      # https://github.com/cilium/tetragon/issues/3583.
+      if: ${{ matrix.os != 'ubuntu-26.04' }}
       env:
         GOPATH: ${{ env.GITHUB_WORKSPACE }}/go
         SUDO: sudo -E
@@ -66,20 +75,163 @@ jobs:
         sudo -E echo "run go tests: " `uname -a`
         sudo -E go mod verify
         export TETRAGON_LIB=$(realpath "bpf/objs/")
-        make test GO_TEST_TIMEOUT=40m
+        make test GO_TEST_TIMEOUT=60m
+
+    # Run some somple nok8s tests in packages where there is meaningful differentiation
+    - name: Run nok8s go tests
+      # on 26.04 we skip the go test and therefore also building the tester-progs
+      # make sure that they are built before running the nok8s tests
+      run: |
+        cd go/src/github.com/cilium/tetragon/
+        make tester-progs
+        go vet -tags nok8s ./pkg/sensors ./pkg/policyfilter ./pkg/tracingpolicy ./pkg/testutils/policytest
+        go test -tags nok8s ./pkg/tracingpolicy ./pkg/testutils/policytest
 
     - name: Upload Tetragon logs
       if: failure()
-      uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: tetragon-json
+        name: tetragon-json-${{ matrix.os }}
         path: /tmp/tetragon.gotest*
         retention-days: 5
 
     - name: Upload bugtool dumps
       if: failure()
-      uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: tetragon-bugtool
+        name: tetragon-bugtool-${{ matrix.os }}
         path: /tmp/tetragon-bugtool*
+        retention-days: 5
+
+    - name: Upload vmlinux file
+      if: failure()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: btf-vmlinux-${{ matrix.os }}
+        path: /sys/kernel/btf/vmlinux
+        retention-days: 5
+
+  fuzz:
+    name: Go fuzz tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-24.04, ubuntu-24.04-arm64 ]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        path: go/src/github.com/cilium/tetragon/
+
+    - name: Install Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        # renovate: datasource=golang-version depName=go
+        go-version: '1.27.1'
+
+    - name: Run go fuzz tests
+      env:
+        SUDO: sudo -E
+      run: |
+        cd go/src/github.com/cilium/tetragon/
+        make test-fuzz
+
+    - name: Collect fuzz failures
+      if: ${{ failure() }}
+      id: collect-fuzz-failures
+      shell: bash
+      run: |
+        cd go/src/github.com/cilium/tetragon/
+        destination="${RUNNER_TEMP}/go-fuzz-failures"
+        found=false
+
+        while IFS= read -r -d '' file; do
+          mkdir -p "$destination"
+          cp --parents -- "$file" "$destination"
+          found=true
+        done < <(git ls-files -z --others -- '**/testdata/fuzz/**')
+
+        echo "found=$found" >> "$GITHUB_OUTPUT"
+
+    - name: Upload fuzz failures
+      if: ${{ failure() && steps.collect-fuzz-failures.outputs.found == 'true' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: go-fuzz-failures-${{ matrix.os }}
+        path: ${{ runner.temp }}/go-fuzz-failures
+        retention-days: 5
+
+  build_windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        path: go/src/github.com/cilium/tetragon/
+
+    - name: Install Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        # renovate: datasource=golang-version depName=go
+        go-version: '1.27.1'
+
+    - name: Run go tests
+      working-directory: ${{ github.workspace }}\go\src\github.com\cilium\tetragon
+      run: |
+        go test --failfast .\pkg\... .\cmd\...
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    # Advisory for now: a detected race should surface in the job logs without
+    # blocking the PR while we shake out the initial package list. Flip to
+    # false (or remove the line) once the default RACE_PKGS set is stable.
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        path: go/src/github.com/cilium/tetragon/
+
+    - name: Install Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        # renovate: datasource=golang-version depName=go
+        go-version: '1.27.1'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get -y install libelf-dev netcat-traditional libcap-dev gcc libc6-dev-i386 pahole llvm
+
+        sudo sed -i '/secure_path/d' /etc/sudoers
+        sudo sed -i '/env_reset/d' /etc/sudoers
+
+    - name: Install bpftool
+      uses: mtardy/setup-bpftool@9bc044304197616a6321d452e04cc059e006d8e2 # v1.0.4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Run go tests with -race
+      env:
+        GOPATH: ${{ env.GITHUB_WORKSPACE }}/go
+        SUDO: sudo -E
+      run: |
+        go clean -cache -modcache -testcache -fuzzcache
+        cd go/src/github.com/cilium/tetragon/
+        sudo -E echo "run race tests: " `uname -a`
+        sudo -E go mod verify
+        export TETRAGON_LIB=$(realpath "bpf/objs/")
+        make test-race RACE_TEST_TIMEOUT=45m
+
+    - name: Upload Tetragon logs
+      if: failure()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: tetragon-race-logs
+        path: /tmp/tetragon.gotest*
         retention-days: 5

@@ -4,65 +4,15 @@
 package network
 
 import (
-	"fmt"
-
-	"golang.org/x/sys/unix"
+	"errors"
+	"strconv"
 )
 
-var inetFamily = map[uint16]string{
-	unix.AF_UNSPEC:     "AF_UNSPEC",
-	unix.AF_UNIX:       "AF_UNIX",
-	unix.AF_INET:       "AF_INET",
-	unix.AF_AX25:       "AF_AX25",
-	unix.AF_IPX:        "AF_IPX",
-	unix.AF_APPLETALK:  "AF_APPLETALK",
-	unix.AF_NETROM:     "AF_NETROM",
-	unix.AF_BRIDGE:     "AF_BRIDGE",
-	unix.AF_ATMPVC:     "AF_ATMPVC",
-	unix.AF_X25:        "AF_X25",
-	unix.AF_INET6:      "AF_INET6",
-	unix.AF_ROSE:       "AF_ROSE",
-	unix.AF_DECnet:     "AF_DECnet",
-	unix.AF_NETBEUI:    "AF_NETBEUI",
-	unix.AF_SECURITY:   "AF_SECURITY",
-	unix.AF_KEY:        "AF_KEY",
-	unix.AF_NETLINK:    "AF_NETLINK",
-	unix.AF_PACKET:     "AF_PACKET",
-	unix.AF_ASH:        "AF_ASH",
-	unix.AF_ECONET:     "AF_ECONET",
-	unix.AF_ATMSVC:     "AF_ATMSVC",
-	unix.AF_RDS:        "AF_RDS",
-	unix.AF_IRDA:       "AF_IRDA",
-	unix.AF_PPPOX:      "AF_PPPOX",
-	unix.AF_WANPIPE:    "AF_WANPIPE",
-	unix.AF_LLC:        "AF_LLC",
-	unix.AF_IB:         "AF_IB",
-	unix.AF_MPLS:       "AF_MPLS",
-	unix.AF_CAN:        "AF_CAN",
-	unix.AF_TIPC:       "AF_TIPC",
-	unix.AF_BLUETOOTH:  "AF_BLUETOOTH",
-	unix.AF_IUCV:       "AF_IUCV",
-	unix.AF_RXRPC:      "AF_RXRPC",
-	unix.AF_ISDN:       "AF_ISDN",
-	unix.AF_PHONET:     "AF_PHONET",
-	unix.AF_IEEE802154: "AF_IEEE802154",
-	unix.AF_CAIF:       "AF_CAIF",
-	unix.AF_ALG:        "AF_ALG",
-	unix.AF_NFC:        "AF_NFC",
-	unix.AF_VSOCK:      "AF_VSOCK",
-	unix.AF_KCM:        "AF_KCM",
-	unix.AF_QIPCRTR:    "AF_QIPCRTR",
-	unix.AF_SMC:        "AF_SMC",
-	unix.AF_XDP:        "AF_XDP",
-	unix.AF_MCTP:       "AF_MCTP",
-}
-
 func InetFamily(family uint16) string {
-
 	if f, ok := inetFamily[family]; ok {
 		return f
 	}
-	return fmt.Sprintf("%d", family)
+	return strconv.FormatUint(uint64(family), 10)
 }
 
 func InetFamilyNumber(family string) (uint16, error) {
@@ -71,7 +21,7 @@ func InetFamilyNumber(family string) (uint16, error) {
 			return familynum, nil
 		}
 	}
-	return 0, fmt.Errorf("address family string not known")
+	return 0, errors.New("address family string not known")
 }
 
 var inetType = map[uint16]string{
@@ -88,7 +38,7 @@ func InetType(ty uint16) string {
 	if t, ok := inetType[ty]; ok {
 		return t
 	}
-	return fmt.Sprintf("%d", ty)
+	return strconv.FormatUint(uint64(ty), 10)
 }
 
 var inetProtocol = map[uint16]string{
@@ -125,7 +75,7 @@ func InetProtocol(proto uint16) string {
 	if p, ok := inetProtocol[proto]; ok {
 		return p
 	}
-	return fmt.Sprintf("%d", proto)
+	return strconv.FormatUint(uint64(proto), 10)
 }
 
 func InetProtocolNumber(proto string) (uint16, error) {
@@ -134,7 +84,7 @@ func InetProtocolNumber(proto string) (uint16, error) {
 			return protonum, nil
 		}
 	}
-	return 0, fmt.Errorf("protocol string not known")
+	return 0, errors.New("protocol string not known")
 }
 
 var tcpState = map[uint8]string{
@@ -156,7 +106,7 @@ func TcpState(state uint8) string {
 	if p, ok := tcpState[state]; ok {
 		return p
 	}
-	return fmt.Sprintf("%d", state)
+	return strconv.FormatUint(uint64(state), 10)
 }
 
 func TcpStateNumber(state string) (uint8, error) {
@@ -165,5 +115,5 @@ func TcpStateNumber(state string) (uint8, error) {
 			return statenum, nil
 		}
 	}
-	return 0, fmt.Errorf("state string not known")
+	return 0, errors.New("state string not known")
 }

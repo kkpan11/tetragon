@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows && !nok8s
+
 package tracing
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"strconv"
 
-	k8sv1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
 	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
@@ -41,14 +44,12 @@ func (ksb *EnforcerSpecBuilder) WithKill(sig uint32) *EnforcerSpecBuilder {
 }
 
 func (ksb *EnforcerSpecBuilder) WithMultiKprobe() *EnforcerSpecBuilder {
-	multi := true
-	ksb.multiKprobe = &multi
+	ksb.multiKprobe = new(true)
 	return ksb
 }
 
 func (ksb *EnforcerSpecBuilder) WithoutMultiKprobe() *EnforcerSpecBuilder {
-	multi := false
-	ksb.multiKprobe = &multi
+	ksb.multiKprobe = new(false)
 	return ksb
 }
 
@@ -100,7 +101,6 @@ func (ksb *EnforcerSpecBuilder) MustYAML() string {
 }
 
 func (ksb *EnforcerSpecBuilder) Build() (*v1alpha1.TracingPolicy, error) {
-
 	var listNames []string
 	var lists []v1alpha1.ListSpec
 	var enforcers []v1alpha1.EnforcerSpec
@@ -114,7 +114,7 @@ func (ksb *EnforcerSpecBuilder) Build() (*v1alpha1.TracingPolicy, error) {
 		} else {
 			name = ksb.name
 		}
-		listName := fmt.Sprintf("list:%s", name)
+		listName := "list:" + name
 		listNames = append(listNames, listName)
 		lists = append(lists, v1alpha1.ListSpec{
 			Name:      name,
@@ -131,7 +131,7 @@ func (ksb *EnforcerSpecBuilder) Build() (*v1alpha1.TracingPolicy, error) {
 	actions := []v1alpha1.ActionSelector{{Action: "NotifyEnforcer"}}
 	act := &actions[0]
 	if ksb.kill == nil && ksb.override == nil {
-		return nil, fmt.Errorf("need either override or kill to notify enforcer")
+		return nil, errors.New("need either override or kill to notify enforcer")
 	}
 	if ksb.kill != nil {
 		act.ArgSig = *ksb.kill
@@ -157,7 +157,7 @@ func (ksb *EnforcerSpecBuilder) Build() (*v1alpha1.TracingPolicy, error) {
 	if ksb.multiKprobe != nil {
 		options = append(options, v1alpha1.OptionSpec{
 			Name:  option.KeyDisableKprobeMulti,
-			Value: fmt.Sprintf("%t", *ksb.multiKprobe),
+			Value: strconv.FormatBool(*ksb.multiKprobe),
 		})
 	}
 
@@ -166,13 +166,9 @@ func (ksb *EnforcerSpecBuilder) Build() (*v1alpha1.TracingPolicy, error) {
 	operator := "InMap"
 
 	return &v1alpha1.TracingPolicy{
-		TypeMeta: k8sv1.TypeMeta{
-			Kind:       "TracingPolicy",
-			APIVersion: "cilium.io/v1alpha1",
-		},
-		ObjectMeta: k8sv1.ObjectMeta{
-			Name: ksb.name,
-		},
+		Kind:       "TracingPolicy",
+		APIVersion: "cilium.io/v1alpha1",
+		Name:       ksb.name,
 		Spec: v1alpha1.TracingPolicySpec{
 			Lists: lists,
 			Tracepoints: []v1alpha1.TracepointSpec{{

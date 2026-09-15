@@ -1,4 +1,4 @@
-This is a dev demo of how to install the teragon OCI hook on a CRI-O runtime.
+This is a dev demo of how to install the tetragon OCI hook on a CRI-O runtime.
 
 Note: we should move this to the documentation once the PR is merged and `tetragon-oci-hook` and
 `tetragon-oci-hook-setup` are part of the tetragon development image.
@@ -27,7 +27,7 @@ Install the image enabling the init container:
 helm install --namespace kube-system \
         --set tetragonOperator.image.override=localhost/cilium/tetragon-operator:latest \
         --set tetragon.image.override=localhost/cilium/tetragon:latest  \
-        --set tetragon.grpc.address="unix:///var/run/cilium/tetragon/tetragon.sock" \
+        --set tetragon.grpc.address="unix:///var/run/tetragon/tetragon/tetragon.sock" \
         --set tetragon.ociHookSetup.enabled=true \
         tetragon ./install/kubernetes/tetragon
 ...
@@ -49,7 +49,7 @@ helm uninstall -n kube-system tetragon
 ```
 
 In many situations, you would want the hook to keep running even if tetragon is
-not. Doing so, will allow you to configure a class of pods that can only run if tetragon is availble.
+not. Doing so, will allow you to configure a class of pods that can only run if tetragon is available.
 
 
 To uninstall the hook, you can install the following daemonset:

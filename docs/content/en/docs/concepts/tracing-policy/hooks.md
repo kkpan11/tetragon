@@ -4,10 +4,20 @@ weight: 2
 description: "Hook points for Tracing Policies and arguments description"
 ---
 
-Tetragon can hook into the kernel using `kprobes` and `tracepoints`, as well as in user-space
-programs using `uprobes`. Users can configure these hook points using the correspodning sections of
-the `TracingPolicy` specification (`.spec`). These hook points include arguments and return values
-that can be specified using the `args` and `returnArg` fields as detailed in the following sections.
+Tetragon can hook into the kernel using `kprobes`, `fentry/fexit`, and `tracepoints`, as well as in
+user-space programs using `uprobes`. Users can configure these hook points using the corresponding
+sections of the `TracingPolicy` specification (`.spec`). These hook points include arguments and
+return values that can be specified using the `args` and `returnArg` fields as detailed in the
+following sections.
+
+{{< warning >}}
+Hooking a system call can introduce time-of-check to time-of-use (TOCTOU)
+races when the relevant argument is a pointer to user-space memory.
+In that case, user space can modify the underlying data after the hook executes
+but before the kernel consumes it. Hooking a later kernel function, such as an
+LSM `security_` hook, avoids this issue because it operates on kernel-resident
+state after the data has been copied from user space.
+{{< /warning >}}
 
 ## Kprobes
 
@@ -80,6 +90,74 @@ spec:
     # [...]
 ```
 
+## Fentry/Fexit
+
+Fentry/fexit programs attach to kernel functions using BTF (BPF Type Format).
+They rely on the ftrace kernel infrastructure, which calls the BPF program
+directly from a trampoline, making them a faster alternative to kprobes.
+
+Fentry in Tetragon requires a kernel >= 6.1 built with BTF enabled
+(`CONFIG_DEBUG_INFO_BTF=y`), which you can verify with:
+
+```shell
+grep CONFIG_DEBUG_INFO_BTF /boot/config-$(uname -r)
+```
+
+Compared to kprobes, fentry currently comes with the following limitations:
+
+- Enforcement actions such as `Override` or `Signal` are not supported.
+- Each fentry spec attaches to a single kernel function, there is no
+  multi-attach equivalent to multi kprobes.
+
+Here is an example of a `TracingPolicy` using the `fentries` section to trace
+the `tcp_connect` kernel function:
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "fentry-example"
+spec:
+  fentries:
+  - call: "tcp_connect"
+    syscall: false
+    return: true
+    args:
+    - index: 0
+      type: "sock"
+    returnArg:
+      index: 0
+      type: "int"
+```
+
+The `fentry` program attaches at function entry, while its `fexit` counterpart
+attaches at function exit, where the return value is available. Setting
+`return: true` is what attaches the `fexit` program, see
+[Return values](#return-values) for more details on `return` and `returnArg`.
+
+System calls can be traced with fentry as well. As with kprobes, set the
+`syscall` field to `true` in that case, so that Tetragon knows the traced
+function uses the system call ABI and reads its arguments accordingly. The
+symbol naming rules described in the kprobes section above apply here too.
+
+Similar to kprobes, you can define multiple fentry specs in the same policy:
+
+```yaml
+spec:
+  fentries:
+  - call: "tcp_connect"
+    syscall: false
+    # [...]
+  - call: "tcp_close"
+    syscall: false
+    # [...]
+```
+
+Fentry specs support the same `args`, `returnArg`, and `selectors` fields as
+kprobes, so you can use argument filtering and in-kernel selectors in the same
+way. For details on selectors, see the
+[Selectors]({{< ref "/docs/concepts/tracing-policy/selectors" >}}) documentation.
+
 ## Tracepoints
 
 
@@ -87,7 +165,7 @@ Tracepoints are statically defined in the kernel and have the advantage of being
 kernel versions and thus more portable than kprobes.
 
 To see the list of tracepoints available on your kernel, you can list them
-using `sudo ls /sys/kernel/debug/tracing/events`, the output should be similar
+using `sudo ls /sys/kernel/tracing/events`, the output should be similar
 to this.
 
 ```
@@ -118,7 +196,7 @@ error_report  iomap           page_isolation  smbus         xhci-hcd
 You can then choose the subsystem that you want to trace, and look the
 tracepoint you want to use and its format. For example, if we choose the
 `netif_receive_skb` tracepoints from the `net` subsystem, we can read its
-format with `sudo cat /sys/kernel/debug/tracing/events/net/netif_receive_skb/format`,
+format with `sudo cat /sys/kernel/tracing/events/net/netif_receive_skb/format`,
 the output should be similar to the following.
 
 ```
@@ -156,6 +234,107 @@ spec:
     - index: 4
       type: "int64"
 ```
+## Raw Tracepoints
+
+Raw tracepoints allow same attachment as tracepoints, but allow access to raw
+tracepoint arguments (compared to standard tracepoints that provide access to
+arguments through tracepoint format).
+
+Raw tracepoints are attach directly without the perf layer in the middle,
+so should be bit faster than standard tracepoints.
+
+Each tracepoint is defined in kernel with similar statement like following:
+```
+TRACE_EVENT(sched_process_exec,
+
+        TP_PROTO(struct task_struct *p, pid_t old_pid,
+                 struct linux_binprm *bprm),
+        ...
+);
+```
+
+which defines `sched:sched_process_exec` tracepoint with arguments.
+
+Raw tracepoints are configured by setting with `raw` spec tag.
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "rawtp"
+spec:
+  tracepoints:
+    - subsystem: "sched"
+      event: "sched_process_exec"
+      raw: true
+```
+
+We can use raw tracepoint to attach the tracepoint and access above arguments
+directly.
+
+Following example stores 3rd argument:
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "rawtp"
+spec:
+  tracepoints:
+    - subsystem: "sched"
+      event: "sched_process_exec"
+      raw: true
+      args:
+        - index: 2
+          type: "linux_binprm"
+```
+
+which is represented as path and permission data in the resulted event:
+```json
+    "subsys": "sched",
+    "event": "sched_process_exec",
+    "args": [
+      {
+        "linux_binprm_arg": {
+          "path": "/usr/bin/ls",
+          "permission": "rwxr-xr-x"
+        }
+      }
+```
+
+It's also possible to resolve data from arguments with `Resolve`, like:
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "rawtp"
+spec:
+  tracepoints:
+    - subsystem: "sched"
+      event: "sched_process_exec"
+      raw: true
+      args:
+        - index: 0
+          type: "int"
+          resolve: "pid"
+        - index: 2
+          type: "linux_binprm"
+```
+
+which gives you `pid` field from first `task_struct` argument, resulting in following event data:
+```json
+    "subsys": "sched",
+    "event": "sched_process_exec",
+    "args": [
+      {
+        "int_arg": 938600
+      },
+      {
+        "linux_binprm_arg": {
+          "path": "/usr/bin/ls",
+          "permission": "rwxr-xr-x"
+        }
+      }
+```
+
 ## Uprobes
 
 Uprobes are similar to kprobes, but they allow you to dynamically hook into any
@@ -212,6 +391,264 @@ spec:
 This example shows how to use uprobes to hook into the readline function
 running in all the bash shells.
 
+### Selectors
+
+Uprobes support the full range of selectors available for filtering events,
+including `matchArgs`, `matchReturnArgs`, `matchBinaries`, `matchNamespaces`,
+`matchCapabilities`, and more. This allows you to precisely filter uprobe
+events based on function arguments, return values, or process context.
+
+Here is an example that only generates events when the `readline` function
+is called from a specific binary and returns a string starting with "sudo":
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "uprobe-with-selectors"
+spec:
+  uprobes:
+  - path: "/bin/bash"
+    symbols:
+    - "readline"
+    return: true
+    returnArg:
+      index: 0
+      type: "string"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/bin/bash"
+        - "/usr/bin/bash"
+      matchReturnArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "sudo"
+```
+
+This policy will only generate events when `readline` is called from `/bin/bash`
+and returns a string starting with "sudo", which can be useful for monitoring potentially
+sensitive command input.
+
+For more details on available selectors and their usage, see the
+[Selectors]({{< ref "/docs/concepts/tracing-policy/selectors" >}}) documentation.
+
+### Target Binary Digest Verification
+
+In some cases, a uprobe policy is only intended to apply to a specific
+version of a binary, and could have adverse effect if attached to a
+different version of the binary.
+
+For users that want to only apply the policy for a specific build, they
+can specify a digest type and value to validate the target binary. The
+following example policy demonstrates this functionality.
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+    name: "uprobe-digest-example"
+spec:
+    uprobes:
+    - path: "/bin/example-target-binary"
+      symbols:
+      - "main"
+      ignore:
+        digestVerificationFailure: true
+      binaryDigests:
+        - "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        - "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+```
+When the above policy is added, Tetragon calculates the sha256 hash of
+`/bin/example-target-binary` and compares it against all configured binary
+digests. If none of the configured digests match the binary's calculated
+digest, digest verification fails, and Tetragon will not attach to the
+binary.
+
+The `ignore.digestVerificationFailure` field controls how verification
+failure is handled. If set to `true`, a hook that fails digest verification
+is skipped and the policy is partially loaded. If not set, the policy is
+rejected in its entirety (no hooks are attached).
+
+If the policy is not rejected, Tetragon's tracing policy status API
+(`TracingPolicyStatus`) exposes each hook's status. This way, users can
+determine which uprobes/hooks were actually attached. In addition to
+this hook status, the policy's `TracingPolicyState` will be set to
+`TP_STATE_PARTIALLY_ENABLED` when the policy is partially loaded.
+
+As you can see from the above example, the format of the entries in the
+`binaryDigests` list is `<digest type>:<digest>`.
+
+The following digest types are supported:
+- sha1
+- sha256
+- sha384
+- sha512
+- build-id (found in the ELF note section named `.note.gnu.build-id`)
+
+{{< caution >}}
+When a uprobe is attached, the kernel keeps track of the target by its
+inode. It's best practice for installation software (such as rpm, deb,
+install, tar) to unlink a pre-existing target before installing a new
+version. This ensures that the new version of the binary will have a new
+inode, so the uprobe will not fire for it.
+
+But, if the target binary is updated without an unlink, which would happen
+if `cp` is used or if the target is opened and updated in-place, the inode
+will be retained. In this case, the uprobe will continue firing for the
+updated binary, potentially causing unintended effect. As such, it's
+critical that users of this feature ensure their installation method will
+not retain the inode of the target binary that they want to update.
+
+If the user wants the policy to apply to a new version of the binary
+post-installation, they need to reload the policy after installation in
+order to attach to the new version of the binary.
+{{< /caution >}}
+
+## USDTs
+
+Tetragon allows to attach and monitor USDT (User Statically-Defined Tracing) probes.
+
+You can display available USDT probes directly by checking ELF binary `stapsdt` notes with:
+```shell
+readelf -n ..../contrib/tester-progs/usdt
+...
+  stapsdt              0x00000024       NT_STAPSDT (SystemTap probe descriptors)
+    Provider: test
+    Name: usdt0
+    Location: 0x000000000000115b, Base: 0x0000000000002004, Semaphore: 0x0000000000004030
+    Arguments:
+  stapsdt              0x00000043       NT_STAPSDT (SystemTap probe descriptors)
+    Provider: test
+    Name: usdt3
+    Location: 0x0000000000001177, Base: 0x0000000000002004, Semaphore: 0x0000000000004032
+    Arguments: -4@-12(%rbp) -8@-8(%rbp) 8@%rax
+  stapsdt              0x00000084       NT_STAPSDT (SystemTap probe descriptors)
+    Provider: test
+    Name: usdt12
+    Location: 0x000000000000120a, Base: 0x0000000000002004, Semaphore: 0x0000000000004034
+    Arguments: -4@-12(%rbp) -4@%edi -8@-8(%rbp) -8@%r8 -4@$5 -8@%r9 8@%rax 8@%r10 -4@$-9 -2@%dx -2@%cx -1@%sil
+```
+
+Or use `tetra` to generate tracing policy for available USDT probes with:
+```bash
+tetra tracingpolicy generate usdts --binary ..../contrib/tester-progs/usdt
+```
+
+that generates following tracing policy:
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  creationTimestamp: "2025-07-28T21:23:36Z"
+  name: usdts
+spec:
+  usdts:
+  - message: ""
+    name: usdt0
+    path: ./contrib/tester-progs/usdt
+    provider: test
+  - args:
+    - index: 0
+      label: -4@-12(%rbp)
+      maxData: false
+      resolve: ""
+      returnCopy: false
+      sizeArgIndex: 0
+      type: int32
+    - index: 1
+      label: -8@-8(%rbp)
+      maxData: false
+      resolve: ""
+      returnCopy: false
+      sizeArgIndex: 0
+      type: int64
+    - index: 2
+      label: 8@%rax
+      maxData: false
+      resolve: ""
+      returnCopy: false
+      sizeArgIndex: 0
+      type: uint64
+```
+
+Each USDT probe is defined with binary `Path` plus `Provider` and `Name` tags.
+
+The combination of `Provider` and `Name` allows to group usdt probes and
+is usually specific for each application.
+
+Each probe can have up to 5 arguments (which is a tetragon limitation) that
+follow standard argument definitions used for other probes.
+
+## LSM BPF
+
+LSM BPF programs allow runtime instrumentation of the LSM hooks by privileged
+users to implement system-wide MAC (Mandatory Access Control) and Audit policies
+using eBPF.
+
+List of LSM hooks which can be instrumented can be found in `security/security.c`.
+
+To verify if BPF LSM is available use the following command:
+
+```shell
+cat /boot/config-$(uname -r) | grep BPF_LSM
+```
+
+The output should be similar to this if BPF LSM is supported:
+
+```
+CONFIG_BPF_LSM=y
+```
+
+Then, if provided above conditions are met, use this command to check if BPF LSM is enabled:
+
+```shell
+cat /sys/kernel/security/lsm
+```
+
+The output might look like this:
+
+```
+bpf,lockdown,integrity,apparmor
+```
+
+If the output includes the `bpf`, than BPF LSM is enabled. Otherwise, you can modify `/etc/default/grub`:
+
+```
+GRUB_CMDLINE_LINUX="lsm=lockdown,integrity,apparmor,bpf"
+```
+
+Then, update the grub configuration and restart the system.
+
+The provided example of LSM BPF `TracingPolicy` monitors  access to files
+`/etc/passwd` and `/etc/shadow` with `/usr/bin/cat` executable.
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "lsm-file-open"
+spec:
+  lsmhooks:
+  - hook: "file_open"
+    args:
+      - index: 0
+        type: "file"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/bin/cat"
+      matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "/etc/passwd"
+        - "/etc/shadow"
+```
+
 ## Arguments
 
 Kprobes, uprobes and tracepoints all share a needed arguments fields called `args`. It is a list of
@@ -219,7 +656,7 @@ arguments to include in the trace output. Tetragon's BPF code requires
 information about the types of arguments to properly read, print and
 filter on its arguments. This information needs to be provided by the user under the
 `args` section. For the [available
-types](https://github.com/cilium/tetragon/blob/main/pkg/k8s/apis/cilium.io/client/crds/v1alpha1/cilium.io_tracingpolicies.yaml#L64-L88),
+types](https://github.com/cilium/tetragon/blob/v1.4.0/pkg/k8s/apis/cilium.io/client/crds/v1alpha1/cilium.io_tracingpolicies.yaml#L166-L208),
 check the [`TracingPolicy`
 CRD](https://github.com/cilium/tetragon/blob/main/pkg/k8s/apis/cilium.io/client/crds/v1alpha1/cilium.io_tracingpolicies.yaml).
 
@@ -248,7 +685,7 @@ args:
 To properly read and hook onto the `fd_install(unsigned int fd, struct file
 *file)` function, the YAML snippet above tells the BPF code that the first
 argument is an `int` and the second argument is a `file`, which is the
-[`struct file`](https://elixir.bootlin.com/linux/latest/source/include/linux/fs.h#L940)
+[`struct file`](https://elixir.bootlin.com/linux/v6.13.7/source/include/linux/fs.h#L1035)
 of the kernel. In this way, the BPF code and its printer can properly collect
 and print the arguments.
 
@@ -333,6 +770,219 @@ The `maxData` flag does not work with `returnCopy` flag at the moment, so it's
 usable only for syscalls/functions that do not require return probe to read the
 data.
 
+### Attribute resolution
+
+{{< caution >}}
+- For kprobes, available only from kernel version 5.4.
+- For LSM, available only from kernel version 5.7.
+- For uprobes, this functionality is not supported.
+{{< /caution >}}
+
+This functionality allows you to dynamically extract specific attributes from
+kernel structures passed as parameters to Kprobes and LSM hooks.
+For example, when using the `bprm_check_security` LSM hook, you can access and
+display attributes from the parameter `struct linux_binprm *bprm` at index 0.
+This parameter contains many informations you may want to access.
+With the resolve flag, you can easily access fields such as
+`mm.owner.real_parent.comm`, which provides the parent process comm.
+
+#### How it works
+
+The following tracing policy demonstrates how to use the resolve flag to extract the
+parent process's comm during the execution of a binary:
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "lsm"
+spec:
+  lsmhooks:
+  - hook: "bprm_check_security"
+    args:
+    - index: 0 # struct linux_binprm *bprm
+      type: "string"
+      resolve: "mm.owner.real_parent.comm"
+    selectors:
+    - matchActions:
+      - action: Post
+```
+- `index` flag : The parameter at index 0 is a pointer to the
+`struct linux_binprm`.
+- `resolve` flag : Using the resolve flag, the policy extracts the
+`mm.owner.real_parent.comm` field, representing the parent process's comm.
+
+{{< caution >}}
+- This feature requires you to read the kernel structure definitions to find what you're
+looking for in the hook parameter attributes. For instance, if you want to have a look
+at what is available inside `struct linux_binprm`, take a look at its definition in
+[include/linux/binfmts.h](https://elixir.bootlin.com/linux/v6.12.5/source/include/linux/binfmts.h#L18)
+- Some structures are dynamic. This means that they may change at runtime.
+{{< /caution >}}
+
+Tetragon can also handle some structures such as `struct file` or `struct
+path` and a few others. This means you can also extract the whole struct, if it is
+available in the attributes of the parameter, and set the type with the correct type
+like this :
+
+```yaml
+...
+  lsmhooks:
+  - hook: "bprm_check_security"
+    args:
+      - index: 0 # struct linux_binprm *bprm
+        type: "file"
+        resolve: "file"
+...
+```
+Or
+```yaml
+...
+  lsmhooks:
+  - hook: "bprm_check_security"
+    args:
+      - index: 0
+        type: "path"
+        resolve: "file.f_path"
+...
+```
+
+The following tracing policy demonstrates how to use the `resolve` flag on nested
+pointers. For exemple, the hook `security_inode_copy_up` (defined in
+[security/security.c](https://elixir.bootlin.com/linux/v6.12.5/source/security/security.c#L2753))
+takes two parameters: `struct dentry *src` and `struct cred **new`. The resolve
+flag allows you to access fields within these nested structures transparently.
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "lsm"
+spec:
+  kprobes:
+  - call: "security_inode_copy_up"
+    syscall: false
+    args:
+    - index: 0 # struct dentry *src
+      type: "int64"
+    - index: 1 # struct cred **new
+      type: "int"
+      resolve: "user.uid.val"
+    selectors:
+    - matchActions:
+      - action: Post
+```
+
+It is also possible to resolve arrays (`int arr[100]`) and dynamic arrays
+(`int **dyn_arr`) by using square bracket notations, similarly as follows:
+
+```yaml
+- index: 0
+  resolve: some.field[12].some.subfield
+  type: uint32
+```
+
+#### Initial BTF type
+
+By default, Tetragon starts `resolve` from the BTF type of the hook argument.
+For kprobes, tracepoints, and LSM hooks, this type comes from the kernel BTF
+prototype. For uprobes and USDT probes, it comes from the BTF file configured
+with `btfPath`.
+
+Use `btfType` when the hook argument type is too generic, or when you need to
+cast the argument to a more specific structure before resolving fields. The
+`btfType` value is the BTF struct name without the `struct` prefix.
+
+The following example resolves fields from the `struct sockaddr_in` view of the
+second `security_socket_connect` argument:
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "socket-connect-address"
+spec:
+  kprobes:
+  - call: "security_socket_connect"
+    syscall: false
+    args:
+    - index: 1
+      type: "uint16"
+      label: "sockaddr_in.sin_port"
+      btfType: "sockaddr_in"
+      resolve: "sin_port"
+    - index: 1
+      type: "uint32"
+      label: "sockaddr_in.sin_addr.s_addr"
+      btfType: "sockaddr_in"
+      resolve: "sin_addr.s_addr"
+```
+
+#### Kernel module BTF types
+
+For kprobe arguments, use `btfTypeModule` with `btfType` when the structure is
+defined by a kernel module instead of the main kernel BTF. The module name
+should be the kernel module name, without a `.ko` suffix.
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "af-alg-bind"
+spec:
+  kprobes:
+  - call: "security_socket_bind"
+    syscall: false
+    args:
+    - index: 1
+      type: "uint16"
+      label: "sockaddr_alg.salg_family"
+      btfType: "sockaddr_alg_new"
+      btfTypeModule: "af_alg"
+      resolve: "salg_family"
+    - index: 1
+      type: "string"
+      label: "sockaddr_alg.salg_name"
+      btfType: "sockaddr_alg_new"
+      btfTypeModule: "af_alg"
+      resolve: "salg_name"
+```
+
+{{< caution >}}
+When `btfTypeModule` is set, Tetragon first tries to read module BTF exposed by
+the kernel in `/sys/kernel/btf/<module>`. If that is not available, Tetragon
+fails to load the policy.
+{{< /caution >}}
+
+If `btfTypeModule` is omitted, Tetragon searches the main kernel BTF first. For
+hooks that belong to a loaded module, Tetragon also tries that hook's module BTF.
+
+## Data
+
+Kprobes allow definition of `data` fields and following `matchData` selector
+that allows to retrieve data from kernel current task object and specify
+filter on it.
+
+Following example defines data field that retrieves `comm` field from
+kernel `current_task` object.
+
+```yaml
+data:
+- index: 0
+  type: "string"
+  source: "current_task"
+  resolve: "comm"
+selectors:
+- matchData:
+  - index: 0
+    operator: "Equal"
+    values:
+    - "example"
+```
+
+Note all data field spec definitions need to define `source` (ATM only available value
+is `current_task`) and `resolve` string based on kernel `struct task_struct` object.
+
 ## Return values
 
 A `TracingPolicy` spec can specify that the return value should be reported in
@@ -349,6 +999,7 @@ set to `true`, and the `returnArg` parameter needs to be set to specify the
     type: int
     label: "family"
   returnArg:
+    index: 0
     type: sock
 ```
 
@@ -371,7 +1022,9 @@ Specifying socket tracking tells Tetragon to store a mapping between the socket
 and the process' PID and TGID; and to use that mapping when it sees the socket in a
 `sock` argument in another hook to replace the PID and TGID of the context with the
 process that actually owns the socket. This can be done by adding a `returnArgAction`
-to the call. Available actions are `TrackSock` and `UntrackSock`.
+to the call. Use `returnArg` to include the return value in the event output;
+`returnArgAction` is only for the socket-tracking actions `TrackSock` and
+`UntrackSock`.
 See [`TrackSock`](/docs/concepts/tracing-policy/selectors/#tracksock-action) and [`UntrackSock`](/docs/concepts/tracing-policy/selectors/#untracksock-action).
 
 ```yaml
@@ -383,11 +1036,35 @@ See [`TrackSock`](/docs/concepts/tracing-policy/selectors/#tracksock-action) and
     type: int
     label: "family"
   returnArg:
+    index: 0
     type: sock
   returnArgAction: TrackSock
 ```
 
-Socket tracking is only available on kernels >=5.3.
+#### Limitations
+
+Socket tracking has the following limitations:
+
+- Kernel version: socket tracking is only available on kernels >=5.3.
+
+- LRU map overflow: socket mappings are stored in an LRU (Least Recently Used)
+  hash map in the kernel with a fixed upper limit for entries. When the map is
+  full, old entries are evicted to make space for new ones. If many sockets are
+  created in a short period, older socket mappings may be lost and network
+  events may be attributed to the wrong process.
+
+- Socket sharing between processes: sockets are not strictly owned by a single
+  process—they can be shared via `fork()` (when both parent and child keep the
+  file descriptor open) or via IPC file descriptor passing. Tetragon attributes
+  all socket activity to the process that originally created the socket. If that
+  process exits while another continues using the socket, the mapping references
+  a process that no longer exists.
+
+{{< warning >}}
+The LRU map overflow and socket sharing limitations have security implications.
+An adversary could overflow the map to evade attribution, or exploit socket
+sharing to obscure the true source of network activity.
+{{< /warning >}}
 
 
 ## Lists
@@ -458,8 +1135,8 @@ spec:
 
 Syscalls specified with `sys_` prefix are translated to their 64 bit equivalent function names.
 
-It's possible to specify 32 bit syscall by using its full function name that
-includes specific architecture native prefix (like `__ia32_` for `x86`):
+It's possible to specify a syscall for an alternative ABI by using the ABI name as a prefix.
+For example:
 
 ```yaml
 spec:
@@ -468,7 +1145,7 @@ spec:
     type: "syscalls"
     values:
     - "sys_dup"
-    - "__ia32_sys_dup"
+    - "i386/sys_dup"
     name: "another"
     - "sys_open"
     - "sys_close"
@@ -598,7 +1275,7 @@ spec:
     type: "syscalls"
     values:
     - "sys_dup"
-    - "__ia32_sys_dup"
+    - "i386/sys_dup"
   tracepoints:
   - subsystem: "raw_syscalls"
     event: "sys_enter"
@@ -611,4 +1288,165 @@ spec:
         operator: "InMap"
         values:
         - "list:dups"
+```
+
+## Selectors macros
+
+It's possible to define selectors macros in `TracingPolicy` specification that
+contain selectors definitions, which can be used in `kprobes`, `tracepoints`,
+`uprobes`, `usdts`, and `lsmhooks` as a part of their selectors by macro name.
+The content of the macro will be  substituted in target selectors.
+
+{{< caution >}}
+The same field cannot be present in a macro definition and in a policy selector
+that uses the macro. See more info in [macros
+limitations](/docs/concepts/tracing-policy/hooks/#macros-limitations).
+{{< /caution >}}
+
+Consider we have tracing policy, where we want to intercept kernel functions
+`call_1`, `call_2`, `call_3`, but target binary must not be located in
+directory `dir`. For that we define the following policy:
+    
+ ```yaml
+ spec:
+   kprobes:
+   - call: <call_1>
+     selectors:
+     - matchBinaries:
+       - operator: "NotPrefix"
+         values:
+         - "dir"
+   - call: <call_2>
+     selectors:
+     - matchBinaries:
+       - operator: "NotPrefix"
+         values:
+         - "dir"
+   - call: <call_3>
+     selectors:
+     - matchBinaries:
+       - operator: "NotPrefix"
+         values:
+         - "dir"
+ ```
+
+With macros, we can rewrite this policy in more convenient way:
+
+```yaml
+spec:
+  selectorsMacros:
+    dir:
+      matchBinaries:
+      - operator: "NotPrefix"
+        values:
+        - "dir"
+  kprobes:
+  - call: <call_1>
+    selectors:
+    - macros: [ dir ]
+  - call: <call_2>
+    selectors:
+    - macros: [ dir ]
+  - call: <call_3>
+    selectors:
+    - macros: [ dir ]
+```
+
+For a more realistic example, consider we want to intercept system calls `open`
+and `openat`, which have different signatures: `open` system call has
+`pathname` as a first argument, and `openat` has `pathname` as a second
+argument. We want to catch event when `pathname` ends with `passwd`, but we
+want to filter out events where binary has prefix `/opt/myapp`, because we
+consider that our application can read `passwd` file safely. Because these
+system calls signatures are different, we cannot create a list and have same
+`matchArgs` selector, because indices of `pathname` are different.
+
+With macros, the policy would look like this:
+
+```yaml
+spec:
+  selectorsMacros:
+    myappExclusion:
+      matchBinaries:
+      - operator: "NotPrefix"
+        values: "/opt/myapp"
+  kprobes:
+  - call: "sys_open"
+    args:
+    - index: 0
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "passwd"
+      macros: ["myappExclusion"]
+  - call: "sys_openat"
+    args:
+    - index: 1
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Postfix"
+        values:
+        - "passwd"
+      macros: ["myappExclusion"]
+```
+
+### Limitations {#macros-limitations}
+
+Having a same field in a hook selector and in a macro definition, or using
+different macros with same fields defined will result in an error.
+
+The following policy will be considered as **incorrect**, because there is
+`matchArgs` field in both macro and policy selector:
+```yaml
+spec:
+  selectorsMacros:
+    argMacro:
+      matchArgs:
+        - index: 0
+          operator: "NotEqual"
+          values:
+            - <value-1>
+  kprobes:
+  - call: <call>
+    args:
+      - index: 0
+        type: int
+    selectors:
+    - macros: [ argMacro ]
+      matchArgs:
+        - index: 0
+          operator: "NotEqual"
+          values:
+            - <value-1>
+```
+
+The following policy will be considered as **incorrect**, because different
+macros contain `matchArgs` field and used in same selector:
+```yaml
+spec:
+  selectorsMacros:
+    argMacro1:
+      matchArgs:
+        - index: 0
+          operator: "NotEqual"
+          values:
+            - <value-1>
+    argMacro2:
+      matchArgs:
+        - index: 0
+          operator: "NotEqual"
+          values:
+            - <value-2>
+  kprobes:
+  - call: <call>
+    args:
+      - index: 0
+        type: int
+    selectors:
+    - macros: [ argMacro1, argMacro2 ]
 ```

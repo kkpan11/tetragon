@@ -19,17 +19,36 @@ PROGS = sigkill-tester \
 	bench-reader \
 	threads-exit \
 	enforcer-tester \
+	enforcer-tester-32 \
 	drop-privileges \
 	getcpu \
 	direct-write-tester \
 	change-capabilities \
-	user-stacktrace
+	user-stacktrace \
+	test-helper \
+	pause \
+	raisesigkill \
+	forks \
+	capabilities-gained \
+	follow_children_1 \
+	usdt \
+	capabilities-ioperm \
+	usdt-override \
+	usdt-resolve \
+	uretprobe \
+	uprobe-resolve \
+	regs-override \
+	usdt-args \
+	uprobe-null \
+	uprobe-caller \
+	uprobe-simple \
+	pclntab-unstripped \
+	pclntab-stripped \
+	null-mount \
+	resolve-nested-anon-struct
 
-# For now enforcer-tester is compiled to 32-bit only on x86_64 as we want
-# to test 32-bit binaries and system calls compatibility layer.
-ifeq ($(shell uname -m),x86_64)
-	PROGS += enforcer-tester-32
-endif
+LIBS =	libuprobe.so \
+	libtester.so
 
 all: $(PROGS)
 
@@ -72,28 +91,117 @@ exit-code: exit-code.c
 libuprobe.so: uprobe-lib.c
 	$(GCC) -Wall -fPIC $< -o $@ -shared
 
-uprobe-test-1: uprobe-test.c libuprobe.so
-	$(GCC) -Wall $< -o $@ $(CURDIR)/libuprobe.so
+libtester.so: tester-lib.c
+	$(GCC) -Wall -fPIC $< -o $@ -shared
+
+uprobe-test-1: uprobe-test.c tester-lib.h libuprobe.so libtester.so
+	$(GCC) -Wall $< -o $@ -L . -luprobe -ltester -Wl,-rpath,'$$ORIGIN'
 
 uprobe-test-2: uprobe-test-1
 	cp uprobe-test-1 uprobe-test-2
 
-# -m32 is an x86_64 flag.
-# NB(kkourt) we compile this as static to avoid the need for ia32 libs in VMs
+capabilities-gained: capabilities-gained.c
+	$(GCC) -Wall $< -o $@ -lcap
+
+usdt: usdt.c
+	$(GCC) -Wall $< -o $@
+
+usdt-args: usdt-args.c tester-lib.h libtester.so
+	$(GCC) -Wall $< -o $@ -L . -ltester -Wl,-rpath,'$$ORIGIN'
+
+capabilities-ioperm: capabilities-ioperm.c
+	$(GCC) -Wall $< -o $@
+
+usdt-override: usdt-override.c
+	$(GCC) -Wall $< -O2 -o $@
+	strip $@
+
+usdt-resolve: usdt-resolve.c
+	$(GCC) -ggdb3 -O2 -Wall $< -o $@
+	pahole -J $@
+	llvm-objcopy --dump-section .BTF=$@.btf.tmp $@
+	llvm-objcopy -I binary -O elf64-x86-64 --rename-section .data=.BTF $@.btf.tmp $@.btf
+	rm $@.btf.tmp
+
+uprobe-resolve: uprobe-resolve.c tester-lib.h libtester.so
+	$(GCC) -ggdb3 -O2 -Wall $< -o $@ -L . -ltester -Wl,-rpath,'$$ORIGIN'
+	pahole -J $@
+	llvm-objcopy --dump-section .BTF=$@.btf.tmp $@
+	llvm-objcopy -I binary -O elf64-x86-64 --rename-section .data=.BTF $@.btf.tmp $@.btf
+	rm $@.btf.tmp
+
+# Use a custom linker script (buildid-first.ld) to ensure that the first note section
+# is the buildID section. Only kernels containing the following patch look further than
+# the first note section for the buildID. This patch is available in upstream kernels >=5.9.
+uprobe-caller: uprobe-caller.c libuprobe.so
+	# https://github.com/torvalds/linux/commit/b33164f2bd1cedb094c32cb466287116164457ae
+	$(GCC) -ggdb3 -O0 -Wall -fcf-protection=none -fno-omit-frame-pointer $< -o $@ -L . -luprobe -Wl,-rpath,'$$ORIGIN' -Wl,-T,buildid-first.ld
+	pahole -J $@
+	llvm-objcopy --dump-section .BTF=$@.btf.tmp $@
+	llvm-objcopy -I binary -O elf64-x86-64 --rename-section .data=.BTF $@.btf.tmp $@.btf
+	rm $@.btf.tmp
+
+uprobe-null: uprobe-null.c
+	$(GCC) -ggdb3 -O2 -Wall $< -o $@
+	pahole -J $@
+	llvm-objcopy --dump-section .BTF=$@.btf.tmp $@
+	llvm-objcopy -I binary -O elf64-x86-64 --rename-section .data=.BTF $@.btf.tmp $@.btf
+	rm $@.btf.tmp
+
+resolve-nested-anon-struct: resolve-nested-anon-struct.c
+	$(GCC) -ggdb3 -O2 -Wall $< -o $@
+	pahole -J $@
+	llvm-objcopy --dump-section .BTF=$@.btf.tmp $@
+	llvm-objcopy -I binary -O elf64-x86-64 --rename-section .data=.BTF $@.btf.tmp $@.btf
+	rm $@.btf.tmp
+
+regs-override: regs-override.c
+	$(GCC) -Wall -fcf-protection=none $< -o $@
+
+uretprobe: uretprobe.c
+	$(GCC) -Wall $< -O2 -o $@
+
+# NB: compile the 32 bit version of enforcer-tester statically so that we don't
+# need additional libraries in the VMs
 enforcer-tester-32: enforcer-tester.c
+ifeq ($(shell uname -m),x86_64)
 	$(GCC) -Wall -m32 -static $< -o $@
+else ifeq ($(shell uname -m),aarch64)
+	arm-linux-gnueabihf-gcc -Wall -static $< -o $@
+else
+	$(error unsupported arch)
+endif
 
 lseek-pipe: FORCE
 	go build -o lseek-pipe ./go/lseek-pipe
 
 getcpu: FORCE
-	go build -o getcpu ./go/getcpu
+	go build -o $@ ./go/getcpu
+
+getcpu-i386: FORCE
+	GOARCH=386 go build -o $@ ./go/getcpu
 
 user-stacktrace: FORCE
 	go build -o user-stacktrace ./go/user-stacktrace
 
+test-helper: FORCE
+	go build -o test-helper ./go/test-helper
+
+pclntab-unstripped: FORCE
+	go build -o $@ ./go/pclntab-test
+
+pclntab-stripped: FORCE
+	go build -ldflags='-s -w' -o $@ ./go/pclntab-test
+
 .PHONY: clean
 clean:
-	rm -f $(PROGS)
+	rm -f $(PROGS) $(LIBS) *.btf
+
+OTHER_FILES = resolve-nested-anon-struct.btf uprobe-resolve.btf
+
+# Used by top-level Makefile to create a tester-progs tarball
+.PHONY: all-files
+all-files:
+	@echo $(PROGS) $(LIBS) $(OTHER_FILES)
 
 FORCE:

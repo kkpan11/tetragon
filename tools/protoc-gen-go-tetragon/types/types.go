@@ -6,12 +6,17 @@ package types
 import (
 	"path/filepath"
 
-	"github.com/cilium/tetragon/tools/protoc-gen-go-tetragon/common"
 	"google.golang.org/protobuf/compiler/protogen"
+
+	"github.com/cilium/tetragon/tools/protoc-gen-go-tetragon/common"
 )
 
 func Generate(gen *protogen.Plugin, files []*protogen.File) error {
-	g := common.NewFile(gen, files[0], "", filepath.Base(common.TetragonApiPackageName), "types")
+	f, err := common.GetFirstTetragonFile(files)
+	if err != nil {
+		return err
+	}
+	g := common.NewFile(gen, f, "", filepath.Base(common.TetragonApiPackageName), "types")
 
 	events, err := common.GetEvents(files)
 	if err != nil {
@@ -40,6 +45,12 @@ func Generate(gen *protogen.Plugin, files []*protogen.File) error {
         SetParent(p * ` + processIdent + `)
     }`)
 
+	g.P(`// AncestorEvent represents a Tetragon event that has an Ancestor field
+    type AncestorEvent interface {
+        Event
+        SetAncestors(ps []* ` + processIdent + `)
+    }`)
+
 	// Generate impls
 	for _, event := range events {
 		g.P(`// Encapsulate implements the Event interface.
@@ -63,6 +74,14 @@ func Generate(gen *protogen.Plugin, files []*protogen.File) error {
             // Sets the Parent field of an event.
             func (event *` + event.GoIdent.GoName + `) SetParent(p *` + processIdent + `) {
                 event.Parent = p
+            }`)
+		}
+
+		if common.IsAncestorsEvent(event) {
+			g.P(`// SetAncestors implements the AncestorEvent interface.
+            // Sets the Ancestor field of an event.
+            func (event *` + event.GoIdent.GoName + `) SetAncestors(ps []*` + processIdent + `) {
+                event.Ancestors = ps
             }`)
 		}
 	}

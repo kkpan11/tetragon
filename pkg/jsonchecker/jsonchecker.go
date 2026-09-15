@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -15,15 +16,13 @@ import (
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
 	"github.com/cilium/tetragon/api/v1/tetragon/codegen/helpers"
-	"github.com/cilium/tetragon/pkg/eventcache"
 	"github.com/cilium/tetragon/pkg/logger"
 	"github.com/cilium/tetragon/pkg/testutils"
-	"github.com/sirupsen/logrus"
 )
 
 var (
 	Retries    = 13
-	RetryDelay = eventcache.EventRetryTimer + (1 * time.Second)
+	RetryDelay = 3 * time.Second
 )
 
 // DebugError is an error that will create a debug output message
@@ -50,12 +49,12 @@ func (e *DebugError) Unwrap() error {
 	return e.err
 }
 
-// JsonEOF is a type of error where we went over all the events and there was no match.
+// JsonEOFError is a type of error where we went over all the events and there was no match.
 //
 // The reason to have a special error is that there are cases where the events
 // we are looking for might not have been processed yet. In these cases, we
 // need to retry.
-type JsonEOF struct {
+type JsonEOFError struct {
 	// err is what FinalCheck() returned
 	err error
 	// count is the number of events we checked
@@ -63,25 +62,24 @@ type JsonEOF struct {
 }
 
 // Error returns the error message
-func (e *JsonEOF) Error() string {
+func (e *JsonEOFError) Error() string {
 	return fmt.Sprintf("JsonEOF: failed to match after %d events: err:%v", e.count, e.err)
 }
 
 // Unwrap returns the original error
-func (e *JsonEOF) Unwrap() error {
+func (e *JsonEOFError) Unwrap() error {
 	return e.err
 }
 
 // JsonCheck checks a JSON string using the new eventchecker library.
-func JsonCheck(jsonFile *os.File, checker ec.MultiEventChecker, log *logrus.Logger) error {
+func JsonCheck(jsonFile *os.File, checker ec.MultiEventChecker, log *slog.Logger) error {
 	count := 0
 	dec := json.NewDecoder(jsonFile)
 	for dec.More() {
-		var dbgErr *DebugError
 		var ev tetragon.GetEventsResponse
 		if err := dec.Decode(&ev); err != nil {
 			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
-				return &JsonEOF{
+				return &JsonEOFError{
 					count: count,
 					err:   fmt.Errorf("unmarshal failed: %w", err),
 				}
@@ -97,23 +95,23 @@ func JsonCheck(jsonFile *os.File, checker ec.MultiEventChecker, log *logrus.Logg
 		matchPrefix := fmt.Sprintf("%sevent:%s", prefix, eType)
 		done, err := ec.NextResponseCheck(checker, &ev, log)
 		if done && err == nil {
-			log.Infof("%s =>  FINAL MATCH", matchPrefix)
-			log.Infof("jsonTestCheck: DONE!")
+			log.Info(matchPrefix + " =>  FINAL MATCH")
+			log.Info("jsonTestCheck: DONE!")
 			return nil
 		} else if err == nil {
-			log.Infof("%s => MATCH, continuing", matchPrefix)
+			log.Info(matchPrefix + " => MATCH, continuing")
 		} else if done && err != nil {
-			log.Errorf("%s => terminating error: %s", matchPrefix, err)
+			log.Error(fmt.Sprintf("%s => terminating error: %s", matchPrefix, err))
 			return err
-		} else if errors.As(err, &dbgErr) {
-			log.Debugf("%s => no match: %s, continuing", matchPrefix, err)
+		} else if _, ok := errors.AsType[*DebugError](err); ok {
+			log.Debug(fmt.Sprintf("%s => no match: %s, continuing", matchPrefix, err))
 		} else {
-			log.Infof("%s => no match: %s, continuing", matchPrefix, err)
+			log.Info(fmt.Sprintf("%s => no match: %s, continuing", matchPrefix, err))
 		}
 	}
 
 	if err := checker.FinalCheck(log); err != nil {
-		return &JsonEOF{
+		return &JsonEOFError{
 			count: count,
 			err:   err,
 		}
@@ -122,18 +120,12 @@ func JsonCheck(jsonFile *os.File, checker ec.MultiEventChecker, log *logrus.Logg
 }
 
 func doJsonTestCheck(t *testing.T, jsonFile *os.File, checker ec.MultiEventChecker) error {
-	fieldLogger := logger.GetLogger()
-	log, ok := fieldLogger.(*logrus.Logger)
-	if !ok {
-		return fmt.Errorf("failed to convert logger")
-	}
-
 	cnt := 0
 	prevEvents := 0
 	var err error
 	for {
 		t0 := time.Now()
-		err = JsonCheck(jsonFile, checker, log)
+		err = JsonCheck(jsonFile, checker, logger.GetLogger())
 		elapsed := time.Since(t0)
 		t.Logf("JsonCheck (retry=%d) took %s", cnt, elapsed)
 		if err == nil {
@@ -142,7 +134,7 @@ func doJsonTestCheck(t *testing.T, jsonFile *os.File, checker ec.MultiEventCheck
 
 		// if this is not a JsonEOF error, it means that the checker
 		// concluded that there was a falure. Dont retry.
-		var errEOF *JsonEOF
+		var errEOF *JsonEOFError
 		if !errors.As(err, &errEOF) {
 			break
 		}
@@ -168,6 +160,10 @@ func doJsonTestCheck(t *testing.T, jsonFile *os.File, checker ec.MultiEventCheck
 }
 
 func JsonTestCheckExpect(t *testing.T, checker ec.MultiEventChecker, expectCheckerFailure bool) error {
+	return JsonTestCheckExpectWithKeep(t, checker, expectCheckerFailure, false)
+}
+
+func JsonTestCheckExpectWithKeep(t *testing.T, checker ec.MultiEventChecker, expectCheckerFailure, keep bool) error {
 	var err error
 
 	jsonFname, err := testutils.GetExportFilename(t)
@@ -196,7 +192,7 @@ func JsonTestCheckExpect(t *testing.T, checker ec.MultiEventChecker, expectCheck
 		}
 	}
 
-	if err == nil {
+	if err == nil && !keep {
 		// mark the file to be deleted
 		if xerr := testutils.DoneWithExportFile(t); xerr != nil {
 			// We failed to mark the file as deleted. This will happen if we hit a

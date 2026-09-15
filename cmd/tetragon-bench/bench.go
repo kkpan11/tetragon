@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package main
 
 import (
@@ -9,9 +11,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/cilium/tetragon/pkg/bench"
 	"github.com/spf13/viper"
 	"golang.org/x/sys/unix"
+
+	"github.com/cilium/tetragon/pkg/bench"
 )
 
 // Command-line flags

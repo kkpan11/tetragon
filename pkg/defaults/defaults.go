@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Cilium
 
+//go:build !windows
+
 package defaults
+
+import "time"
 
 const (
 	// DefaultMapRoot is the default path where BPFFS should be mounted
@@ -37,14 +41,46 @@ const (
 	// Used by both client cli to guess unix socket address and by bugtool
 	InitInfoFile = DefaultRunDir + "tetragon-info.json"
 
+	// DefaultUnixSocket is the in-pod IPC socket the agent exposes when the
+	// gRPC server is listening on TCP, so co-located tooling can connect
+	// without TLS material.
+	DefaultUnixSocket = DefaultRunDir + "tetragon.sock"
+
+	// BugtoolExtraFiles is the file location for extra files to include in bugtool archives.
+	// Written by the daemon at startup, read by the CLI at bugtool time.
+	BugtoolExtraFiles = DefaultRunDir + "tetragon-bugtool-extra-files.json"
+
 	// Default directory from where to load tracing policies.
 	DefaultTpDir = "/etc/tetragon/tetragon.tp.d"
+
+	// Default directory in which to persist tracing policies installed over gRPC.
+	DefaultGRPCPolicyDir = DefaultRunDir + "grpc-policies"
 
 	// Default secure export logs permissions
 	DefaultLogsPermission = "600"
 
 	// Pid file where to write tetragon main PID
 	DefaultPidFile = DefaultRunDir + "tetragon.pid"
+
+	// defaults for the event cache
+	DefaultEventCacheNumRetries = 15
+	DefaultEventCacheRetryDelay = 2
+
+	// defaults for the process cache
+	DefaultProcessCacheGCInterval = 30 * time.Second
+
+	// defaults for the {k,u}retprobes lru cache
+	DefaultRetprobesCacheSize = 4096
+
+	// DefaultSleepablePreloadSize is the default maximum number of entries in the sleepable preload map.
+	DefaultSleepablePreloadSize = 32768
+
+	// DefaultSleepableOffloadSize is the default maximum number of entries in the sleepable offload map.
+	DefaultSleepableOffloadSize = 32768
+
+	// DefaultMaxGRPCRecvMsgSize is the default maximum gRPC receive message
+	// size for the tetra CLI (10MB).
+	DefaultMaxGRPCRecvMsgSize = 10 * 1024 * 1024
 )
 
 var (

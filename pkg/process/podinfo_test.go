@@ -5,36 +5,35 @@ package process
 
 import (
 	"testing"
-	"time"
 
-	"github.com/cilium/tetragon/api/v1/tetragon"
-	"github.com/cilium/tetragon/pkg/watcher"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/build"
+	"github.com/cilium/tetragon/pkg/watcher"
 )
 
 func TestK8sWatcher_GetPodInfo(t *testing.T) {
-	controller := true
-	pod := v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "test-pod",
-			Namespace:         "kube-system",
-			UID:               "1",
-			ResourceVersion:   "1",
-			Generation:        1,
-			CreationTimestamp: metav1.Time{},
-			Labels:            map[string]string{"a": "b", "c": "d"},
-			GenerateName:      "test-workload-",
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					Name:       "test-workload",
-					Kind:       "Deployment",
-					Controller: &controller,
-				},
+	build.SkipIfK8sDisabled(t)
+	var pods []any
+	pod := &v1.Pod{
+		Name:              "test-pod",
+		Namespace:         "kube-system",
+		UID:               "1",
+		ResourceVersion:   "1",
+		Generation:        1,
+		CreationTimestamp: metav1.Time{},
+		Labels:            map[string]string{"a": "b", "c": "d"},
+		GenerateName:      "test-workload-",
+		OwnerReferences: []metav1.OwnerReference{
+			{
+				Name:       "test-workload",
+				Kind:       "Deployment",
+				Controller: new(true),
 			},
 		},
 		Status: v1.PodStatus{
@@ -47,17 +46,17 @@ func TestK8sWatcher_GetPodInfo(t *testing.T) {
 			},
 		},
 	}
+	pods = append(pods, pod)
 
-	k8sClient := fake.NewSimpleClientset(&pod)
-	watcher := watcher.NewK8sWatcher(k8sClient, time.Hour)
-	watcher.Start()
+	podAccessor := watcher.NewFakeK8sWatcher(pods)
 	pid := uint32(1)
-	podInfo := getPodInfo(watcher, "abcd1234", "curl", "cilium.io", 1)
+	podInfo := getPodInfo(podAccessor, "abcd1234", "curl", "cilium.io", 1)
 	assert.True(t, proto.Equal(podInfo, &tetragon.Pod{
 		Namespace:    pod.Namespace,
 		Workload:     pod.OwnerReferences[0].Name,
 		WorkloadKind: pod.OwnerReferences[0].Kind,
 		Name:         pod.Name,
+		Uid:          string(pod.UID),
 		Container: &tetragon.Container{
 			Id:  pod.Status.ContainerStatuses[0].ContainerID,
 			Pid: &wrapperspb.UInt32Value{Value: pid},
@@ -65,6 +64,7 @@ func TestK8sWatcher_GetPodInfo(t *testing.T) {
 				Id:   pod.Status.ContainerStatuses[0].ImageID,
 				Name: pod.Status.ContainerStatuses[0].Image,
 			},
+			SecurityContext: &tetragon.SecurityContext{},
 		},
 		PodLabels: pod.Labels,
 	}))

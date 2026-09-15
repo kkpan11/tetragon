@@ -7,6 +7,7 @@
 #include "common.h"
 #include "msg_types.h"
 #include "process.h"
+#include "vmlinux.h"
 
 /* The namespace and capability changes filters require later kernels */
 #ifdef __LARGE_BPF_PROG
@@ -20,10 +21,28 @@
 #define MAX_POSSIBLE_SELECTORS	 31
 #define SELECTORS_ACTIVE	 31
 #define MAX_CONFIGURED_SELECTORS MAX_POSSIBLE_SELECTORS + 1
+// This constant is mirrored in Go in `ParseMatchCaller()`.
+// If you adjust this constant, you must also adjust the Go code.
+#define MAX_STACK_DEPTH 16
+
+/* convenience mask for verifier appeasing*/
+#define MAX_POSSIBLE_ARGS_MASK 0x7
+_Static_assert(MAX_POSSIBLE_ARGS - 1 <= MAX_POSSIBLE_ARGS_MASK, "Need to update MAX_POSSIBLE_ARGS_MASK");
+
+/* This reflects the maximum reachable argument in term of the
+ * function/tracepoint signature. This is different from MAX_POSSIBLE_ARGS
+ * because MAX_POSSIBLE_ARGS concerns the maximum number of arguments that can
+ * be configured in the tracing policy.  This value (5) comes from the 5
+ * member variables (a0 - a4) of msg_generic_kprobe
+ */
+#define MAX_ACCESSIBLE_ARGS 5
+/* convenience mask for verifier appeasing*/
+#define MAX_ACCESSIBLE_ARGS_MASK 0x7
+_Static_assert(MAX_ACCESSIBLE_ARGS - 1 <= MAX_ACCESSIBLE_ARGS_MASK, "Need to update MAX_ACCESSIBLE_ARGS_MASK");
 
 struct msg_selector_data {
 	__u64 curr;
-	bool pass;
+	bool pass; // Verdict of the process filter.
 	bool active[MAX_CONFIGURED_SELECTORS];
 #ifdef __NS_CHANGES_FILTER
 	__u64 match_ns;
@@ -31,8 +50,25 @@ struct msg_selector_data {
 #ifdef __CAP_CHANGES_FILTER
 	__u64 match_cap;
 #endif
-	bool is32BitSyscall;
 };
+
+/* value to mask an offsset into msg_generic_kprobe->args */
+#define GENERIC_MSG_ARGS_MASK 0x7ff
+
+struct generic_path {
+	int state;
+	int off;
+	int cnt;
+	struct path path_buf;
+	const struct path *path;
+	struct dentry *root_dentry;
+	struct vfsmount *root_mnt;
+	struct dentry *dentry;
+	struct vfsmount *vfsmnt;
+	struct mount *mnt;
+};
+
+typedef __u32 arg_status_t;
 
 struct msg_generic_kprobe {
 	struct msg_common common;
@@ -48,14 +84,32 @@ struct msg_generic_kprobe {
 	__u64 user_stack_id; // User Stack trace ID
 	/* anything above is shared with the userspace so it should match structs MsgGenericKprobe and MsgGenericTracepoint in Go */
 	char args[24000];
+	struct bpf_stack_build_id user_stack[MAX_STACK_DEPTH];
+	int user_stack_ret; // cached return value of get_stack() from the first attempt this event
 	unsigned long a0, a1, a2, a3, a4;
 	long argsoff[MAX_POSSIBLE_ARGS];
+	arg_status_t arg_status[MAX_POSSIBLE_ARGS];
 	struct msg_selector_data sel;
 	__u32 idx; // attach cookie index
 	__u32 tailcall_index_process; // recursion index for generic_process_event
 	__u32 tailcall_index_selector; // recursion index for filter_read_arg
-	int pass;
+	int actions_offset; // do_action expects this value to be the offset where matchActions begin or zero if there was the selector did not match (and no action will be taken).
+	union {
+		struct {
+			bool post; // true if event needs to be posted
+		} lsm;
+	};
+	struct execve_map_value curr;
+	struct heap_exe exe;
+#ifndef __V61_BPF_PROG
+	struct generic_path path;
+#endif
 };
+
+FUNC_INLINE bool is_arg_ok(struct msg_generic_kprobe *e, int idx)
+{
+	return !e->arg_status[idx & MAX_POSSIBLE_ARGS_MASK];
+}
 
 FUNC_INLINE size_t generic_kprobe_common_size(void)
 {

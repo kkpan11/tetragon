@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 import (
@@ -12,13 +14,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
+
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
-	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
 	"github.com/cilium/tetragon/pkg/arch"
 	"github.com/cilium/tetragon/pkg/bpf"
+	"github.com/cilium/tetragon/pkg/config"
 	"github.com/cilium/tetragon/pkg/jsonchecker"
-	"github.com/cilium/tetragon/pkg/kernels"
 	lc "github.com/cilium/tetragon/pkg/matchers/listmatcher"
 	sm "github.com/cilium/tetragon/pkg/matchers/stringmatcher"
 	"github.com/cilium/tetragon/pkg/observer"
@@ -26,12 +31,10 @@ import (
 	"github.com/cilium/tetragon/pkg/option"
 	"github.com/cilium/tetragon/pkg/policyfilter"
 	"github.com/cilium/tetragon/pkg/sensors"
-	"github.com/cilium/tetragon/pkg/sensors/base"
+	"github.com/cilium/tetragon/pkg/syscallinfo"
 	"github.com/cilium/tetragon/pkg/testutils"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
 	"github.com/cilium/tetragon/pkg/tracingpolicy"
-	"github.com/stretchr/testify/assert"
-	"golang.org/x/sys/unix"
 )
 
 func testEnforcerCheckSkip(t *testing.T) {
@@ -43,21 +46,28 @@ func testEnforcerCheckSkip(t *testing.T) {
 	}
 }
 
-func testEnforcer(t *testing.T, configHook string,
-	test string, test2 string,
-	checker *eventchecker.UnorderedEventChecker,
-	checkerFunc func(err error, rc int)) {
+type cmdChecker struct {
+	cmd     string
+	checkFn func(t *testing.T, err error, rc int)
+}
 
+func newCmdChecker(cmd string, checkFn func(t *testing.T, err error, rc int)) cmdChecker {
+	return cmdChecker{
+		cmd:     cmd,
+		checkFn: checkFn,
+	}
+}
+
+func testEnforcer(t *testing.T, configHook string,
+	checker *eventchecker.UnorderedEventChecker,
+	cmds ...cmdChecker) {
 	var doneWG, readyWG sync.WaitGroup
 	defer doneWG.Wait()
 
 	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
 	defer cancel()
 
-	err := os.WriteFile(testConfigFile, []byte(configHook), 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
-	}
+	createCrdFile(t, configHook)
 
 	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
 	if err != nil {
@@ -66,20 +76,14 @@ func testEnforcer(t *testing.T, configHook string,
 	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
 	readyWG.Wait()
 
-	cmd := exec.Command(test)
-	err = cmd.Run()
-
-	checkerFunc(err, cmd.ProcessState.ExitCode())
-
-	if test2 != "" {
-		cmd := exec.Command(test2)
+	for _, cc := range cmds {
+		cmd := exec.Command(cc.cmd)
 		err = cmd.Run()
-
-		checkerFunc(err, cmd.ProcessState.ExitCode())
+		cc.checkFn(t, err, cmd.ProcessState.ExitCode())
 	}
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestEnforcerOverride(t *testing.T) {
@@ -93,17 +97,17 @@ func TestEnforcerOverride(t *testing.T) {
 			WithOverrideValue(-17) // EEXIST
 	}
 
-	tpChecker := ec.NewProcessTracepointChecker("").
-		WithArgs(ec.NewKprobeArgumentListMatcher().
+	tpChecker := eventchecker.NewProcessTracepointChecker("").
+		WithArgs(eventchecker.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
-				ec.NewKprobeArgumentChecker().WithSizeArg(unix.SYS_GETCPU),
+				eventchecker.NewKprobeArgumentChecker().WithSyscallId(mkSysIDChecker(t, unix.SYS_GETCPU)),
 			)).
 		WithAction(tetragon.KprobeAction_KPROBE_ACTION_NOTIFYENFORCER)
 
-	checker := ec.NewUnorderedEventChecker(tpChecker)
+	checker := eventchecker.NewUnorderedEventChecker(tpChecker)
 
-	checkerFunc := func(_ error, rc int) {
+	checkerFunc := func(t *testing.T, _ error, rc int) {
 		if rc != int(syscall.EEXIST) {
 			t.Fatalf("Wrong exit code %d expected %d", rc, int(syscall.EEXIST))
 		}
@@ -119,12 +123,12 @@ func TestEnforcerOverride(t *testing.T) {
 				t.Skip("no multi-kprobe support")
 			}
 			yaml := builder().WithOverrideReturn().WithMultiKprobe().MustYAML()
-			testEnforcer(t, yaml, test, "", checker, checkerFunc)
+			testEnforcer(t, yaml, checker, newCmdChecker(test, checkerFunc))
 		})
 
 		t.Run("kprobe (no multi)", func(t *testing.T) {
 			yaml := builder().WithOverrideReturn().WithoutMultiKprobe().MustYAML()
-			testEnforcer(t, yaml, test, "", checker, checkerFunc)
+			testEnforcer(t, yaml, checker, newCmdChecker(test, checkerFunc))
 		})
 	})
 	t.Run("fmod_ret", func(t *testing.T) {
@@ -132,7 +136,7 @@ func TestEnforcerOverride(t *testing.T) {
 			t.Skip("fmod_ret not supported")
 		}
 		yaml := builder().WithFmodRet().MustYAML()
-		testEnforcer(t, yaml, test, "", checker, checkerFunc)
+		testEnforcer(t, yaml, checker, newCmdChecker(test, checkerFunc))
 	})
 }
 
@@ -147,17 +151,17 @@ func TestEnforcerOverrideManySyscalls(t *testing.T) {
 			WithOverrideValue(-17) // EEXIST
 	}
 
-	tpChecker := ec.NewProcessTracepointChecker("").
-		WithArgs(ec.NewKprobeArgumentListMatcher().
+	tpChecker := eventchecker.NewProcessTracepointChecker("").
+		WithArgs(eventchecker.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
-				ec.NewKprobeArgumentChecker().WithSizeArg(unix.SYS_GETCPU),
+				eventchecker.NewKprobeArgumentChecker().WithSyscallId(mkSysIDChecker(t, unix.SYS_GETCPU)),
 			)).
 		WithAction(tetragon.KprobeAction_KPROBE_ACTION_NOTIFYENFORCER)
 
-	checker := ec.NewUnorderedEventChecker(tpChecker)
+	checker := eventchecker.NewUnorderedEventChecker(tpChecker)
 
-	checkerFunc := func(_ error, rc int) {
+	checkerFunc := func(t *testing.T, _ error, rc int) {
 		if rc != int(syscall.EEXIST) {
 			t.Fatalf("Wrong exit code %d expected %d", rc, int(syscall.EEXIST))
 		}
@@ -173,12 +177,12 @@ func TestEnforcerOverrideManySyscalls(t *testing.T) {
 				t.Skip("no multi-kprobe support")
 			}
 			yaml := builder().WithOverrideReturn().WithMultiKprobe().MustYAML()
-			testEnforcer(t, yaml, test, "", checker, checkerFunc)
+			testEnforcer(t, yaml, checker, newCmdChecker(test, checkerFunc))
 		})
 
 		t.Run("kprobe (no multi)", func(t *testing.T) {
 			yaml := builder().WithOverrideReturn().WithoutMultiKprobe().MustYAML()
-			testEnforcer(t, yaml, test, "", checker, checkerFunc)
+			testEnforcer(t, yaml, checker, newCmdChecker(test, checkerFunc))
 		})
 	})
 	t.Run("fmod_ret", func(t *testing.T) {
@@ -186,8 +190,14 @@ func TestEnforcerOverrideManySyscalls(t *testing.T) {
 			t.Skip("fmod_ret not supported")
 		}
 		yaml := builder().WithFmodRet().MustYAML()
-		testEnforcer(t, yaml, test, "", checker, checkerFunc)
+		testEnforcer(t, yaml, checker, newCmdChecker(test, checkerFunc))
 	})
+}
+
+func mkSysIDChecker(t *testing.T, id uint64) *eventchecker.SyscallIdChecker {
+	abi, err := syscallinfo.DefaultABI()
+	require.NoError(t, err)
+	return eventchecker.NewSyscallIdChecker().WithId(uint32(id)).WithAbi(sm.Full(abi))
 }
 
 func TestEnforcerSignal(t *testing.T) {
@@ -195,17 +205,17 @@ func TestEnforcerSignal(t *testing.T) {
 
 	test := testutils.RepoRootPath("contrib/tester-progs/enforcer-tester")
 
-	tpChecker := ec.NewProcessTracepointChecker("").
-		WithArgs(ec.NewKprobeArgumentListMatcher().
+	tpChecker := eventchecker.NewProcessTracepointChecker("").
+		WithArgs(eventchecker.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
-				ec.NewKprobeArgumentChecker().WithSizeArg(syscall.SYS_PRCTL),
+				eventchecker.NewKprobeArgumentChecker().WithSyscallId(mkSysIDChecker(t, syscall.SYS_PRCTL)),
 			)).
 		WithAction(tetragon.KprobeAction_KPROBE_ACTION_NOTIFYENFORCER)
 
-	checker := ec.NewUnorderedEventChecker(tpChecker)
+	checker := eventchecker.NewUnorderedEventChecker(tpChecker)
 
-	checkerFunc := func(err error, _ int) {
+	checkerFunc := func(t *testing.T, err error, _ int) {
 		if err == nil || err.Error() != "signal: killed" {
 			t.Fatalf("Wrong error '%v' expected 'killed'", err)
 		}
@@ -228,12 +238,12 @@ func TestEnforcerSignal(t *testing.T) {
 		}
 
 		yaml := builder().WithMultiKprobe().MustYAML()
-		testEnforcer(t, yaml, test, "", checker, checkerFunc)
+		testEnforcer(t, yaml, checker, newCmdChecker(test, checkerFunc))
 	})
 
 	t.Run("kprobe (no multi)", func(t *testing.T) {
 		yaml := builder().WithoutMultiKprobe().MustYAML()
-		testEnforcer(t, yaml, test, "", checker, checkerFunc)
+		testEnforcer(t, yaml, checker, newCmdChecker(test, checkerFunc))
 	})
 
 }
@@ -245,7 +255,7 @@ func TestEnforcerMultiNotSupported(t *testing.T) {
 		WithOverrideValue(-17). // EEXIST
 		MustYAML()
 	err := checkCrd(t, yaml)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func testSecurity(t *testing.T, tracingPolicy, tempFile string) {
@@ -269,31 +279,47 @@ func testSecurity(t *testing.T, tracingPolicy, tempFile string) {
 
 	cmd := exec.Command(testBin, tempFile)
 	err = cmd.Run()
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	t.Logf("Running: %s %v\n", cmd.String(), err)
 
-	kpCheckerPwrite := ec.NewProcessKprobeChecker("").
-		WithProcess(ec.NewProcessChecker().
+	kpCheckerPwrite := eventchecker.NewProcessKprobeChecker("").
+		WithProcess(eventchecker.NewProcessChecker().
 			WithBinary(sm.Suffix(testBin))).
 		WithFunctionName(sm.Full(arch.AddSyscallPrefixTestHelper(t, "sys_pwrite64"))).
 		WithAction(tetragon.KprobeAction_KPROBE_ACTION_NOTIFYENFORCER).
-		WithArgs(ec.NewKprobeArgumentListMatcher().
+		WithArgs(eventchecker.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
-				ec.NewKprobeArgumentChecker().WithFileArg(
-					ec.NewKprobeFileChecker().WithPath(sm.Full(tempFile))),
+				eventchecker.NewKprobeArgumentChecker().WithFileArg(
+					eventchecker.NewKprobeFileChecker().WithPath(sm.Full(tempFile))),
 			))
 
-	checker := ec.NewUnorderedEventChecker(kpCheckerPwrite)
+	checker := eventchecker.NewUnorderedEventChecker(kpCheckerPwrite)
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// check the pwrite syscall did not write anything
 	fileInfo, err := os.Stat(tempFile)
 	if assert.NoError(t, err) {
-		assert.NotEqual(t, 0, fileInfo.Size())
+		require.NotEqual(t, 0, fileInfo.Size())
 	}
+}
+
+func directWriteTempFile(t *testing.T) string {
+	// We can't use t.TempDir as it writes into /tmp by default.
+	// The direct-write-tester.c program opens and writes using the O_DIRECT
+	// flag that is unsupported and return EINVAL on tmpfs, while it works on a
+	// disk based fs. Recently, the base image used by vmtests started to switch
+	// /tmp from the disk to tmpfs which made that test fail.
+	tempFile, err := os.CreateTemp("/var/tmp", "tetragon-testfile-*")
+	if err != nil {
+		t.Fatalf("failed to create temporary file for tester prog: %s", err)
+	}
+	t.Cleanup(func() {
+		os.Remove(tempFile.Name())
+	})
+	return tempFile.Name()
 }
 
 // Testing the ability to kill the process before it executes the syscall,
@@ -321,17 +347,17 @@ func TestEnforcerSecuritySigKill(t *testing.T) {
 		t.Skip("skipping enforcer test, fmod_ret is not available")
 	}
 
-	if !kernels.EnableLargeProgs() {
+	if !config.EnableLargeProgs() {
 		t.Skip("Older kernels do not support matchArgs for more than one arguments")
 	}
 
-	tempFile := t.TempDir() + "/test"
+	tempFile := directWriteTempFile(t)
 
 	tracingPolicy := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: "syswritefollowfdpsswd"
+  name: "syswritepsswd"
 spec:
   options:
     - name: "override-method"
@@ -353,20 +379,17 @@ spec:
         operator: "Equal"
         values:
         - "` + tempFile + `"
-      matchActions:
-      - action: FollowFD
-        argFd: 0
-        argName: 1
   - call: "sys_close"
     syscall: true
     args:
     - index: 0
-      type: "int"
+      type: "fd"
     selectors:
-    - matchActions:
-      - action: UnfollowFD
-        argFd: 0
-        argName: 0
+    - matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "` + tempFile + `"
   - call: "sys_pwrite64"
     syscall: true
     args:
@@ -408,17 +431,17 @@ func TestEnforcerSecurityNotifyEnforcer(t *testing.T) {
 		t.Skip("skipping enforcer test, fmod_ret is not available")
 	}
 
-	if !kernels.EnableLargeProgs() {
+	if !config.EnableLargeProgs() {
 		t.Skip("Older kernels do not support matchArgs for more than one arguments")
 	}
 
-	tempFile := t.TempDir() + "/test"
+	tempFile := directWriteTempFile(t)
 
 	tracingPolicy := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: "syswritefollowfdpsswd"
+  name: "syswritepsswd"
 spec:
   options:
     - name: "override-method"
@@ -440,20 +463,17 @@ spec:
         operator: "Equal"
         values:
         - "` + tempFile + `"
-      matchActions:
-      - action: FollowFD
-        argFd: 0
-        argName: 1
   - call: "sys_close"
     syscall: true
     args:
     - index: 0
-      type: "int"
+      type: "fd"
     selectors:
-    - matchActions:
-      - action: UnfollowFD
-        argFd: 0
-        argName: 0
+    - matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "` + tempFile + `"
   - call: "sys_pwrite64"
     syscall: true
     args:
@@ -490,7 +510,7 @@ func TestEnforcerMulti(t *testing.T) {
 		t.Skip("skipping enforcer test, fmod_ret is not available")
 	}
 
-	if !kernels.EnableLargeProgs() {
+	if !config.EnableLargeProgs() {
 		t.Skip("Older kernels do not support matchArgs for more than one arguments")
 	}
 
@@ -527,7 +547,7 @@ spec:
       - index: 1
         operator: "Equal"
         values:
-        - 0xffff
+        - "0xffff"
       matchBinaries:
       - operator: "In"
         values:
@@ -569,7 +589,7 @@ spec:
       - index: 1
         operator: "Equal"
         values:
-        - 0xfffe
+        - "0xfffe"
       matchBinaries:
       - operator: "In"
         values:
@@ -581,33 +601,29 @@ spec:
 `
 
 	policy1, err := tracingpolicy.FromYAML(policyYAML1)
-	if err != nil {
-		t.Errorf("FromYAML policyYAML1 error %s", err)
-	}
+	require.NoError(t, err, "FromYAML policyYAML1 error")
 
 	policy2, err := tracingpolicy.FromYAML(policyYAML2)
-	if err != nil {
-		t.Errorf("FromYAML policyYAML2 error %s", err)
-	}
+	require.NoError(t, err, "FromYAML policyYAML2 error")
 
 	if err := observer.InitDataCache(1024); err != nil {
 		t.Fatalf("observertesthelper.InitDataCache: %s", err)
 	}
 
 	option.Config.HubbleLib = tus.Conf().TetragonLib
-	tus.LoadSensor(t, base.GetInitialSensor())
+	tus.LoadInitialSensor(t)
 
 	sensor1, err := gEnforcerPolicy.PolicyHandler(policy1, policyfilter.NoFilterID)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	sensor2, err := policyHandler{}.PolicyHandler(policy1, policyfilter.NoFilterID)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	sensor3, err := gEnforcerPolicy.PolicyHandler(policy2, policyfilter.NoFilterID)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	sensor4, err := policyHandler{}.PolicyHandler(policy2, policyfilter.NoFilterID)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Loading all policies
 	tus.LoadSensor(t, sensor1)
@@ -642,10 +658,13 @@ spec:
 	}
 
 	// Unload policy 1 (watch 0xffff)
-	sensor1.Unload()
-	sensor2.Unload()
+	sensor1.Unload(true)
+	sensor2.Unload(true)
 
 	t.Logf("Unloaded policy 1\n")
+
+	// bpf pinned links removal is asynchronous, we need to wait to be sure it's gone
+	time.Sleep(2 * time.Second)
 
 	// 'enforcer-tester 0xffff' should NOT get killed now
 	cmd = exec.Command(testBin, "0xffff")
@@ -664,10 +683,13 @@ spec:
 	}
 
 	// Unload policy 2 (watch 0xfffe)
-	sensor3.Unload()
-	sensor4.Unload()
+	sensor3.Unload(true)
+	sensor4.Unload(true)
 
 	t.Logf("Unloaded policy 2\n")
+
+	// bpf pinned links removal is asynchronous, we need to wait to be sure it's gone
+	time.Sleep(2 * time.Second)
 
 	// 'enforcer-tester 0xfffe' should NOT get killed now
 	cmd = exec.Command(testBin, "0xfffe")
@@ -678,45 +700,56 @@ spec:
 	}
 }
 
-func testEnforcerPersistent(t *testing.T, builder func() *EnforcerSpecBuilder, expected, test string) {
+// We test following scenario:
+// - load enforcement policy
+// - 1st run of test binary, make sure enforcement policy is triggered
+// - simulate tetragon exit (with KeepSensorsOnExit)
+// - 2nd run of test binary, make sure enforcement policy is triggered
+// - remove bpffs directory
+// - 3rd run of test binary, no enforcement
+func testEnforcerPersistentKeep(t *testing.T, builder func() *EnforcerSpecBuilder, expected, test string) {
 	testEnforcerCheckSkip(t)
 
 	if !bpf.HasLinkPin() {
 		t.Skip("skipping persistent enforcer test, link pin is not available")
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	option.Config.KeepSensorsOnExit = true
+	defer func() { option.Config.KeepSensorsOnExit = false }()
+
+	tus.LoadInitialSensor(t)
+	path := bpf.MapPrefixPath()
+	mgr, err := sensors.StartSensorManager(path)
+	require.NoError(t, err)
+
 	run := func(idx int, exp string) {
 		cmd := exec.Command(test, "0xfffe")
 		err := cmd.Run()
 
+		t.Logf("Run %s: %v\n", cmd, err)
 		if err == nil || err.Error() != exp {
 			t.Fatalf("run %d: Wrong error '%v' expected '%s'", idx, err, exp)
 		}
 	}
 
-	yaml := builder().WithoutMultiKprobe().MustYAML()
-	configHook := []byte(yaml)
-	err := os.WriteFile(testConfigFile, configHook, 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
-	}
+	tp, err := builder().WithoutMultiKprobe().Build()
+	require.NoError(t, err)
 
-	option.Config.KeepSensorsOnExit = true
-	defer func() { option.Config.KeepSensorsOnExit = false }()
-
-	sens, err := observertesthelper.GetDefaultSensorsWithFile(t, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
-	if err != nil {
-		t.Fatalf("GetDefaultObserverWithFile error: %s", err)
-	}
+	err = mgr.AddTracingPolicy(ctx, tp)
+	require.NoError(t, err)
 
 	// first run - sensors are loaded, we should get kill/override
 	run(1, expected)
 
-	sensi := make([]sensors.SensorIface, 0, len(sens))
-	for _, s := range sens {
-		sensi = append(sensi, s)
-	}
-	sensors.UnloadSensors(sensi)
+	// Remove all servers - simulate tetragon exit with KeepSensorsOnExit
+	mgr.RemoveAllSensors(ctx)
+
+	// bpf pinned links removal is asynchronous, we need to wait to be sure it's gone
+	// (if for some reason it's gone)
+	time.Sleep(2 * time.Second)
 
 	// second run - sensors are unloaded, but pins stay, we should get kill/override
 	run(2, expected)
@@ -731,6 +764,131 @@ func testEnforcerPersistent(t *testing.T, builder func() *EnforcerSpecBuilder, e
 	run(3, "exit status 22")
 }
 
+// We test following scenario:
+// - load enforcement policy
+// - 1st run of test binary, make sure enforcement policy is triggered
+// - simulate tetragon exit (normal, WITHOUT KeepSensorsOnExit)
+// - 2nd run of test binary, no enforcement
+func testEnforcerPersistentNoKeep(t *testing.T, builder func() *EnforcerSpecBuilder, expected, test string) {
+	testEnforcerCheckSkip(t)
+
+	if !bpf.HasLinkPin() {
+		t.Skip("skipping persistent enforcer test, link pin is not available")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// option.Config.KeepSensorsOnExit is false
+
+	tus.LoadInitialSensor(t)
+	path := bpf.MapPrefixPath()
+	mgr, err := sensors.StartSensorManager(path)
+	require.NoError(t, err)
+
+	run := func(idx int, exp string) {
+		cmd := exec.Command(test, "0xfffe")
+		err := cmd.Run()
+
+		t.Logf("Run %s: %v\n", cmd, err)
+		if err == nil || err.Error() != exp {
+			t.Fatalf("run %d: Wrong error '%v' expected '%s'", idx, err, exp)
+		}
+	}
+
+	tp, err := builder().WithoutMultiKprobe().Build()
+	require.NoError(t, err)
+
+	err = mgr.AddTracingPolicy(ctx, tp)
+	require.NoError(t, err)
+
+	// first run - sensors are loaded, we should get kill/override
+	run(1, expected)
+
+	// Remove all servers - simulate tetragon exit WITHOUT KeepSensorsOnExit
+	mgr.RemoveAllSensors(ctx)
+
+	// bpf pinned links removal is asynchronous, we need to wait to be sure it's gone
+	time.Sleep(2 * time.Second)
+
+	// second run - sensors are unloaded, we should get no enforcement
+	run(2, "exit status 22")
+}
+
+// We test following scenario:
+// - load enforcement policy
+// - 1st run of test binary, make sure enforcement policy is triggered
+// - disable enforcement policy via sensor manager
+// - 2nd run of test binary, no enforcement
+// - enable enforcement policy via sensor manager
+// - 3rd run of test binary, make sure enforcement policy is triggered
+// - remove enforcement policy via sensor manager
+// - 4th run of test binary, no enforcement
+func testEnforcerPersistentUnload(t *testing.T, builder func() *EnforcerSpecBuilder, expected, test string) {
+	testEnforcerCheckSkip(t)
+
+	if !bpf.HasLinkPin() {
+		t.Skip("skipping persistent enforcer test, link pin is not available")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	option.Config.KeepSensorsOnExit = true
+	defer func() { option.Config.KeepSensorsOnExit = false }()
+
+	tus.LoadInitialSensor(t)
+	path := bpf.MapPrefixPath()
+	mgr, err := sensors.StartSensorManager(path)
+	require.NoError(t, err)
+
+	run := func(idx int, exp string) {
+		cmd := exec.Command(test, "0xfffe")
+		err := cmd.Run()
+
+		t.Logf("Run %d: '%s' (%v)\n", idx, cmd, err)
+		if err == nil || err.Error() != exp {
+			t.Fatalf("run %d: Wrong error '%v' expected '%s'", idx, err, exp)
+		}
+	}
+
+	tp, err := builder().WithoutMultiKprobe().Build()
+	require.NoError(t, err)
+
+	err = mgr.AddTracingPolicy(ctx, tp)
+	require.NoError(t, err)
+
+	// first run - sensors are loaded, we should get kill/override
+	run(1, expected)
+
+	// disable the policy and we should get rid of the enforcement
+	err = mgr.DisableTracingPolicy(ctx, tp.TpName(), "", tp.TpDomain())
+	require.NoError(t, err)
+
+	// bpf pinned links removal is asynchronous, we need to wait to be sure it's gone
+	time.Sleep(2 * time.Second)
+
+	// second run - sensors are unloaded, map dir is removed, we should get no enforcement
+	run(2, "exit status 22")
+
+	// enable the policy and we should get the enforcement
+	err = mgr.EnableTracingPolicy(ctx, tp.TpName(), "", tp.TpDomain())
+	require.NoError(t, err)
+
+	// third run - sensors are loaded, we should get kill/override
+	run(3, expected)
+
+	// remove the policy and we should get rid of the enforcement
+	err = mgr.DeleteTracingPolicy(ctx, tp.TpName(), "", tp.TpDomain())
+	require.NoError(t, err)
+
+	// bpf pinned links removal is asynchronous, we need to wait to be sure it's gone
+	time.Sleep(2 * time.Second)
+
+	// forth run - sensors are unloaded, map dir is removed, we should get no enforcement
+	run(4, "exit status 22")
+}
+
 func TestEnforcerPersistentOverride(t *testing.T) {
 	test := testutils.RepoRootPath("contrib/tester-progs/enforcer-tester")
 
@@ -741,11 +899,18 @@ func TestEnforcerPersistentOverride(t *testing.T) {
 			WithOverrideValue(-17) // EEXIST
 	}
 
-	testEnforcerPersistent(t, builder, "exit status 17", test)
+	t.Run("persistent-override-keep", func(t *testing.T) {
+		testEnforcerPersistentKeep(t, builder, "exit status 17", test)
+	})
+	t.Run("persistent-override-no-keep", func(t *testing.T) {
+		testEnforcerPersistentNoKeep(t, builder, "exit status 17", test)
+	})
+	t.Run("persistent-override-extra", func(t *testing.T) {
+		testEnforcerPersistentUnload(t, builder, "exit status 17", test)
+	})
 }
 
 func TestEnforcerPersistentKill(t *testing.T) {
-
 	test := testutils.RepoRootPath("contrib/tester-progs/enforcer-tester")
 
 	builder := func() *EnforcerSpecBuilder {
@@ -755,5 +920,13 @@ func TestEnforcerPersistentKill(t *testing.T) {
 			WithKill(9) // SigKill
 	}
 
-	testEnforcerPersistent(t, builder, "signal: killed", test)
+	t.Run("persistent-kill-keep", func(t *testing.T) {
+		testEnforcerPersistentKeep(t, builder, "signal: killed", test)
+	})
+	t.Run("persistent-kill-no-keep", func(t *testing.T) {
+		testEnforcerPersistentNoKeep(t, builder, "signal: killed", test)
+	})
+	t.Run("persistent-kill-extra", func(t *testing.T) {
+		testEnforcerPersistentUnload(t, builder, "signal: killed", test)
+	})
 }

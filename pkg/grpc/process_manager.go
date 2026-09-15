@@ -12,18 +12,17 @@ import (
 	"github.com/cilium/tetragon/pkg/logger"
 	"github.com/cilium/tetragon/pkg/metrics/eventmetrics"
 	"github.com/cilium/tetragon/pkg/option"
+	"github.com/cilium/tetragon/pkg/policystore"
 	"github.com/cilium/tetragon/pkg/reader/node"
 	"github.com/cilium/tetragon/pkg/reader/notify"
 	"github.com/cilium/tetragon/pkg/rthooks"
 	"github.com/cilium/tetragon/pkg/sensors"
 	"github.com/cilium/tetragon/pkg/server"
-	"github.com/sirupsen/logrus"
 )
 
 // ProcessManager maintains a cache of processes from tetragon exec events.
 type ProcessManager struct {
-	nodeName string
-	Server   *server.Server
+	Server *server.Server
 	// synchronize access to the listeners map.
 	mux       sync.Mutex
 	listeners map[server.Listener]struct{}
@@ -35,22 +34,23 @@ func NewProcessManager(
 	wg *sync.WaitGroup,
 	manager *sensors.Manager,
 	hookRunner *rthooks.Runner,
+	policyStore *policystore.Store,
 ) (*ProcessManager, error) {
 	pm := &ProcessManager{
-		nodeName:  node.GetNodeNameForExport(),
 		listeners: make(map[server.Listener]struct{}),
 	}
 
-	pm.Server = server.NewServer(ctx, wg, pm, manager, hookRunner)
+	pm.Server = server.NewServer(ctx, wg, pm, manager, hookRunner, policyStore)
 
-	// Exec cache is always needed to ensure events have an associated Process{}
-	eventcache.New(pm.Server)
+	if !option.Config.DisableProcessCache {
+		// Exec cache is always needed to ensure events have an associated Process{}
+		eventcache.New(pm)
+	}
 
-	logger.GetLogger().WithFields(logrus.Fields{
-		"enableK8s":         option.Config.EnableK8s,
-		"enableProcessCred": option.Config.EnableProcessCred,
-		"enableProcessNs":   option.Config.EnableProcessNs,
-	}).Info("Starting process manager")
+	logger.GetLogger().Info("Starting process manager",
+		"enableK8s", option.Config.EnableK8s,
+		"enableProcessCred", option.Config.EnableProcessCred,
+		"enableProcessNs", option.Config.EnableProcessNs)
 	return pm, nil
 }
 
@@ -69,22 +69,23 @@ func (pm *ProcessManager) Close() error {
 }
 
 func (pm *ProcessManager) AddListener(listener server.Listener) {
-	logger.GetLogger().WithField("getEventsListener", listener).Debug("Adding a getEventsListener")
+	logger.GetLogger().Debug("Adding a getEventsListener", "getEventsListener", listener)
 	pm.mux.Lock()
 	defer pm.mux.Unlock()
 	pm.listeners[listener] = struct{}{}
 }
 
 func (pm *ProcessManager) RemoveListener(listener server.Listener) {
-	logger.GetLogger().WithField("getEventsListener", listener).Debug("Removing a getEventsListener")
+	logger.GetLogger().Debug("Removing a getEventsListener", "getEventsListener", listener)
 	pm.mux.Lock()
 	defer pm.mux.Unlock()
 	delete(pm.listeners, listener)
 }
 
-func (pm *ProcessManager) NotifyListener(original interface{}, processed *tetragon.GetEventsResponse) {
+func (pm *ProcessManager) NotifyListener(original any, processed *tetragon.GetEventsResponse) {
 	pm.mux.Lock()
 	defer pm.mux.Unlock()
+	node.SetCommonFields(processed)
 	for l := range pm.listeners {
 		l.Notify(processed)
 	}

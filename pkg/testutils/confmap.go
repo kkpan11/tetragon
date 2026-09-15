@@ -21,8 +21,7 @@ func GetTgRuntimeConf() (*confmap.TetragonConfValue, error) {
 	}
 
 	// This must be called before probing cgroup configurations
-	err = cgroups.DiscoverSubSysIds()
-	if err != nil {
+	if err = cgroups.DiscoverSubSysIds(); err != nil { // nolint: staticcheck // DiscoverSubSysIds is always return non-nil error in windows
 		return nil, err
 	}
 
@@ -33,11 +32,11 @@ func GetTgRuntimeConf() (*confmap.TetragonConfValue, error) {
 	}
 
 	return &confmap.TetragonConfValue{
-		LogLevel:        uint32(logger.GetLogLevel()),
-		TgCgrpHierarchy: cgroups.GetCgrpHierarchyID(),
-		TgCgrpSubsysIdx: cgroups.GetCgrpSubsystemIdx(),
-		NSPID:           uint32(nspid),
-		CgrpFsMagic:     cgroupFsMagic,
+		LogLevel:          uint32(logger.GetLogLevel(logger.GetLogger())),
+		TgCgrpHierarchy:   cgroups.GetCgrpHierarchyID(),
+		TgCgrpv1SubsysIdx: cgroups.GetCgrpv1SubsystemIdx(),
+		NSPID:             uint32(nspid),
+		CgrpFsMagic:       cgroupFsMagic,
 	}, nil
 }
 

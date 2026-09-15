@@ -11,12 +11,13 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/cilium/little-vm-helper/pkg/arch"
 	"github.com/cilium/little-vm-helper/pkg/logcmd"
+	"github.com/cilium/little-vm-helper/pkg/slogger"
 	"github.com/cilium/little-vm-helper/pkg/step"
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -51,11 +52,15 @@ var (
 
 type CreateImage struct {
 	*StepConf
+	// PkgRepo is from which release branch (ex: sid, buster, bookworm, stable)
+	// to use for installing packages during bootstrap
+	PkgRepo string
 }
 
-func NewCreateImage(cnf *StepConf) *CreateImage {
+func NewCreateImage(cnf *StepConf, pkgRepository string) *CreateImage {
 	return &CreateImage{
 		StepConf: cnf,
+		PkgRepo:  pkgRepository,
 	}
 }
 
@@ -75,7 +80,11 @@ func (s *CreateImage) makeRootImage(ctx context.Context) error {
 	}
 	imgFname := filepath.Join(s.imagesDir, s.imgCnf.Name)
 	tarFname := path.Join(s.imagesDir, fmt.Sprintf("%s.tar", s.imgCnf.Name))
-	bootable := arch.Bootable(s.imgCnf.Bootable)
+	iarch, err := arch.NewArch(runtime.GOARCH)
+	if err != nil {
+		return err
+	}
+	bootable := iarch.Bootable(s.imgCnf.Bootable)
 	// build package list: add a kernel if building a bootable image
 	packages := make([]string, 0, len(s.imgCnf.Packages)+1)
 	if bootable {
@@ -84,11 +93,11 @@ func (s *CreateImage) makeRootImage(ctx context.Context) error {
 	packages = append(packages, s.imgCnf.Packages...)
 
 	cmd := exec.CommandContext(ctx, Mmdebstrap,
-		"sid",
+		s.PkgRepo,
 		"--include", strings.Join(packages, ","),
 		tarFname,
 	)
-	err := logcmd.RunAndLogCommand(cmd, s.log)
+	err = logcmd.RunAndLogCommand(cmd, s.log)
 	if err != nil {
 		return err
 	}
@@ -166,7 +175,7 @@ func (s *CreateImage) makeRootImage(ctx context.Context) error {
 }
 
 func resizeImage(ctx context.Context,
-	log logrus.FieldLogger,
+	log slogger.Logger,
 	imgFname string, size string,
 ) error {
 

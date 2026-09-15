@@ -4,26 +4,76 @@ weight: 3
 description: "Perform in-kernel BPF filtering and actions on events"
 ---
 
-Selectors are a way to perform in-kernel BPF filtering on the events to
-export, or on the events on which to apply an action.
+Selectors enable per-hook in-kernel BPF filtering and actions. Each selector defines a set of
+filters as well as a set of (optional) actions to be performed if the selector filters match. Each
+hook can contain up to 5 selectors. If no selectors are defined on a hook, the default action
+(`Post`, i.e., post an event) will be used.
 
-A `TracingPolicy` can contain from 0 to 5 selectors. A selector is composed of
-1 or more filters. The available filters are the following:
+
+Each selector comprises a set of filters:
 - [`matchArgs`](#arguments-filter): filter on the value of arguments.
+- [`matchCmdArgs`](#command-line-arguments-filter): filter on process command-line arguments.
+- [`matchData`](#data-filter): filter on the value of data fields.
 - [`matchReturnArgs`](#return-args-filter): filter on the return value.
 - [`matchPIDs`](#pids-filter): filter on PID.
 - [`matchBinaries`](#binaries-filter): filter on binary path.
+- [`matchParentBinaries`](#parent-binaries-filter): filter on parent binary path.
 - [`matchNamespaces`](#namespaces-filter): filter on Linux namespaces.
 - [`matchCapabilities`](#capabilities-filter): filter on Linux capabilities.
 - [`matchNamespaceChanges`](#namespace-changes-filter): filter on Linux namespaces changes.
 - [`matchCapabilityChanges`](#capability-changes-filter): filter on Linux capabilities changes.
+- [`matchWorkloads`](#workloads-filter): filter on Kubernetes workloads.
+- [`matchCEL`](#matchcel): filter on the value of CEL expressions
+- [`matchUserCallers`](#matchusercallers): filter on the user space callstack of the hooked function.
+
+And a set of actions that will be performed if the specified filters match:
 - [`matchActions`](#actions-filter): apply an action on selector matching.
 - [`matchReturnActions`](#return-actions-filter): apply an action on return selector matching.
+
+For a selector to match, all of its filters must match (AND operator). If a selector defines no
+filters, it matches. If multiple selectors are defined in a hook, only the action defined in the
+first matching selector will be applied (short-circuited OR). If a selector defines no action, the
+default action (`Post`) is applied.
+
+For example, the following policy will generate events when the `sys_mount` system call is executed
+by binaries other than `/usr/bin/mount`.
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "mount-example"
+spec:
+  kprobes:
+  - call: "sys_mount"
+    syscall: true
+    selectors:
+      # first selector
+      - matchBinaries:
+        - operator: In
+          values:
+          - "/usr/bin/mount"
+        matchActions:
+        - action: NoPost
+      # second selector
+      - matchActions:
+        - action: Post
+
+```
 
 ## Arguments filter
 
 Arguments filters can be specified under the `matchArgs` field and provide
 filtering based on the value of the function's argument.
+
+You can specify the argument either in the `index` or in `args` field. The `index` field
+denotes the argument position within the function arguments, while the  `args`
+field denotes the arguments position within the spec arguments. Both fields are
+zero based (1st argument has zero value). The `args` field (if defined) takes
+precedence over `index` field.
+
+The `args` field can support multiple arguments. Currently, the only operator that supports more
+than 1 argument is the `CapabilitiesGained` operator.
 
 In the next example, a selector is defined with a `matchArgs` filter that tells
 the BPF code to process only the function call for which the second argument,
@@ -43,6 +93,30 @@ selectors:
     - "/etc/passwd"
     - "/etc/shadow"
 ```
+In the next example, a selector is defined with a `matchArgs` filter that tells
+the BPF code to process only the function call for which the second spec argument,
+`args` equals to [1] (which represents 1st function argument, `index` equals to 0),
+has value `0xcoffee`.
+
+```yaml
+- args:
+  - index: 2
+    type: "int"
+    label: "arg0-index2"
+  - index: 0
+    type: "int"
+    label: "arg1-index1"
+  - index: 1
+    type: "int"
+    label: "arg2-index0"
+  selectors:
+  - matchArgs:
+    - args: [1]
+      operator: "Equal"
+      values:
+      - "0xcoffee"
+```
+Note that you can mix `index` and `arg` fields within `matchArgs` selector definitions.
 
 The available operators for `matchArgs` are:
 - `Equal`
@@ -50,6 +124,12 @@ The available operators for `matchArgs` are:
 - `Prefix`
 - `Postfix`
 - `Mask`
+- `FileType`
+- `NotFileType`
+
+{{< warning >}}
+The `CelExpr` `MatchArgs` operator has been deprecated. Please use the `MatchCEL` selector instead.
+{{< /warning >}}
 
 **Further examples**
 
@@ -82,6 +162,167 @@ with the previous example.
     values:
     - "/etc"
 ```
+
+### File type filtering
+
+The `FileType` and `NotFileType` operators allow filtering based on the type of a
+file (e.g., regular file, pipe, socket, etc.). These operators can only be used
+with arguments of type `file` or `path`.
+
+Matching file types:
+- `sock` or `socket`: Socket
+- `lnk` or `link`: Symbolic link
+- `reg` or `regular`: Regular file
+- `blk` or `block`: Block device
+- `dir`: Directory
+- `chr` or `char`: Character device
+- `fifo` or `pipe`: FIFO/Pipe
+
+In the following example, we monitor `vfs_write` only for regular files.
+
+```yaml
+selectors:
+- matchArgs:
+  - index: 0
+    operator: "FileType"
+    values:
+    - "reg"
+```
+
+
+## Command-line arguments filter
+
+Command-line argument filters can be specified under the `matchCmdArgs` field.
+Unlike `matchArgs`, which filters on arguments passed to the hook,
+`matchCmdArgs` filters on the arguments passed to the current process when it
+was executed.
+
+The `index` field selects a command-line argument. Indexes are zero-based and
+exclude `argv[0]`, which is represented by the process binary. For example,
+index `0` selects `--output` when the process was started as `curl --output
+/tmp/result`.
+
+```yaml
+selectors:
+- matchBinaries:
+  - operator: In
+    values:
+    - "/usr/bin/curl"
+  matchCmdArgs:
+  - index: 0
+    operator: Equal
+    values:
+    - "--output"
+  - index: 1
+    operator: Prefix
+    values:
+    - "/tmp/"
+```
+
+The available operators for `matchCmdArgs` are:
+
+- `Equal`
+- `NotEqual`
+- `Prefix`
+- `NotPrefix`
+- `Postfix`
+- `NotPostfix`
+
+A selector can contain up to five `matchCmdArgs` filters, and each `index` can
+range from 0 to 31. All filters must match. Tetragon caches at most the first
+256 bytes of command-line arguments, including the NUL bytes that separate
+them. Data beyond this limit is truncated, and only arguments fully contained
+in the cache can match.
+
+{{< caution >}}
+Command-line arguments are user-controlled and can be reordered or obfuscated,
+so account for alternate forms when using this filter for enforcement.
+{{< /caution >}}
+
+The `matchCmdArgs` filter requires support for large BPF programs, normally
+available on Linux kernel version 5.3 and later.
+
+## Data filter
+
+Data filters can be specified under the `matchData` field and provide
+filtering based on the value of the specified `data` field.
+
+The `data` block allows you to filter events based on fields of
+kernel data structures rather than function arguments — for example,
+the UID of the current task at a hook that does not take credentials
+as an argument. Each entry in the `data` block specifies:
+
+- `source`: where to read from. Supported values are `current_task`
+  (the process's `task_struct`) and `pt_regs` (the register state at
+  the hook point).
+- `resolve`: which field of the source structure to read.
+- `type`: how the resolved value should be interpreted.
+
+A `matchData` selector then refers to a `data` entry by its `index`
+and applies an operator.
+
+In the following example we extract the `pid` value from `current_task`
+and filter on all values except for `1`.
+
+```yaml
+data:
+- index: 0
+  type: "int"
+  source: "current_task"
+  resolve: "pid"
+selectors:
+- matchData:
+  - index: 0
+    operator: "NotEqual"
+    values:
+    - "1"
+```
+
+Nested fields can be accessed through the `.` separator, as described
+in [Attribute resolution]({{< ref "/docs/concepts/tracing-policy/hooks#attribute-resolution" >}}).
+In the following example we extract the UID of the current task via
+`cred.uid.val` and filter for non-system users (UID greater than
+`1000`), hooked at `security_bprm_committed_creds` — an LSM hook
+called after a process's credentials are committed.
+
+```yaml
+kprobes:
+- call: "security_bprm_committed_creds"
+  syscall: false
+  data:
+  - index: 0
+    type: "int"
+    source: "current_task"
+    resolve: "cred.uid.val"
+  selectors:
+  - matchData:
+    - index: 0
+      operator: "GreaterThan"
+      values:
+      - "1000"
+```
+
+The same pattern works for non-integer types. The following example
+reads the process name from `comm` (a string field of `task_struct`)
+and matches when it equals a specific value.
+
+```yaml
+data:
+- index: 0
+  type: "string"
+  source: "current_task"
+  resolve: "comm"
+selectors:
+- matchData:
+  - index: 0
+    operator: "Equal"
+    values:
+    - "cat"
+```
+
+The available operators for `matchData` are the same as those listed under
+[Arguments filter](#arguments-filter), and apply according to the `type`
+declared in the corresponding `data` entry.
 
 ## Return args filter
 
@@ -158,9 +399,34 @@ calls and kernel functions that are coming from `cat` or `tail`.
     - "/usr/bin/tail"
 ```
 
-Currently, only the `In` operator type is supported and the `values` field has
-to be a map of `strings`. The default behaviour is `followForks: true`, so all
-the child processes are followed. The current limitation is 4 values.
+The available operators for `matchBinaries` are:
+- `In`
+- `NotIn`
+- `Prefix`
+- `NotPrefix`
+- `Postfix`
+- `NotPostfix`
+
+The `values` field has to be a map of `strings`.
+
+### Follow children
+
+The `matchBinaries` filter can be configured to also apply to children of matching processes. To do
+this, set `followChildren` to `true`. For example:
+
+```yaml
+- matchBinaries:
+  - operator: "In"
+    values:
+    - "/usr/sbin/sshd"
+    followChildren: true
+```
+
+There are a number of limitations when using followChildren:
+- Children created before the policy was installed will not be matched.
+- The number of `matchBinaries` sections with `followChildren: true` cannot exceed 64.
+- `operator` can be `In` or `NotIn`.
+
 
 **Further examples**
 
@@ -176,6 +442,7 @@ following:
   - operator: "In"
     values:
     - "/usr/sbin/sshd"
+    followChildren: true
 ```
 
 while the whole `kprobe` call is the following:
@@ -196,6 +463,7 @@ while the whole `kprobe` call is the following:
     - operator: "In"
       values:
       - "/usr/sbin/sshd"
+      followChildren: true
   # match to stdin/stdout/stderr
     matchArgs:
     - index: 0
@@ -205,6 +473,90 @@ while the whole `kprobe` call is the following:
       - "2"
       - "3"
 ```
+
+
+### Scripts with shebangs
+
+{{< caution >}}
+`matchBinaries` matches against the `interpreter`, not the script path.
+{{< /caution >}}
+
+When executing a script with a shebang (i.e. `#!/usr/bin/python3`), Linux actually runs the
+interpreter and passes the script as an argument. Current implementation of `matchBinaries` filters based on the interpreter path (i.e. `/usr/bin/python3`) and not the script name (i.e. `/opt/scripts/my_script.py`).
+
+This won't work:
+
+```yaml
+- matchBinaries:
+  - operator: "In"
+    values:
+    - "/opt/scripts/my_script.py"
+```
+
+Match the interpreter instead:
+
+```yaml
+- matchBinaries:
+  - operator: "In"
+    values:
+    - "/usr/bin/python3"
+```
+
+## Parent binaries filter
+
+{{< warning >}}
+`matchParentBinaries` selector can be used only with BPF map `parents_map` enabled (option `--parents-map-enabled`), which adds
+additional memory overhead. 
+{{< /warning >}}
+
+Parent binaries filter provides filtering based on current process parent
+binary path, which works similarly to the `matchBinaries` filter. It can be
+specified with the `matchParentBinaries` field. For instance, the following
+`matchParentBinaries` selector will match only if binary `cat` was executed
+from interactive shell like `zsh`, `bash`, `sh`:
+
+```yaml
+- matchParentBinaries:
+  - operator: "In"
+    values:
+    - "/usr/bin/bash"
+    - "/usr/bin/sh"
+    - "/usr/bin/zsh"
+  matchBinaries:
+  - operator: "In"
+    values:
+    - "/usr/bin/cat"
+```
+
+The available operators for `matchParentBinaries` are:
+- `In`
+- `NotIn`
+- `Prefix`
+- `NotPrefix`
+- `Postfix`
+- `NotPostfix`
+
+The `values` field has to be a map of `strings`.
+
+### Follow children
+
+The `matchParentBinaries` filter can be configured to also apply to children of
+matching parent processes. To do this, set `followChildren` to `true`. For example:
+
+```yaml
+- matchParentBinaries:
+  - operator: "In"
+    values:
+    - "/usr/bin/bash"
+    followChildren: true
+```
+
+This policy will match any process, which direct or transitive parent process binary is `bash`.
+
+There are a number of limitations when using `followChildren`:
+- Children created before the policy was installed will not be matched.
+- The number of `matchParentBinaries` sections with `followChildren: true` cannot exceed 64.
+- Operators other than `In/NotIn` are not supported.
 
 ## Namespaces filter
 
@@ -459,9 +811,7 @@ matchNamespaceChanges:
 ```
 
 The `unshare` command, or executing in the host namespace using `nsenter` can
-be used to test this feature. See a
-[demonstration example](https://github.com/cilium/tetragon/blob/main/examples/tracingpolicy/match_namespace_changes.yaml)
-of this feature.
+be used to test this feature.
 
 ## Capability changes filter
 
@@ -481,8 +831,158 @@ matchCapabilityChanges:
   - "CAP_SETUID"
 ```
 
-See a [demonstration example](https://github.com/cilium/tetragon/blob/main/examples/tracingpolicy/match_capability_changes.yaml)
+See a [demonstration example](https://github.com/cilium/tetragon/blob/main/examples/tracingpolicy/fd_install_cap_changes.yaml)
 of this feature.
+
+## Workloads filter
+
+Workloads filter can be specified under the `matchWorkloads` field and provides
+filtering based on Kubernetes workloads. Inside `matchWorkloads` the user can
+define a `hostSelector`, a `podSelector`, and a `containerSelector`.
+
+This works in a similar way to global workload selectors such as `spec.hostSelector`,
+`spec.podSelector`, and `spec.containerSelector`. More details on these
+can be found in [Filtering semantics]({{< ref "/docs/concepts/tracing-policy/k8s-filtering/#filtering-semantics" >}}).
+
+Loading a tracing policy with `matchWorkloads` outside of Kubernetes will fail
+in a similar way to global workload selectors.
+
+The following match host workloads and pods inside `kube-system` namespace:
+
+```yaml
+matchWorkloads:
+  hostSelector: {}
+  podSelector:
+    matchExpressions:
+    - key: "k8s:io.kubernetes.pod.namespace"
+      operator: In
+      values:
+      - "kube-system"
+```
+
+## matchCEL
+
+The `matchCEL` selector allows specifying filtering expressions in
+[CEL](https://cel.dev/overview/cel-overview) that are evaluated in-kernel.
+
+Here's a policy example:
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "sys-lseek"
+spec:
+  kprobes:
+  - call: "sys_lseek"
+    syscall: true
+    data:
+    - source: current_task
+      index: 0
+      type: int
+      resolve: pid
+    args:
+    - index: 2
+      type: "int"
+      label: "whence"
+    - index: 0
+      type: "int"
+      label: "fd"
+    selectors:
+    - matchActions:
+      - action: Post
+      MatchCel:
+        expr: "arg1 == int32(-1) && data0 == arg0 + int32(42)"
+```
+
+Arguments, as specified in the `args:` array, are made available in the CEL expression as `argX`
+where `X` is the zero-based index in the array. Similary for data items, as specified in the `data:`
+list.
+
+In the above example, the argument labeled `whence` is available as `arg0`, the argument labeled
+`fd` is available as `arg1`, and the PID of the process is available as `data0`.
+
+The policy can be triggered via:
+```shell-session
+python3 -c "import os; os.lseek(-1, 0, os.getpid() - 42)"
+```
+
+Currently, `MatchCEL` supports:
+* Addition (`+`) and subtraction (`-`)
+* Logical AND (`&&`), OR (`||`), and NOT (`!`) operators
+* Comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`)
+* Integer casting to 32-bits (`int32()`, `uint32()`)
+* Bitwise operations (`and()`, `or()`, `xor()`, `not()`, `lsh()`, `rsh()`)
+
+Shift operations (`lsh()`, `rsh()`) mask the shift amount to the bit width of
+the operand. In other words, the shift amount is reduced modulo the bit width
+of the operand.
+
+For example, `lsh(uint8(16u), uint8(9u))` is equal to `lsh(uint8(16u),
+uint8(1u))` because the shift amount is masked by 7 (the bit width of a `uint8`
+minus 1) thus `9 & 7 = 1` or reduced modulo the bit width, thus `9 % 8 = 1`.
+
+## matchUserCallers
+
+The `matchUserCallers` selector allows filtering based on the user space
+callstack of the hooked function.
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "uprobe-caller"
+spec:
+  uprobes:
+  - path: test
+    symbols:
+    - "func2"
+    selectors:
+    - matchUserCallers:
+      - depth: "2"
+        symbol: "main"
+```
+
+For this example policy, the `uprobe` will only trigger if the user space
+callstack of the `func2` function contains the symbol `main` at depth 2. The
+following is an example callstack that would match this selector:
+
+```plaintext
+func2 <-- 0 (uprobe)
+func1 <-- 1
+main  <-- 2
+```
+
+Instead of defining a symbol, you can also define the `startRange` and `endRange`
+of the caller function. The values must be the offsets relative to the beginning
+of the executable or shared object. Defining `symbol` is mutually exclusive with
+defining `startRange` and `endRange`.
+
+If the caller function is not in the same binary as the hooked function,
+you can define the `path` field to specify the binary path of the caller
+function.
+
+The `depth` field allows values from 1 to 15. If the depth is not exactly known,
+you can define `depth` as `"any"`. This searches for the caller in the first 15
+frames of the callstack.
+
+`matchUserCallers` can contain up to 5 entries. The selector will match if all
+of the entries match.
+
+**Limitations**
+1. Binaries and all linked libraries in the callstack must have frame pointers
+   enabled.
+2. The `matchUserCallers` selector is only supported for `uprobes`.
+3. On amd64 platforms, kernel commit [`cfa7f3d2c526` ("perf,x86: avoid missing caller address in
+   stack traces captured in uprobe")](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=cfa7f3d2c526c224a6271cc78a4a27a0de06f4f0)
+   (kernel version >=6.12) is needed to match the immediate caller.
+   Without the commit, setting `depth` to `any` is supported, but the immediate
+   caller will not be matched.
+4. arm64 platforms don't support setting `depth` to 1 to match the immediate
+   caller. Setting `depth` to `any` is supported, but the immediate caller will not
+   be matched.
+5. Kernel version >=5.9 is needed to support binaries which don't have their
+   buildID in their first note section.
 
 ## Actions filter
 
@@ -492,9 +992,6 @@ matches. They are defined under `matchActions` and currently, the following
 - [Sigkill action](#sigkill-action)
 - [Signal action](#signal-action)
 - [Override action](#override-action)
-- [FollowFD action](#followfd-action)
-- [UnfollowFD action](#unfollowfd-action)
-- [CopyFD action](#copyfd-action)
 - [GetUrl action](#geturl-action)
 - [DnsLookup action](#dnslookup-action)
 - [Post action](#post-action)
@@ -502,13 +999,15 @@ matches. They are defined under `matchActions` and currently, the following
 - [TrackSock action](#tracksock-action)
 - [UntrackSock action](#untracksock-action)
 - [Notify Enforcer action](#notify-enforcer-action)
+- [Set action](#set-action)
 
 {{< note >}}
-`Sigkill`, `Override`, `FollowFD`, `UnfollowFD`, `CopyFD`, `Post`,
+`Sigkill`, `Override`, `Post`,
 `TrackSock` and `UntrackSock` are
 executed directly in the kernel BPF code while `GetUrl` and `DnsLookup` are
 happening in userspace after the reception of events.
 {{< /note >}}
+
 
 ### Sigkill action
 
@@ -596,9 +1095,19 @@ this action for enforcement.
 
 ### Override action
 
+Override action is defined for kprobe, uprobe and lsmhooks selectors, each one
+of them supporting different arguments:
+| Hook   | Arguments |
+| ------ | --------- |
+| kprobe | `argError` |
+| uprobe | `argError,argRegs,argNewSymbol,argNewAddr,argNewOffset` |
+| lsmhooks | `argError` |
+
+#### Override action for kprobe and lsmhooks
+
 `Override` action allows to modify the return value of call. While `Sigkill`
 will terminate the entire process responsible for making the call, `Override`
-will run in place of the original kprobed function and return the value
+will run in place of the original probed function and return the value
 specified in the `argError` field. It's then up to the code path or the user
 space process handling the returned value to whether stop or proceed with the
 execution.
@@ -646,203 +1155,110 @@ For kernel developers: if you want to override your kernel functions then
 ensure they properly follow the [Error Injectable Functions](https://docs.kernel.org/fault-injection/fault-injection.html#error-injectable-functions) guide.
 {{< /caution >}}
 
-### FollowFD action
+#### Override action for uprobe
 
-The `FollowFD` action allows to create a mapping using a BPF map between file
-descriptors and filenames. After its creation, the mapping can be maintained
-through [`UnfollowFD`](#unfollowfd-action) and [`CopyFD`](#copyfd-action)
-actions. Note that proper maintenance of the mapping is up to the tracing policy
-writer.
+{{< warning >}}
+Beware, here be dragons!!! Use with caution, it could easily crash traced application.
+{{< /warning >}}
 
-`FollowFD` is typically used at hook points where a file descriptor and its
-associated filename appear together. The kernel function `fd_install`
-is a good example.
-
-The `fd_install` kernel function  is called each time a file descriptor must be
-installed into the file descriptor table of a process, typically referenced
-within system calls like `open` or `openat`. It is a good place for tracking
-file descriptor and filename matching.
-
-Let's take a look at the following example:
-```yaml
-- call: "fd_install"
-  syscall: false
-  args:
-  - index: 0
-    type: int
-  - index: 1
-    type: "file"
-  selectors:
-  - matchPIDs:
-      # [...]
-    matchArgs:
-      # [...]
-    matchActions:
-    - action: FollowFD
-      argFd: 0
-      argName: 1
-```
-
-This action uses the dedicated `argFd` and `argName` fields to get respectively
-the index of the file descriptor argument and the index of the name argument in
-the call.
-
-While the mapping between the file descriptor and filename remains in place
-(that is, between `FollowFD` and `UnfollowFD` for the same file descriptor)
-tracing policies may refer to filenames instead of file descriptors.  This
-offers greater convenience and allows more functionality to reside inside the
-kernel, thereby reducing overhead.
-
-For instance, assume that you want to prevent writes into file
-`/etc/passwd`. The system call `sys_write` only receives a file descriptor,
-not a filename, as argument. Yet with a bracketing pair of `FollowFD`
-and `UnfollowFD` actions in place the tracing policy that hooks into `sys_write`
-can nevertheless refer to the filename `/etc/passwd`,
-if it also marks the relevant argument as of type `fd`.
-
-The following example combines actions `FollowFD` and `UnfollowFD` as well
-as an argument of type `fd` to such effect:
+Similar to kprobe, the uprobe `Override` action allows to modify the return value
+of user space call with `argError` argument, like:
 
 ```yaml
-kprobes:
-- call: "fd_install"
-  syscall: false
-  args:
-  - index: 0
-    type: int
-  - index: 1
-    type: "file"
-  selectors:
-  - matchArgs:
-    - index: 1
-      operator: "Equal"
-      values:
-      - "/tmp/passwd"
-    matchActions:
-    - action: FollowFD
-      argFd: 0
-      argName: 1
-- call: "sys_write"
-  syscall: true
-  args:
-  - index: 0
-    type: "fd"
-  - index: 1
-    type: "char_buf"
-    sizeArgIndex: 3
-  - index: 2
-    type: "size_t"
-  selectors:
-  - matchArgs:
-    - index: 0
-      operator: "Equal"
-      values:
-      - "/tmp/passwd"
-    matchActions:
-    - action: Sigkill
-- call: "sys_close"
-  syscall: true
-  args:
-  - index: 0
-     type: "int"
+uprobes:
+- path: "test"
+  symbols:
+  - "func"
   selectors:
   - matchActions:
-    - action: UnfollowFD
-      argFd: 0
-      argName: 0
+    - action: Override
+      argError: 123
 ```
 
-### UnfollowFD action
+Note that it can be successfully used only when following conditions are met:
+- uprobe is attached to the beginning of the user space function;
+- user space function is called via `call` instruction;
+- user space function returns `int` type;
+- kernel support to manipulate raw registers is available (6.18+).
 
-The `UnfollowFD` action takes a file descriptor from a system call and deletes
-the corresponding entry from the BPF map, where it was put under the `FollowFD`
-action.
-It is typically used at hooks points where the scope of association between
-a file descriptor and a filename ends. The system call `sys_close` is a
-good example.
-
-Let's take a look at the following example:
+It's also possible to override the traced symbol with a new symbol call, like:
 ```yaml
-- call: "sys_close"
-  syscall: true
-  args:
-  - index: 0
-    type: "int"
+uprobes:
+- path: "test"
+  symbols:
+  - "malloc"
   selectors:
-  - matchPIDs:
-    - operator: NotIn
-      followForks: true
-      isNamespacePID: true
-      values:
-      - 0
-      - 1
-    matchActions:
-    - action: UnfollowFD
-      argFd: 0
+  - matchActions:
+    - action: Override
+      argNewSymbol: "malloc_patched"
 ```
 
-Similar to the `FollowFD` action, the index of the file descriptor is described
-under `argFd`:
+or even with a new symbol offset or address, eg:
 ```yaml
-matchActions:
-- action: UnfollowFD
-  argFd: 0
-```
-
-In this example, `argFD` is 0. So, the argument from the `sys_close` system
-call at `index: 0` will be deleted from the BPF map whenever a `sys_close` is
-executed.
-```yaml
-- index: 0
-  type: "int"
-```
-
-{{< caution >}}
-Whenever we would like to follow a file descriptor with a `FollowFD` block,
-there should be a matching `UnfollowFD` block, otherwise the BPF map will be
-broken.
-{{< /caution >}}
-
-### CopyFD action
-
-The `CopyFD` action is specific to duplication of file descriptor use cases.
-Similary to `FollowFD`, it takes an `argFd` and `argName` arguments. It can
-typically be used tracking the `dup`, `dup2` or `dup3` syscalls.
-
-See the following example for illustration:
-
-```yaml
-- call: "sys_dup2"
-  syscall: true
-  args:
-  - index: 0
-    type: "fd"
-  - index: 1
-    type: "int"
+uprobes:
+- path: "test"
+  symbols:
+  - "malloc"
   selectors:
-  - matchPIDs:
-    # [...]
-    matchActions:
-    - action: CopyFD
-      argFd: 0
-      argName: 1
-- call: "sys_dup3"
-  syscall: true
-  args:
-  - index: 0
-    type: "fd"
-  - index: 1
-    type: "int"
-  - index: 2
-    type: "int"
-  selectors:
-  - matchPIDs:
-    # [...]
-    matchActions:
-    - action: CopyFD
-      argFd: 0
-      argName: 1
+  - matchActions:
+    - action: Override
+      argNewOffset: "0x0000115c"
 ```
+
+or:
+
+```yaml
+uprobes:
+- path: "test"
+  symbols:
+  - "malloc"
+  selectors:
+  - matchActions:
+    - action: Override
+      argNewAddr: "0x00001137"
+```
+
+There are, however, some restrictions:
+- kernel support to manipulate raw registers is required (6.18+);
+- new symbol must be already present in the binary;
+- new symbol must have the same signature as the original symbol.
+
+{{< warning >}}
+Since tetragon enforces no verification for the last point, this can lead to
+crashing the traced application.
+{{< /warning >}}
+
+It's possible to override specific registers with arbitrary value with `argRegs`
+argument, like:
+
+```yaml
+uprobes:
+- path: "test"
+  symbols:
+  - "func"
+  selectors:
+  - matchActions:
+    - action: Override
+      argRegs:
+      - "rax=11"
+      - "rbp=(%rsp)"
+      - "rip=8(%rsp)"
+      - "rsp=8%rsp"
+```
+
+The `argRegs` argument is an array of strings where each string start with destination
+register name followed by `=` and an assignment expression, which can be one of the
+following types:
+
+- constant `rax=11`
+- register `rbp=%rsp`
+- register plus offset `rip=8%rsp`
+- dereference of register `rbp=(%rsp)`
+- dereference of register plus offset `rsp=8(%rsp)`
+
+{{< note >}}
+This interface is likely to be changed in the future.
+{{< /note >}}
 
 ### GetUrl action
 
@@ -1025,6 +1441,124 @@ Compact output will display missing addresses as `0x0`, see the above note on
 `--expose-stack-addresses` for more info.
 {{< /note >}}
 
+#### File hash collection with IMA
+
+`Post` takes the `imaHash` parameter, when turned to `true` (by default to
+`false`) it adds file hashes in LSM events calculated by Linux integrity subsystem.
+The following list of LSM hooks is supported:
+
+- bprm_check_security
+- bprm_committed_creds
+- bprm_committing_creds
+- bprm_creds_from_file
+- file_ioctl
+- file_lock
+- file_open
+- file_post_open
+- file_receive
+- mmap_file
+
+First, you need to be sure that LSM BPF is [enabled](https://tetragon.io/docs/concepts/tracing-policy/hooks/#lsm-bpf).
+
+To verify if IMA-measurement is available use the following command:
+
+```shell
+cat /boot/config-$(uname -r) | grep "CONFIG_IMA\|CONFIG_INTEGRITY"
+```
+
+The output should be similar to this if IMA-measurement is supported:
+
+```
+CONFIG_INTEGRITY=y
+CONFIG_IMA=y
+```
+
+If provided above conditions are met, you can enable IMA-measurement by modifying `/etc/deault/grub`:
+
+```
+GRUB_CMDLINE_LINUX="lsm=integrity,bpf ima_policy=tcb"
+```
+
+Then, update the grub configuration and restart the system.
+
+`ima_policy=` is used to define which files will be measured. `tcb` measures all executables run,
+all mmap'd files for execution (such as shared libraries), all kernel modules loaded,
+and all firmware loaded. Additionally, a files opened for read by root are measured as well.
+`ima_policy=` can be specified multiple times, and the result is the union of the policies.
+To know more about `ima_policy` you can follow this [link](https://ima-doc.readthedocs.io/en/latest/ima-policy.html).
+
+{{< note >}}
+Hash calculation with IMA subsystem and LSM BPF is supported from 5.11 kernel version.
+For kernel versions below 6.1 is recommended to mount filesystems with `iversion`. Mounting with `iversion`
+helps IMA not recalculating hash if file is not changed. From kernel 6.1 `iversion` is by default.
+It is not necessary to enable IMA to calculate hashes with Tetragon if you have kernel 6.1+.
+But hashes will be recalculated no matter if file is not changed. See implementation details of
+`bpf_ima_file_hash` helper.
+{{< /note >}}
+
+The provided example of `TracingPolicy` collects hashes of executed binaries from
+`zsh` and `bash` interpreters:
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+spec:
+  lsmhooks:
+  - hook: "bprm_check_security"
+    args:
+      - index: 0
+        type: "linux_binprm"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/bin/zsh"
+        - "/usr/bin/bash"
+      matchActions:
+        - action: Post
+          imaHash: true
+```
+
+LSM event with file hash can look like this:
+
+```json
+{
+  "process_lsm": {
+    "process": {
+        ...
+    },
+    "parent": {
+        ...
+    },
+    "function_name": "bprm_check_security",
+    "policy_name": "file-integrity-monitoring",
+    "args": [
+      {
+        "linux_binprm_arg": {
+          "path": "/usr/bin/grep",
+          "permission": "-rwxr-xr-x"
+        }
+      }
+    ],
+    "action": "KPROBE_ACTION_POST",
+    "ima_hash": "sha256:73abb4280520053564fd4917286909ba3b054598b32c9cdfaf1d733e0202cc96"
+  },
+}
+```
+
+`ima_hash` field contains information about hashing algorithm and the hash value itself
+separated by ':'.
+
+This output can be enhanced in a more human friendly using the
+`tetra getevents -e PROCESS_LSM -o compact` command.
+
+```
+🔒 LSM     user-nix /usr/bin/zsh bprm_check_security
+   /usr/bin/cat sha256:dd5526c5872cce104a80f4d4e7f787c56ab7686a5b8dedda0ba4e8b36a3c084c
+🔒 LSM     user-nix /usr/bin/zsh bprm_check_security
+   /usr/bin/grep sha256:73abb4280520053564fd4917286909ba3b054598b32c9cdfaf1d733e0202cc96
+```
+
 ### NoPost action
 
 The `NoPost` action can be used to suppress the event to be generated, but at
@@ -1049,6 +1583,7 @@ generate any event about that.
   - index: 2
     type: "int"
   returnArg:
+    index: 0
     type: "int"
   selectors:
   - matchPIDs:
@@ -1067,9 +1602,7 @@ generate any event about that.
 
 The `TrackSock` action allows to create a mapping using a BPF map between sockets
 and processes. It however needs to maintain a state
-correctly, see [`UntrackSock`](#untracksock-action) related action. `TrackSock`
-works similarly to `FollowFD`, specifying the argument with the `sock` type using
-`argSock` instead of specifying the FD argument with `argFd`.
+correctly, see [`UntrackSock`](#untracksock-action) related action.
 
 It is however more likely that socket tracking will be performed on the return
 value of `sk_alloc` as described above.
@@ -1212,6 +1745,110 @@ spec:
       - action: "Sigkill"
 ```
 
+### Set action
+
+The `Set` action is specific for USDT and uprobe probes.
+It uses the following arguments:
+
+- The `argIndex` defines position of the argument.
+- The `argValue` defined the actual value to write.
+
+#### Uprobe
+
+For uprobes, the `Set` action allows setting the value of the argument at the given index.
+The argument needs to meet a few conditions:
+
+- It must be an integer parameter (`argValue` holds an `uint32`)
+- `argIndex` must be between 0 and 5 for amd64 and between 0 and 7 for arm64
+- `argIndex` refers to the position of the argument in the traced function, starting from 0 for the first argument
+
+Example policy follows:
+```yaml
+spec:
+  uprobes:
+  - path: my-binary
+    symbols:
+    - "pizza"
+    selectors:
+    - matchActions:
+      - action: Set
+        argIndex: 0
+        argValue: 42
+```
+This policy will set the value of the first argument of the `pizza()` function to `42`.
+
+#### USDT
+
+For USDT probes, the `Set` action allows writing a value to a configured probe argument. 
+The argument needs to meet a few conditions:
+
+- It's stored in memory as `USDT deref` argument
+- It has size of 4 bytes
+
+Following command displays binary's ELF notes which includes all defined USDT probes.
+
+```bash
+$ readelf -n ./usdt-override
+...
+Displaying notes found in: .note.stapsdt
+  Owner                Data size        Description
+  stapsdt              0x0000003e       NT_STAPSDT (SystemTap probe descriptors)
+    Provider: tetragon
+    Name: test
+    Location: 0x0000000000001135, Base: 0x0000000000002004, Semaphore: 0x0000000000000000
+    Arguments: -4@-4(%rsp) -4@$1 -4@$2
+```
+
+- Please check `-4@-4(%rsp)` for first argument load, which is `USDT deref`.
+- The `-4` in `-4@-4(%rsp)` stands for signed 4 bytes type.
+
+Following C example is source for `usdt-override` from above. It defines USDT
+probe with 3 arguments and first one meets the criteria for USDT return.
+
+```c
+int main(int argc, char **argv)
+{
+    volatile int ret = 0;
+    int arg_1, arg_2;
+
+    ...
+
+    USDT(tetragon, test, ret, arg_1, arg_2);
+
+    if (ret)
+        return -1;
+
+    ...
+
+```
+
+Note the `volatile` used for `ret` variable that ensures it will be used
+via memory dereferencing in USDT probe.
+
+We can then use following tetragon policy to trace this USDT probe and
+force value `1` for output argument in case the `Set` action is executed.
+
+
+```yaml
+spec:
+  usdts:
+  - path: ".../usdt-override"
+    provider: "tetragon"
+    name: "test"
+    args:
+    - index: 0
+      type: "int32"
+    - index: 1
+      type: "int32"
+    - index: 2
+      type: "int32"
+    selectors:
+      - matchActions:
+        - action: Set
+          argIndex: 0
+          argValue: 1
+```
+
 ## Selector Semantics
 
 The `selector` semantics of the `CiliumTracingPolicy` follows the standard
@@ -1222,13 +1859,13 @@ To explain deeper the structure and the logic behind it, let's consider first
 the following example:
 ```yaml
 selectors:
- - matchPIDs:
-   - operator: In
-     followForks: true
-     values:
-     - pid1
-     - pid2
-     - pid3
+- matchPIDs:
+  - operator: In
+    followForks: true
+    values:
+    - pid1
+    - pid2
+    - pid3
   matchArgs:
   - index: 0
     operator: "Equal"
@@ -1257,12 +1894,12 @@ the container initialization and the main pod process and tried to read from
 the `/etc/passwd` file by using:
 ```yaml
 selectors:
- - matchPIDs:
-   - operator: NotIn
-     followForks: true
-     values:
-     - 0
-     - 1
+- matchPIDs:
+  - operator: NotIn
+    followForks: true
+    values:
+    - 0
+    - 1
   matchArgs:
   - index: 0
     operator: "Equal"
@@ -1281,12 +1918,12 @@ For example, we can monitor `sys_read()` syscalls accessing both the
 `/etc/passwd` or the `/etc/shadow` files:
 ```yaml
 selectors:
- - matchPIDs:
-   - operator: NotIn
-     followForks: true
-     values:
-     - 0
-     - 1
+- matchPIDs:
+  - operator: NotIn
+    followForks: true
+    values:
+    - 0
+    - 1
   matchArgs:
   - index: 0
     operator: "Equal"
@@ -1321,13 +1958,13 @@ then we would build the following expression on the BPF side:
 In case of having multiple `matchArgs`:
 ```yaml
 selectors:
- - matchPIDs:
-   - operator: In
-     followForks: true
-     values:
-     - pid1
-     - pid2
-     - pid3
+- matchPIDs:
+  - operator: In
+    followForks: true
+    values:
+    - pid1
+    - pid2
+    - pid3
   matchArgs:
   - index: 0
     operator: "Equal"
@@ -1370,6 +2007,10 @@ There are different types supported for each operator. In case of `matchArgs`:
 * Protocol
 * Family
 * State
+* InRange - In interval range
+* NotInRange - Not in interval range
+* SubString - Substring match (v6.17+, requires the `bpf_strnstr` kfunc)
+* SubStringIgnoreCase - Substring match case-insensitive (v6.19+, requires the `bpf_strncasestr` kfunc)
 
 The operator types `Equal` and `NotEqual` are used to test whether the certain
 argument of a system call is equal to the defined value in the CR.
@@ -1447,7 +2088,8 @@ The operator `Prefix` checks if the certain argument starts with the defined val
 while the operator `Postfix` compares if the argument matches to the defined value
 as trailing.
 
-The operators relating to ports, addresses and protocol are used with sock or skb
+The operators relating to ports, addresses and protocol are used with sock, skb,
+sockaddr and socket
 types. Port operators can accept a range of ports specified as `min:max` as well
 as lists of individual ports. Address operators can accept IPv4/6 CIDR ranges as well
 as lists of individual addresses.
@@ -1463,6 +2105,20 @@ can be specified as either `AF_INET6` or 10.
 The `State` operator can accept integer values to match against or the equivalent
 TCP_ enumeration. For example, an established socket can be matched with
 `TCP_ESTABLISHED` or 1; a closed socket with `TCP_CLOSE` or 7.
+
+The `InRange` and `NotInRange` operators accept integer values that are within the
+specified range or NOT respectively. The range interval is specified with `:` separating
+minimum and maximum value and includes both values as part of range.
+
+For example following YAML snippet we match all values that are NOT `1,2,3,4 or 5`.
+
+```yaml
+matchArgs:
+- index: 2
+  operator: "NotInRange"
+  values:
+  - 1:5
+```
 
 In case of `matchPIDs`:
 
@@ -1529,13 +2185,13 @@ of `{binary0, binary1, binary2}`:
 When multiple selectors are configured they are logically `OR`d together.
 ```yaml
 selectors:
- - matchPIDs:
-   - operator: In
-     followForks: true
-     values:
-     - pid1
-     - pid2
-     - pid3
+- matchPIDs:
+  - operator: In
+    followForks: true
+    values:
+    - pid1
+    - pid2
+    - pid3
   matchArgs:
   - index: 0
     operator: "Equal"
@@ -1545,13 +2201,13 @@ selectors:
     operator: "lt"
     values:
     -  500
- - matchPIDs:
-   - operator: In
-     followForks: true
-     values:
-     - pid1
-     - pid2
-     - pid3
+- matchPIDs:
+  - operator: In
+    followForks: true
+    values:
+    - pid1
+    - pid2
+    - pid3
   matchArgs:
   - index: 0
     operator: "Equal"
@@ -1567,18 +2223,29 @@ The above would be executed in kernel as:
 
 ### Limitations
 
-{{% pageinfo %}}
-Those limitations might be outdated, see [issue #709](https://github.com/cilium/tetragon/issues/709).
-{{% /pageinfo %}}
-
 Because BPF must be bounded we have to place limits on how many selectors can
 exist.
 
-- Max Selectors 8.
+- Max Selectors 5.
 - Max PID values per selector 4
 - Max MatchArgs per selector 5 (one per index)
-- Max MatchArg Values per MatchArgs 1 (limiting initial implementation can bump
-  to 16 or so)
+- Max MatchArg Values per MatchArgs 4 (for operators like `Equal`, `NotEqual`,
+  `GT`, `LT`, etc.)
+- Max file match values (using `fd` or `file` arg): 8 on kernels ≥5.3, 2 on kernels <5.3
+- String prefix max length: 256 chars
+- String postfix max length: 128 chars
+
+For larger sets of values, consider using the `InMap` or `NotInMap`
+operators which store values in a BPF map.
+These are limited only by the amount of available memory.
+
+{{< caution >}} 
+The `InMap` and `NotInMap` operators also support the range notation described
+for the `InRange` operator. However, using range notation with `InMap` or
+`NotInMap` consumes more memory, because each value in the range is added
+individually to the map. For large ranges, prefer the `InRange` operator
+instead.
+{{< /caution >}}
 
 
 ## Return Actions filter

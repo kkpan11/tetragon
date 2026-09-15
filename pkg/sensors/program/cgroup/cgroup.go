@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package cgroup
 
 import (
 	"fmt"
 
-	"github.com/cilium/tetragon/pkg/sensors/program"
 	"golang.org/x/sys/unix"
+
+	"github.com/cilium/tetragon/pkg/sensors/program"
 )
 
 const (
@@ -20,14 +23,14 @@ var (
 
 func LoadSockOpt(
 	bpfDir string,
-	load *program.Program, verbose int,
+	load *program.Program, maps []*program.Map, verbose int,
 ) error {
-	return LoadCgroupProgram(bpfDir, load, verbose)
+	return LoadCgroupProgram(bpfDir, load, maps, verbose)
 }
 
 func LoadCgroupProgram(
 	bpfDir string,
-	load *program.Program, verbose int) error {
+	load *program.Program, maps []*program.Map, verbose int) error {
 	if fgsCgroupFD < 0 {
 		fd, err := unix.Open(fgsCgroupPath, unix.O_RDONLY, 0)
 		if err != nil {
@@ -35,5 +38,5 @@ func LoadCgroupProgram(
 		}
 		fgsCgroupFD = fd
 	}
-	return program.LoadProgram(bpfDir, load, program.RawAttach(fgsCgroupFD), verbose)
+	return program.LoadProgram(bpfDir, load, maps, program.RawAttach(fgsCgroupFD), verbose)
 }

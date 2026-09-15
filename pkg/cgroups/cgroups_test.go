@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build linux
+
 package cgroups
 
 import (
@@ -11,11 +13,12 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/cilium/tetragon/pkg/defaults"
-	"github.com/cilium/tetragon/pkg/mountinfo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+
+	"github.com/cilium/tetragon/pkg/defaults"
+	"github.com/cilium/tetragon/pkg/mountinfo"
 )
 
 func isDirMountFsType(path string, mntType string) (bool, error) {
@@ -102,8 +105,27 @@ func TestCgroupNameFromCStr(t *testing.T) {
 	}
 }
 
-func TestParseCgroupSubSysIds(t *testing.T) {
+// Ensure that Cgroupv1 controllers discovery fails if no 'cpuset' and no 'memory'
+func TestParseCgroupSubSysIdsWithoutMemoryCpuset(t *testing.T) {
+	testDir := t.TempDir()
+	invalidCgroupv1Controllers :=
+		`
+#subsys_name	hierarchy	num_cgroups	enabled
+cpu	6	78	1
+cpuacct	6	78	1
+blkio	4	78	1
+perf_event	8	2	1
+`
 
+	file := filepath.Join(testDir, "testfile")
+	err := os.WriteFile(file, []byte(invalidCgroupv1Controllers), 0644)
+	require.NoError(t, err)
+
+	err = parseCgroupv1SubSysIds(file)
+	require.Error(t, err)
+}
+
+func TestParseCgroupSubSysIds(t *testing.T) {
 	testDir := t.TempDir()
 
 	d := struct {
@@ -131,23 +153,42 @@ misc	10	1	1
 	err := os.WriteFile(file, []byte(d.data), 0644)
 	require.NoError(t, err)
 
-	err = parseCgroupSubSysIds(file)
+	err = parseCgroupv1SubSysIds(file)
 	require.NoError(t, err)
 	for _, c := range CgroupControllers {
 		if strings.Contains(d.used, c.Name) {
-			require.Equal(t, true, c.Active)
+			require.True(t, c.Active)
 			require.NotZero(t, c.Id)
 		} else {
-			require.Equal(t, false, c.Active)
+			require.False(t, c.Active)
 			require.Zero(t, c.Id)
 		}
 	}
 }
 
+func TestCheckCgroupv2Controllers(t *testing.T) {
+	testDir := t.TempDir()
+	emptyControllers := ""
+
+	file := filepath.Join(testDir, "cgroup.controllers")
+	err := os.WriteFile(file, []byte(emptyControllers), 0644)
+	require.NoError(t, err)
+
+	err = checkCgroupv2Controllers(testDir)
+	require.Error(t, err)
+
+	controllers := "cpuset cpu io memory hugetlb pids rdma misc"
+	err = os.WriteFile(file, []byte(controllers), 0644)
+	require.NoError(t, err)
+
+	err = checkCgroupv2Controllers(testDir)
+	require.NoError(t, err)
+}
+
 // Test cgroup mode detection on an invalid directory
 func TestDetectCgroupModeInvalid(t *testing.T) {
 	mode, err := detectCgroupMode("invalid-cgroupfs-path")
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Equal(t, CGROUP_UNDEF, mode)
 }
 
@@ -161,11 +202,12 @@ func TestDetectCgroupModeDefault(t *testing.T) {
 	}
 
 	mode, err := detectCgroupMode(defaultCgroupRoot)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	if st.Type == unix.CGROUP2_SUPER_MAGIC {
+	switch st.Type {
+	case unix.CGROUP2_SUPER_MAGIC:
 		assert.Equal(t, CGROUP_UNIFIED, mode)
-	} else if st.Type == unix.TMPFS_MAGIC {
+	case unix.TMPFS_MAGIC:
 		unified := filepath.Join(defaultCgroupRoot, "unified")
 		err = syscall.Statfs(unified, &st)
 		if err == nil && st.Type == unix.CGROUP2_SUPER_MAGIC {
@@ -173,12 +215,12 @@ func TestDetectCgroupModeDefault(t *testing.T) {
 
 			// Extra detection
 			mode, err = detectCgroupMode(unified)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, CGROUP_UNIFIED, mode)
 		} else {
 			assert.Equal(t, CGROUP_LEGACY, mode)
 		}
-	} else {
+	default:
 		t.Errorf("TestDetectCgroupModeDefault() failed Cgroupfs %s type failed:  want:%d or %d -  got:%d",
 			defaultCgroupRoot, unix.CGROUP2_SUPER_MAGIC, unix.TMPFS_MAGIC, st.Type)
 	}
@@ -188,14 +230,14 @@ func TestDetectCgroupModeDefault(t *testing.T) {
 func TestDetectCgroupModeCustomLocation(t *testing.T) {
 	// We also mount cgroup2 on /run/tetragon/cgroup2 let's test it
 	mounted, err := isDirMountFsType(defaults.Cgroup2Dir, mountinfo.FilesystemTypeCgroup2)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	mode, err := detectCgroupMode(defaults.Cgroup2Dir)
 	if mounted {
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, CGROUP_UNIFIED, mode)
 	} else {
-		assert.Error(t, err)
+		require.Error(t, err)
 		assert.Equal(t, CGROUP_UNDEF, mode)
 	}
 }
@@ -208,7 +250,7 @@ func TestDetectCgroupModeCustomLocation(t *testing.T) {
 // they are properly set.
 func TestDetectCgroupMode(t *testing.T) {
 	mode, err := DetectCgroupMode()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.NotEqual(t, CGROUP_UNDEF, mode)
 	assert.NotEqual(t, CGROUP_UNDEF, cgroupMode)
 	assert.NotEmpty(t, cgroupFSPath)
@@ -222,25 +264,26 @@ func TestDetectCgroupMode(t *testing.T) {
 // TODO Setup multiple cgroupv1 and cgroupv2 combinations
 func TestDetectCgroupFSMagic(t *testing.T) {
 	fs, err := DetectCgroupFSMagic()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.NotEqual(t, CGROUP_UNDEF, fs)
-	if cgroupMode == CGROUP_UNIFIED {
+	switch cgroupMode {
+	case CGROUP_UNIFIED:
 		assert.Equal(t, uint64(unix.CGROUP2_SUPER_MAGIC), fs)
-	} else if cgroupMode == CGROUP_HYBRID {
+	case CGROUP_HYBRID:
 		assert.Equal(t, uint64(unix.CGROUP_SUPER_MAGIC), fs)
 		mounted, err := isDirMountFsType(filepath.Join(cgroupFSPath, "unified"), mountinfo.FilesystemTypeCgroup2)
-		assert.NoError(t, err)
-		assert.Equal(t, true, mounted)
-	} else if cgroupMode == CGROUP_LEGACY {
+		require.NoError(t, err)
+		assert.True(t, mounted)
+	case CGROUP_LEGACY:
 		assert.Equal(t, uint64(unix.CGROUP_SUPER_MAGIC), fs)
-	} else {
+	default:
 		t.Errorf("Test failed to get Cgroup filesystem %s type", cgroupFSPath)
 	}
 
 	assert.NotEqual(t, uint64(CGROUP_UNDEF), GetCgroupFSMagic())
 	assert.NotEmpty(t, CgroupFsMagicStr(fs))
 	assert.NotEmpty(t, GetCgroupFSPath())
-	assert.Equal(t, true, filepath.IsAbs(GetCgroupFSPath()))
+	assert.True(t, filepath.IsAbs(GetCgroupFSPath()))
 }
 
 // Test discovery of compiled-in Cgroups controllers
@@ -248,13 +291,13 @@ func TestDetectCgroupFSMagic(t *testing.T) {
 // - We properly discover compiled-in cgroup controllers
 // - Their hierarchy IDs
 // - Their css index
-func TestDiscoverSubSysIdsDefault(t *testing.T) {
+func TestDiscoverCgroupv1SubSysIdsDefault(t *testing.T) {
 	fs, err := DetectCgroupFSMagic()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.NotEqual(t, CGROUP_UNDEF, fs)
 
 	err = DiscoverSubSysIds()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	accessFs := false
 	fixed := false
@@ -263,43 +306,45 @@ func TestDiscoverSubSysIdsDefault(t *testing.T) {
 	if err == nil {
 		accessFs = true
 	}
+
+	/* Let's skip now as we are interested only in Cgroupv1 for asserting controllers index */
+	if cgroupMode == CGROUP_UNIFIED {
+		return
+	}
+
 	for _, controller := range CgroupControllers {
 		if accessFs {
-			if cgroupMode == CGROUP_UNIFIED {
-				assert.EqualValues(t, 0, controller.Id, "Cgroupv2 Controller '%s' hierarchy ID should be O as it is Unified Cgroup", controller.Name)
-			} else {
-				assert.NotEqualValues(t, 0, controller.Id, "Cgroupv1 Controller '%s' hierarchy ID should not be zero", controller.Name)
-			}
+			assert.NotEqualValues(t, 0, controller.Id, "Cgroupv1 Controller '%s' hierarchy ID should not be zero", controller.Name)
 		}
 
 		if controller.Active {
 			fixed = true
 
-			// If those controllers are active let's check their css index
+			// If those controllers are active and we are in cgroupv1 let's check their css index
 			if controller.Name == "memory" || controller.Name == "pids" {
 				assert.NotEqualValues(t, 0, controller.Idx, "Cgroup Controller '%s' css index should not be zero", controller.Name)
 			}
 		}
 	}
 
-	assert.Equalf(t, true, fixed, "TestDiscoverSubSysIdsDefault() could not detect and fix compiled Cgroup controllers")
+	assert.Truef(t, fixed, "TestDiscoverSubSysIdsDefault() could not detect active cgroup controllers")
 }
 
 func TestGetCgroupIdFromPath(t *testing.T) {
 	mode, err := DetectCgroupMode()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.NotEqual(t, CGROUP_UNDEF, mode)
 
 	err = DiscoverSubSysIds()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	pid := os.Getpid()
 	path, err := findMigrationPath(uint32(pid))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.NotEmpty(t, path)
 
 	id, err := GetCgroupIdFromPath(path)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.NotZero(t, id)
 
 	// Log data useful to inspect different hierarchies

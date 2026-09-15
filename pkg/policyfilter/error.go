@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !nok8s
+
 package policyfilter
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/cilium/tetragon/pkg/metrics/policyfiltermetrics"
 )
 
-// podNamespaceConflictErr: even if a pod changes, we expect the namespace to remain the same
-type podNamespaceConflictErr struct {
+// podNamespaceConflictError: even if a pod changes, we expect the namespace to remain the same
+type podNamespaceConflictError struct {
 	podID        PodID
 	oldNs, newNs string
 }
 
-func (e *podNamespaceConflictErr) Error() string {
+func (e *podNamespaceConflictError) Error() string {
 	return fmt.Sprintf("conflicting namespaces for pod with id '%s': old='%s' vs new='%s'",
 		e.podID.String(), e.oldNs, e.newNs)
 }
@@ -25,10 +28,9 @@ func ErrorLabel(err error) string {
 	if err == nil {
 		return policyfiltermetrics.NoErr.String()
 	}
-	switch err.(type) {
-	case *podNamespaceConflictErr:
+
+	if _, ok := errors.AsType[*podNamespaceConflictError](err); ok {
 		return policyfiltermetrics.PodNamespaceConflictErr.String()
-	default:
-		return policyfiltermetrics.GenericErr.String()
 	}
+	return policyfiltermetrics.GenericErr.String()
 }

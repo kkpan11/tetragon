@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 import (
@@ -9,33 +11,43 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"path"
+	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/cilium/ebpf"
+	ciliumbtf "github.com/cilium/ebpf/btf"
+	lru "github.com/hashicorp/golang-lru/v2"
+
+	tetragon "github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/api/ops"
 	"github.com/cilium/tetragon/pkg/api/processapi"
 	api "github.com/cilium/tetragon/pkg/api/tracingapi"
 	"github.com/cilium/tetragon/pkg/arch"
+	"github.com/cilium/tetragon/pkg/asm"
 	"github.com/cilium/tetragon/pkg/bpf"
 	"github.com/cilium/tetragon/pkg/btf"
+	"github.com/cilium/tetragon/pkg/celbpf"
+	"github.com/cilium/tetragon/pkg/cgtracker"
+	"github.com/cilium/tetragon/pkg/config"
 	"github.com/cilium/tetragon/pkg/eventhandler"
 	"github.com/cilium/tetragon/pkg/grpc/tracing"
 	"github.com/cilium/tetragon/pkg/idtable"
 	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
-	"github.com/cilium/tetragon/pkg/kernels"
+	"github.com/cilium/tetragon/pkg/ksyms"
 	"github.com/cilium/tetragon/pkg/logger"
-	"github.com/cilium/tetragon/pkg/metrics/kprobemetrics"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
 	"github.com/cilium/tetragon/pkg/observer"
 	"github.com/cilium/tetragon/pkg/option"
 	"github.com/cilium/tetragon/pkg/policyfilter"
 	"github.com/cilium/tetragon/pkg/selectors"
 	"github.com/cilium/tetragon/pkg/sensors"
+	"github.com/cilium/tetragon/pkg/sensors/base"
 	"github.com/cilium/tetragon/pkg/sensors/program"
-	lru "github.com/hashicorp/golang-lru/v2"
-	"github.com/sirupsen/logrus"
 
 	gt "github.com/cilium/tetragon/pkg/generictypes"
 )
@@ -52,32 +64,6 @@ func init() {
 	observer.RegisterEventHandlerAtInit(ops.MSG_OP_GENERIC_KPROBE, handleGenericKprobe)
 }
 
-const (
-	CharBufErrorENOMEM      = -1
-	CharBufErrorPageFault   = -2
-	CharBufErrorTooLarge    = -3
-	CharBufSavedForRetprobe = -4
-
-	// The following values could be fine tuned if either those feature use too
-	// much kernel memory when enabled.
-	stackTraceMapMaxEntries = 32768
-	ratelimitMapMaxEntries  = 32768
-	fdInstallMapMaxEntries  = 32000
-	enforcerMapMaxEntries   = 32768
-)
-
-func kprobeCharBufErrorToString(e int32) string {
-	switch e {
-	case CharBufErrorENOMEM:
-		return "CharBufErrorENOMEM"
-	case CharBufErrorTooLarge:
-		return "CharBufErrorBufTooLarge"
-	case CharBufErrorPageFault:
-		return "CharBufErrorPageFault"
-	}
-	return "CharBufErrorUnknown"
-}
-
 type kprobeSelectors struct {
 	entry *selectors.KernelSelectorState
 	retrn *selectors.KernelSelectorState
@@ -88,11 +74,6 @@ type kprobeLoadArgs struct {
 	retprobe  bool
 	syscall   bool
 	config    *api.EventConfig
-}
-
-type pendingEventKey struct {
-	eventId    uint64
-	ktimeEnter uint64
 }
 
 type genericKprobeData struct {
@@ -107,19 +88,18 @@ type genericKprobe struct {
 	argSigPrinters    []argPrinter
 	argReturnPrinters []argPrinter
 	funcName          string
+	instance          InstanceID
 
 	// for kprobes that have a retprobe, we maintain the enter events in
 	// the map, so that we can merge them when the return event is
 	// generated. The events are maintained in the map below, using
 	// the retprobe_id (thread_id) and the enter ktime as the key.
-	pendingEvents *lru.Cache[pendingEventKey, pendingEvent]
+	pendingEvents *lru.Cache[pendingEventKey, pendingEvent[*tracing.MsgGenericKprobeUnix]]
 
 	tableId idtable.EntryID
 
 	// for kprobes that have a GetUrl or DnsLookup action, we store the table of arguments.
 	actionArgs idtable.Table
-
-	pinPathPrefix string
 
 	// policyName is the name of the policy that this tracepoint belongs to
 	policyName string
@@ -133,6 +113,9 @@ type genericKprobe struct {
 	// is there override defined for the kprobe
 	hasOverride bool
 
+	// is there selector defined for the kprobe
+	hasSelector bool
+
 	// sensor specific data that we need when we process event, so it's
 	// unique for each kprobeEntry when we use single kprobes and it's
 	// ont global instance when we use kprobe multi
@@ -143,23 +126,19 @@ type genericKprobe struct {
 	// for each kprobe when using single kprobes.
 	hasStackTrace bool
 
-	// is there ratelimit defined in the kprobe
-	hasRatelimit bool
-
 	customHandler eventhandler.Handler
-}
-
-// pendingEvent is an event waiting to be merged with another event.
-// This is needed for retprobe probes that generate two events: one at the
-// function entry, and one at the function return. We merge these events into
-// one, before returning it to the user.
-type pendingEvent struct {
-	ev          *tracing.MsgGenericKprobeUnix
-	returnEvent bool
 }
 
 func (g *genericKprobe) SetID(id idtable.EntryID) {
 	g.tableId = id
+}
+
+func (g *genericKprobe) LogAttrs(level slog.Level, msg string, attrs ...slog.Attr) {
+	attrs = append(attrs,
+		slog.Attr{Key: "policy_name", Value: slog.StringValue(g.policyName)},
+		slog.Attr{Key: "func_name", Value: slog.StringValue(g.funcName)},
+	)
+	logger.GetLogger().LogAttrs(context.Background(), level, msg, attrs...)
 }
 
 var (
@@ -183,10 +162,6 @@ var (
 	MaxFilterIntArgs = 8
 )
 
-func multiKprobePinPath(sensorPath string) string {
-	return sensors.PathJoin(sensorPath, "multi_kprobe")
-}
-
 func getProgramSelector(load *program.Program, kprobeEntry *genericKprobe) *selectors.KernelSelectorState {
 	if kprobeEntry != nil {
 		if load.RetProbe {
@@ -197,83 +172,7 @@ func getProgramSelector(load *program.Program, kprobeEntry *genericKprobe) *sele
 	return nil
 }
 
-func filterMaps(load *program.Program, pinPath string, kprobeEntry *genericKprobe) []*program.Map {
-	var maps []*program.Map
-
-	/*
-	 * If we got passed genericKprobe != nil we can make selector map fixes
-	 * related to the kernel version. We pass nil for multi kprobes but as
-	 * they are added in later kernels than 5.9, there's no fixing needed.
-	 */
-	state := getProgramSelector(load, kprobeEntry)
-
-	argFilterMaps := program.MapBuilderPin("argfilter_maps", sensors.PathJoin(pinPath, "argfilter_maps"), load)
-	if state != nil && !kernels.MinKernelVersion("5.9") {
-		// Versions before 5.9 do not allow inner maps to have different sizes.
-		// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
-		maxEntries := state.ValueMapsMaxEntries()
-		argFilterMaps.SetInnerMaxEntries(maxEntries)
-	}
-	maps = append(maps, argFilterMaps)
-
-	addr4FilterMaps := program.MapBuilderPin("addr4lpm_maps", sensors.PathJoin(pinPath, "addr4lpm_maps"), load)
-	if state != nil && !kernels.MinKernelVersion("5.9") {
-		// Versions before 5.9 do not allow inner maps to have different sizes.
-		// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
-		maxEntries := state.Addr4MapsMaxEntries()
-		addr4FilterMaps.SetInnerMaxEntries(maxEntries)
-	}
-	maps = append(maps, addr4FilterMaps)
-
-	addr6FilterMaps := program.MapBuilderPin("addr6lpm_maps", sensors.PathJoin(pinPath, "addr6lpm_maps"), load)
-	if state != nil && !kernels.MinKernelVersion("5.9") {
-		// Versions before 5.9 do not allow inner maps to have different sizes.
-		// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
-		maxEntries := state.Addr6MapsMaxEntries()
-		addr6FilterMaps.SetInnerMaxEntries(maxEntries)
-	}
-	maps = append(maps, addr6FilterMaps)
-
-	var stringFilterMap [selectors.StringMapsNumSubMaps]*program.Map
-	numSubMaps := selectors.StringMapsNumSubMaps
-	if !kernels.MinKernelVersion("5.11") {
-		numSubMaps = selectors.StringMapsNumSubMapsSmall
-	}
-
-	for string_map_index := 0; string_map_index < numSubMaps; string_map_index++ {
-		stringFilterMap[string_map_index] = program.MapBuilderPin(fmt.Sprintf("string_maps_%d", string_map_index),
-			sensors.PathJoin(pinPath, fmt.Sprintf("string_maps_%d", string_map_index)), load)
-		if state != nil && !kernels.MinKernelVersion("5.9") {
-			// Versions before 5.9 do not allow inner maps to have different sizes.
-			// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
-			maxEntries := state.StringMapsMaxEntries(string_map_index)
-			stringFilterMap[string_map_index].SetInnerMaxEntries(maxEntries)
-		}
-		maps = append(maps, stringFilterMap[string_map_index])
-	}
-
-	stringPrefixFilterMaps := program.MapBuilderPin("string_prefix_maps", sensors.PathJoin(pinPath, "string_prefix_maps"), load)
-	if state != nil && !kernels.MinKernelVersion("5.9") {
-		// Versions before 5.9 do not allow inner maps to have different sizes.
-		// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
-		maxEntries := state.StringPrefixMapsMaxEntries()
-		stringPrefixFilterMaps.SetInnerMaxEntries(maxEntries)
-	}
-	maps = append(maps, stringPrefixFilterMaps)
-
-	stringPostfixFilterMaps := program.MapBuilderPin("string_postfix_maps", sensors.PathJoin(pinPath, "string_postfix_maps"), load)
-	if state != nil && !kernels.MinKernelVersion("5.9") {
-		// Versions before 5.9 do not allow inner maps to have different sizes.
-		// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
-		maxEntries := state.StringPostfixMapsMaxEntries()
-		stringPostfixFilterMaps.SetInnerMaxEntries(maxEntries)
-	}
-	maps = append(maps, stringPostfixFilterMaps)
-
-	return maps
-}
-
-func createMultiKprobeSensor(sensorPath, policyName string, multiIDs []idtable.EntryID, has hasMaps) ([]*program.Program, []*program.Map, error) {
+func createMultiKprobeSensor(polInfo *policyInfo, multiIDs []idtable.EntryID, has hasMaps) ([]*program.Program, []*program.Map, error) {
 	var multiRetIDs []idtable.EntryID
 	var progs []*program.Program
 	var maps []*program.Map
@@ -291,87 +190,85 @@ func createMultiKprobeSensor(sensorPath, policyName string, multiIDs []idtable.E
 		gk.data = data
 
 		has.stackTrace = has.stackTrace || gk.hasStackTrace
-		has.rateLimit = has.rateLimit || gk.hasRatelimit
 	}
 
-	loadProgName := "bpf_multi_kprobe_v53.o"
-	loadProgRetName := "bpf_multi_retkprobe_v53.o"
-	if kernels.EnableV61Progs() {
-		loadProgName = "bpf_multi_kprobe_v61.o"
-		loadProgRetName = "bpf_multi_retkprobe_v61.o"
-	} else if kernels.MinKernelVersion("5.11") {
-		loadProgName = "bpf_multi_kprobe_v511.o"
-		loadProgRetName = "bpf_multi_retkprobe_v511.o"
-	}
-
-	pinPath := multiKprobePinPath(sensorPath)
+	loadProgName, loadProgRetName := config.GenericKprobeObjs(true)
 
 	load := program.Builder(
 		path.Join(option.Config.HubbleLib, loadProgName),
-		fmt.Sprintf("%d functions", len(multiIDs)),
+		fmt.Sprintf("kprobe_multi (%d functions)", len(multiIDs)),
 		"kprobe.multi/generic_kprobe",
-		pinPath,
+		"multi_kprobe",
 		"generic_kprobe").
-		SetLoaderData(multiIDs)
+		SetLoaderData(multiIDs).
+		SetPolicy(polInfo.name)
 	progs = append(progs, load)
 
-	fdinstall := program.MapBuilderPin("fdinstall_map", sensors.PathJoin(sensorPath, "fdinstall_map"), load)
-	if has.fdInstall {
-		fdinstall.SetMaxEntries(fdInstallMapMaxEntries)
-	}
-	maps = append(maps, fdinstall)
-
-	configMap := program.MapBuilderPin("config_map", sensors.PathJoin(pinPath, "config_map"), load)
+	configMap := program.MapBuilderProgram("config_map", load)
 	maps = append(maps, configMap)
 
-	tailCalls := program.MapBuilderPin("kprobe_calls", sensors.PathJoin(pinPath, "kp_calls"), load)
+	tailCalls := program.MapBuilderProgram("kprobe_calls", load)
 	maps = append(maps, tailCalls)
 
-	filterMap := program.MapBuilderPin("filter_map", sensors.PathJoin(pinPath, "filter_map"), load)
+	filterMap := program.MapBuilderProgram("filter_map", load)
 	maps = append(maps, filterMap)
 
-	maps = append(maps, filterMaps(load, pinPath, nil)...)
+	if has.selector {
+		maps = append(maps, createSelectorMaps(load, nil)...)
 
-	retProbe := program.MapBuilderPin("retprobe_map", sensors.PathJoin(pinPath, "retprobe_map"), load)
-	maps = append(maps, retProbe)
+		selMatchBinariesMap := program.MapBuilderProgram("tg_mb_sel_opts", load)
+		maps = append(maps, selMatchBinariesMap)
+	}
 
-	callHeap := program.MapBuilderPin("process_call_heap", sensors.PathJoin(pinPath, "process_call_heap"), load)
+	if len(multiRetIDs) != 0 {
+		retProbe := program.MapBuilderSensor("retprobe_map", load)
+		maps = append(maps, retProbe)
+	}
+
+	callHeap := program.MapBuilderSensor("process_call_heap", load)
 	maps = append(maps, callHeap)
 
-	selMatchBinariesMap := program.MapBuilderPin("tg_mb_sel_opts", sensors.PathJoin(pinPath, "tg_mb_sel_opts"), load)
-	maps = append(maps, selMatchBinariesMap)
-
-	matchBinariesPaths := program.MapBuilderPin("tg_mb_paths", sensors.PathJoin(pinPath, "tg_mb_paths"), load)
-	maps = append(maps, matchBinariesPaths)
-
-	stackTraceMap := program.MapBuilderPin("stack_trace_map", sensors.PathJoin(pinPath, "stack_trace_map"), load)
 	if has.stackTrace {
+		stackTraceMap := program.MapBuilderProgram("stack_trace_map", load)
 		stackTraceMap.SetMaxEntries(stackTraceMapMaxEntries)
+		maps = append(maps, stackTraceMap)
+		data.stackTraceMap = stackTraceMap
 	}
-	maps = append(maps, stackTraceMap)
-	data.stackTraceMap = stackTraceMap
 
-	if kernels.EnableLargeProgs() {
-		socktrack := program.MapBuilderPin("socktrack_map", sensors.PathJoin(sensorPath, "socktrack_map"), load)
+	if config.EnableLargeProgs() {
+		socktrack := program.MapBuilderSensor("socktrack_map", load)
+		if has.sockTrack {
+			socktrack.SetMaxEntries(socktrackMapMaxEntries)
+		}
 		maps = append(maps, socktrack)
 	}
 
-	if kernels.EnableLargeProgs() {
-		ratelimitMap := program.MapBuilderPin("ratelimit_map", sensors.PathJoin(pinPath, "ratelimit_map"), load)
+	if config.EnableLargeProgs() {
+		ratelimitMap := program.MapBuilderSensor("ratelimit_map", load)
 		if has.rateLimit {
 			ratelimitMap.SetMaxEntries(ratelimitMapMaxEntries)
 		}
 		maps = append(maps, ratelimitMap)
 	}
 
-	enforcerDataMap := enforcerMap(policyName, load)
 	if has.enforcer {
-		enforcerDataMap.SetMaxEntries(enforcerMapMaxEntries)
+		maps = append(maps, enforcerMapsUser(load)...)
 	}
-	maps = append(maps, enforcerDataMap)
+
+	if option.Config.EnableCgTrackerID {
+		maps = append(maps, program.MapUser(cgtracker.MapName, load))
+	}
 
 	filterMap.SetMaxEntries(len(multiIDs))
 	configMap.SetMaxEntries(len(multiIDs))
+
+	if has.override {
+		overrideTasksMap := program.MapBuilderProgram("override_tasks", load)
+		overrideTasksMap.SetMaxEntries(overrideMapMaxEntries)
+		maps = append(maps, overrideTasksMap)
+	}
+
+	maps = append(maps, polInfo.policyConfMap(load), polInfo.selectorStatsMap(load))
 
 	if len(multiRetIDs) != 0 {
 		loadret := program.Builder(
@@ -381,33 +278,33 @@ func createMultiKprobeSensor(sensorPath, policyName string, multiIDs []idtable.E
 			"multi_retkprobe",
 			"generic_kprobe").
 			SetRetProbe(true).
-			SetLoaderData(multiRetIDs)
+			SetLoaderData(multiRetIDs).
+			SetPolicy(polInfo.name)
 		progs = append(progs, loadret)
 
-		retProbe := program.MapBuilderPin("retprobe_map", sensors.PathJoin(pinPath, "retprobe_map"), loadret)
+		retProbe := program.MapBuilderSensor("retprobe_map", loadret)
 		maps = append(maps, retProbe)
 
-		retConfigMap := program.MapBuilderPin("config_map", sensors.PathJoin(pinPath, "retprobe_config_map"), loadret)
+		retConfigMap := program.MapBuilderProgram("config_map", loadret)
 		maps = append(maps, retConfigMap)
 
-		retFilterMap := program.MapBuilderPin("filter_map", sensors.PathJoin(pinPath, "retprobe_filter_map"), loadret)
+		retFilterMap := program.MapBuilderProgram("filter_map", loadret)
 		maps = append(maps, retFilterMap)
 
-		maps = append(maps, filterMaps(loadret, pinPath, nil)...)
+		if has.selector {
+			maps = append(maps, createSelectorMaps(loadret, nil)...)
+		}
 
-		callHeap := program.MapBuilderPin("process_call_heap", sensors.PathJoin(pinPath, "process_call_heap"), loadret)
+		callHeap := program.MapBuilderSensor("process_call_heap", loadret)
 		maps = append(maps, callHeap)
 
-		fdinstall := program.MapBuilderPin("fdinstall_map", sensors.PathJoin(sensorPath, "fdinstall_map"), loadret)
-		if has.fdInstall {
-			fdinstall.SetMaxEntries(fdInstallMapMaxEntries)
+		socktrack := program.MapBuilderSensor("socktrack_map", loadret)
+		if has.sockTrack {
+			socktrack.SetMaxEntries(socktrackMapMaxEntries)
 		}
-		maps = append(maps, fdinstall)
-
-		socktrack := program.MapBuilderPin("socktrack_map", sensors.PathJoin(sensorPath, "socktrack_map"), loadret)
 		maps = append(maps, socktrack)
 
-		tailCalls := program.MapBuilderPin("retkprobe_calls", sensors.PathJoin(pinPath, "retprobe-kp_calls"), loadret)
+		tailCalls := program.MapBuilderProgram("retkprobe_calls", loadret)
 		maps = append(maps, tailCalls)
 
 		retConfigMap.SetMaxEntries(len(multiRetIDs))
@@ -417,112 +314,176 @@ func createMultiKprobeSensor(sensorPath, policyName string, multiIDs []idtable.E
 	return progs, maps, nil
 }
 
+func validateKprobeType(ty string) error {
+	invalidArgTypes := []string{"auto", "syscall64"}
+	if slices.Contains(invalidArgTypes, ty) {
+		return fmt.Errorf("type '%s' is invalid for kprobes", ty)
+	}
+	return nil
+}
+
+type kpValidateInfo struct {
+	calls        []string
+	syscall      bool
+	ignore       bool
+	ignoredCount int
+}
+
+func validateOverride(
+	f *v1alpha1.KProbeSpec,
+	funcName string,
+	useMulti bool,
+) error {
+	isSecurityFunc := strings.HasPrefix(funcName, "security_")
+
+	if isSecurityFunc {
+		// LSM functions
+		if !bpf.HasModifyReturn() {
+			return errors.New("override action not supported on security_ hooks, fmod_ret not available")
+		}
+
+		if useMulti {
+			return fmt.Errorf("can't override '%s' function with kprobe_multi, use --%s option", funcName, option.KeyDisableKprobeMulti)
+		}
+	} else if f.Syscall {
+		if !bpf.HasOverrideHelper() {
+			return errors.New("override action not supported on syscalls, bpf_override_return helper not available")
+		}
+	} else {
+		return errors.New("override action can be used only with syscalls and security_ hooks")
+	}
+
+	return nil
+}
+
+func preValidateKprobe(
+	log logger.FieldLogger,
+	f *v1alpha1.KProbeSpec,
+	ks *ksyms.Ksyms,
+	btfobj *btf.Spec,
+	lists []v1alpha1.ListSpec,
+) (*kpValidateInfo, error) {
+	isSyscall := f.Syscall
+	var calls []string
+	// the f.Call is either defined as list:NAME
+	// or specifies directly the function
+	if isL, list := isList(f.Call, lists); isL {
+		if list == nil {
+			return nil, fmt.Errorf("error list '%s' not found", f.Call)
+		}
+		var err error
+		calls, err = getListSymbols(list)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get symbols from list '%s': %w", f.Call, err)
+		}
+		if isSyscallListType(list.Type) {
+			isSyscall = true
+		}
+	} else {
+		calls = []string{f.Call}
+		if f.Syscall {
+			// modifying f.Call directly since BTF validation
+			// later will use v1alpha1.KProbeSpec object
+			prefixedName, err := arch.AddSyscallPrefix(f.Call)
+			if err != nil {
+				log.Warn("kprobe spec pre-validation of syscall prefix failed, continuing with original name", logfields.Error, err)
+			} else {
+				calls[0] = prefixedName
+			}
+		}
+	}
+
+	for sid, selector := range f.Selectors {
+		for mid, matchAction := range selector.MatchActions {
+			if (matchAction.KernelStackTrace || matchAction.UserStackTrace) && matchAction.Action != "Post" {
+				return nil, fmt.Errorf("kernelStackTrace or userStackTrace can only be used along Post action: got (kernelStackTrace/userStackTrace) enabled in selectors[%d].matchActions[%d] with action '%s'", sid, mid, matchAction.Action)
+			}
+		}
+	}
+
+	if selectors.HasSigkillAction(f) && !config.EnableLargeProgs() {
+		return nil, errors.New("sigkill action requires kernel >= 5.3.0")
+	}
+
+	retCalls := make([]string, 0, len(calls))
+	ignored := 0
+	for idx, call := range calls {
+		var warn *btf.ValidationWarnError
+		var failed *btf.ValidationFailedError
+
+		// Now go over BTF validation
+		err := btf.ValidateKprobeSpec(btfobj, call, f, ks)
+		switch {
+		case err == nil:
+		case errors.As(err, &warn):
+			log.Warn("kprobe spec pre-validation issued a warning, but will continue with loading", logfields.Error, warn)
+		case errors.As(err, &failed):
+			if f.Ignore != nil && f.Ignore.CallNotFound && errors.Is(err, ciliumbtf.ErrNotFound) {
+				log.Info("kprobe call ignored because it was not found", "idx", idx, "call", call)
+				ignored++
+				continue
+			}
+			return nil, fmt.Errorf("kprobe spec pre-validation failed: %w", failed)
+		default:
+			log.Warn("kprobe spec pre-validation returned an error, but will continue with loading", logfields.Error, err)
+		}
+		retCalls = append(retCalls, call)
+	}
+
+	for idxArg, arg := range f.Args {
+		if err := validateKprobeType(arg.Type); err != nil {
+			return nil, fmt.Errorf("args[%d].type: %w", idxArg, err)
+		}
+	}
+
+	return &kpValidateInfo{
+		calls:        retCalls,
+		syscall:      isSyscall,
+		ignore:       ignored == len(calls), // if all calls were ignored, ignore the whole kprobe
+		ignoredCount: ignored,
+	}, nil
+}
+
 // preValidateKprobes pre-validates the semantics and BTF information of a Kprobe spec
-//
-// Pre validate the kprobe semantics and BTF information in order to separate
-// the kprobe errors from BPF related ones.
-func preValidateKprobes(name string, kprobes []v1alpha1.KProbeSpec, lists []v1alpha1.ListSpec) error {
+// Furthermore, it does some preprocessing of the calls and returns one kpValidateInfo struct per
+// kprobe. It also validates that if any selector uses NotifyEnforcer action, the spec contains enforcers.
+func preValidateKprobes(log logger.FieldLogger, kprobes []v1alpha1.KProbeSpec, lists []v1alpha1.ListSpec, enforcers []v1alpha1.EnforcerSpec) ([]*kpValidateInfo, error) {
 	btfobj, err := btf.NewBTF()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// validate lists first
 	err = preValidateLists(lists)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	// get kernel symbols
+	ks, err := ksyms.KernelSymbols()
+	if err != nil {
+		return nil, fmt.Errorf("validateKprobeSpec: ksyms.KernelSymbols: %w", err)
+	}
+
+	// If the NotifyEnforcer action is specified, there must be at least one enforcer.
+	for _, kprobe := range kprobes {
+		if selectors.HasNotifyEnforcerAction(kprobe.Selectors) {
+			if len(enforcers) == 0 {
+				return nil, errors.New("NotifyEnforcer action specified, but spec contains no enforcers")
+			}
+		}
+	}
+
+	ret := make([]*kpValidateInfo, len(kprobes))
 	for i := range kprobes {
-		f := &kprobes[i]
-
-		var list *v1alpha1.ListSpec
-
-		// the f.Call is either defined as list:NAME
-		// or specifies directly the function
-		if strings.HasPrefix(f.Call, "list:") {
-			listName := f.Call[len("list:"):]
-
-			list = getList(listName, lists)
-			if list == nil {
-				return fmt.Errorf("Error list '%s' not found", listName)
-			}
-		} else if f.Syscall {
-			// modifying f.Call directly since BTF validation
-			// later will use v1alpha1.KProbeSpec object
-			prefixedName, err := arch.AddSyscallPrefix(f.Call)
-			if err != nil {
-				logger.GetLogger().WithFields(logrus.Fields{
-					"sensor": name,
-				}).WithError(err).Warn("Kprobe spec pre-validation of syscall prefix failed")
-			} else {
-				f.Call = prefixedName
-			}
-		}
-
-		for sid, selector := range f.Selectors {
-			for mid, matchAction := range selector.MatchActions {
-				if (matchAction.KernelStackTrace || matchAction.UserStackTrace) && matchAction.Action != "Post" {
-					return fmt.Errorf("kernelStackTrace or userStackTrace can only be used along Post action: got (kernelStackTrace/userStackTrace) enabled in kprobes[%d].selectors[%d].matchActions[%d] with action '%s'", i, sid, mid, matchAction.Action)
-				}
-			}
-		}
-
-		// get the call possible values, either from f.Call or the list
-		calls := func() []string {
-			if list != nil {
-				return list.Values
-			}
-			return []string{f.Call}
-		}()
-
-		if selectors.HasOverride(f) {
-			if !bpf.HasOverrideHelper() {
-				return fmt.Errorf("Error override action not supported, bpf_override_return helper not available")
-			}
-			if !f.Syscall {
-				for idx := range calls {
-					if !strings.HasPrefix(calls[idx], "security_") {
-						return fmt.Errorf("Error override action can be used only with syscalls and security_ hooks")
-					}
-				}
-			}
-		}
-
-		if selectors.HasSigkillAction(f) && !kernels.EnableLargeProgs() {
-			return fmt.Errorf("sigkill action requires kernel >= 5.3.0")
-		}
-
-		for idx := range calls {
-			// Now go over BTF validation
-			if err := btf.ValidateKprobeSpec(btfobj, calls[idx], f); err != nil {
-				if warn, ok := err.(*btf.ValidationWarn); ok {
-					logger.GetLogger().WithFields(logrus.Fields{
-						"sensor": name,
-					}).WithError(warn).Warn("Kprobe spec pre-validation failed, but will continue with loading")
-				} else if e, ok := err.(*btf.ValidationFailed); ok {
-					return fmt.Errorf("kprobe spec pre-validation failed: %w", e)
-				} else {
-					err = fmt.Errorf("invalid or old kprobe spec: %s", err)
-					logger.GetLogger().WithFields(logrus.Fields{
-						"sensor": name,
-					}).WithError(err).Warn("Kprobe spec pre-validation failed, but will continue with loading")
-				}
-			} else {
-				logger.GetLogger().WithFields(logrus.Fields{
-					"sensor": name,
-				}).Debug("Kprobe spec pre-validation succeeded")
-			}
-		}
-
-		for idxArg, arg := range f.Args {
-			if arg.Type == "auto" {
-				return fmt.Errorf("spec.kprobes[%d].args[%d].type default 'auto' is invalid for a kprobe", i, idxArg)
-			}
+		var err error
+		ret[i], err = preValidateKprobe(log, &kprobes[i], ks, btfobj, lists)
+		if err != nil {
+			return nil, fmt.Errorf("error in spec.kprobes[%d]: %w", i, err)
 		}
 	}
 
-	return nil
+	return ret, nil
 }
 
 type addKprobeIn struct {
@@ -532,141 +493,221 @@ type addKprobeIn struct {
 	policyID      policyfilter.PolicyID
 	customHandler eventhandler.Handler
 	selMaps       *selectors.KernelSelectorMaps
-}
-
-func getKprobeSymbols(symbol string, syscall bool, lists []v1alpha1.ListSpec) ([]string, bool, error) {
-	if strings.HasPrefix(symbol, "list:") {
-		name := symbol[len("list:"):]
-		for idx := range lists {
-			list := lists[idx]
-			if list.Name == name {
-				return list.Values, isSyscallListType(list.Type), nil
-			}
-		}
-		return []string{""}, false, fmt.Errorf("list '%s' not found", name)
-	}
-	return []string{symbol}, syscall, nil
+	celExprs      *selectors.CelExprFunctions
+	selStatsBase  uint32
 }
 
 type hasMaps struct {
 	stackTrace bool
 	rateLimit  bool
-	fdInstall  bool
 	enforcer   bool
+	override   bool
+	sockTrack  bool
+	selector   bool
+	fentry     bool
 }
 
-func hasMapsSetup(spec *v1alpha1.TracingPolicySpec) hasMaps {
-	has := hasMaps{}
-	for _, kprobe := range spec.KProbes {
-		has.fdInstall = has.fdInstall || selectorsHaveFDInstall(kprobe.Selectors)
+// hasMapsSetup setups the has maps for the per policy maps. The per kprobe maps
+// are setup later in createSingleKprobeSensor or createMultiKprobeSensor.
+func hasMapsSetup(spec *v1alpha1.TracingPolicySpec, kprobes []v1alpha1.KProbeSpec, fentry bool) hasMaps {
+	has := hasMaps{fentry: fentry}
+	for _, kprobe := range kprobes {
 		has.enforcer = has.enforcer || len(spec.Enforcers) != 0
-
-		// check for early break
-		if has.fdInstall && has.enforcer {
-			break
-		}
+		has.rateLimit = has.rateLimit || selectors.HasRateLimit(kprobe.Selectors)
+		has.sockTrack = has.sockTrack || selectors.HasSockTrack(&kprobe)
+		has.override = has.override || selectors.HasOverride(kprobe.Selectors)
+		has.selector = has.selector || selectors.HasSelector(&kprobe)
 	}
 	return has
+}
+
+func isArm() bool {
+	return runtime.GOARCH == "arm64"
+}
+
+type attachType int
+
+const (
+	kprobe attachType = iota
+	fentry
+)
+
+func isFentry(typ attachType) bool {
+	return typ == fentry
 }
 
 func createGenericKprobeSensor(
 	spec *v1alpha1.TracingPolicySpec,
 	name string,
-	policyID policyfilter.PolicyID,
-	policyName string,
-	customHandler eventhandler.Handler,
+	polInfo *policyInfo,
+	valInfo []*kpValidateInfo,
+	typ attachType,
 ) (*sensors.Sensor, error) {
 	var progs []*program.Program
 	var maps []*program.Map
 	var ids []idtable.EntryID
 	var useMulti bool
 	var selMaps *selectors.KernelSelectorMaps
+	var celExprs *selectors.CelExprFunctions
+	var kprobes []v1alpha1.KProbeSpec
+	var statuses []*tetragon.HookStatus
 
-	kprobes := spec.KProbes
-	lists := spec.Lists
+	fentry := isFentry(typ)
 
-	specOpts, err := getSpecOptions(spec.Options)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get spec options: %s", err)
+	if fentry {
+		kprobes = spec.Fentries
+	} else {
+		kprobes = spec.KProbes
 	}
+
+	has := hasMapsSetup(spec, kprobes, fentry)
 
 	// use multi kprobe only if:
 	// - it's not disabled by spec option
 	// - it's not disabled by command line option
 	// - there's support detected
-	if !specOpts.DisableKprobeMulti {
+	if !polInfo.specOpts.DisableKprobeMulti {
 		useMulti = !option.Config.DisableKprobeMulti && bpf.HasKprobeMulti()
+
+		// arm does not override on top of kprobe.multi
+		if isArm() && (has.enforcer || has.override) {
+			useMulti = false
+		}
+		// there's no multi support yet
+		if fentry {
+			useMulti = false
+		}
 	}
 
 	if useMulti {
 		selMaps = &selectors.KernelSelectorMaps{}
+		// if we are using multi-kprobe, CEL expressions are shared across all kprobes
+		celExprs = &selectors.CelExprFunctions{}
 	}
 
 	in := addKprobeIn{
 		useMulti:      useMulti,
 		sensorPath:    name,
-		policyID:      policyID,
-		policyName:    policyName,
-		customHandler: customHandler,
+		policyID:      polInfo.policyID,
+		policyName:    polInfo.name,
+		customHandler: polInfo.customHandler,
 		selMaps:       selMaps,
+		celExprs:      celExprs,
 	}
 
-	has := hasMapsSetup(spec)
+	var selectorStatsBase uint32
+	dups := NewDupInstance()
 
 	for i := range kprobes {
-		syms, syscall, err := getKprobeSymbols(kprobes[i].Call, kprobes[i].Syscall, lists)
-		if err != nil {
-			return nil, err
+		if err := appendMacrosSelectors(kprobes[i].Selectors, spec.SelectorsMacros); err != nil {
+			return nil, fmt.Errorf("append macros selectors: %w", err)
 		}
 
+		in.selStatsBase = selectorStatsBase
+		selectorStatsBase += uint32(len(kprobes[i].Selectors))
+
+		hookStatus := &tetragon.HookStatus{
+			State:           tetragon.HookState_STATUS_UNSPECIFIED,
+			HookDescription: kprobes[i].Call,
+			Section:         "kprobes",
+			HookIdx:         uint32(i),
+		}
+
+		statuses = append(statuses, hookStatus)
+
+		if valInfo[i].ignore {
+			hookStatus.State = tetragon.HookState_STATUS_CALL_NOT_FOUND
+			continue
+		}
+		syms := valInfo[i].calls
+		syscall := valInfo[i].syscall
 		// Syscall flag might be changed in list definition
 		kprobes[i].Syscall = syscall
 
-		for idx := range syms {
-			id, err := addKprobe(syms[idx], &kprobes[i], &in)
+		for _, sym := range syms {
+			id, err := addKprobe(sym, dups.GetID(sym), &kprobes[i], &in, has)
 			if err != nil {
 				return nil, err
 			}
 			ids = append(ids, id)
 		}
+		if valInfo[i].ignoredCount == 0 {
+			hookStatus.State = tetragon.HookState_STATUS_LOADED
+		} else {
+			hookStatus.State = tetragon.HookState_STATUS_PARTIAL_CALL_NOT_FOUND
+		}
 	}
 
-	if useMulti {
-		progs, maps, err = createMultiKprobeSensor(in.sensorPath, in.policyName, ids, has)
-	} else {
-		progs, maps, err = createSingleKprobeSensor(in.sensorPath, ids, has)
-	}
+	if len(ids) != 0 {
+		var err error
+		if useMulti {
+			progs, maps, err = createMultiKprobeSensor(polInfo, ids, has)
+		} else {
+			progs, maps, err = createSingleKprobeSensor(polInfo, ids, has)
+		}
 
-	if err != nil {
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
+
+		maps = append(maps, program.MapUserFrom(base.ExecveMap))
+		if config.EnableV511Progs() && !option.Config.UsePerfRingBuffer {
+			maps = append(maps, program.MapUserFrom(base.RingBufEvents))
+		}
+
+		if option.Config.ParentsMapEnabled {
+			maps = append(maps, program.MapUserFrom(base.ParentBinariesMap))
+		}
 	}
 
 	return &sensors.Sensor{
-		Name:  name,
-		Progs: progs,
-		Maps:  maps,
+		Name:      name,
+		Progs:     progs,
+		Maps:      maps,
+		Policy:    polInfo.name,
+		Namespace: polInfo.namespace,
 		DestroyHook: func() error {
 			var errs error
+
 			for _, id := range ids {
-				_, err := genericKprobeTable.RemoveEntry(id)
+				gk, err := genericKprobeTableGet(id)
+				if err != nil {
+					errs = errors.Join(errs, err)
+					continue
+				}
+
+				if err = selectors.CleanupKernelSelectorState(gk.loadArgs.selectors.entry); err != nil {
+					errs = errors.Join(errs, err)
+				}
+
+				_, err = genericKprobeTable.RemoveEntry(id)
 				if err != nil {
 					errs = errors.Join(errs, err)
 				}
 			}
 			return errs
 		},
+		Statuses:        statuses,
+		NoHooksAttached: len(ids) == 0,
 	}, nil
+}
+
+func initEventConfig() *api.EventConfig {
+	return &api.EventConfig{
+		ArgIndex: [api.EventConfigMaxArgs]int32{-1, -1, -1, -1, -1},
+	}
 }
 
 // addKprobe will, amongst other things, create a generic kprobe entry and add
 // it to the genericKprobeTable. The caller should make sure that this entry is
 // properly removed on kprobe removal.
-func addKprobe(funcName string, f *v1alpha1.KProbeSpec, in *addKprobeIn) (id idtable.EntryID, err error) {
+func addKprobe(funcName string, instance InstanceID, f *v1alpha1.KProbeSpec, in *addKprobeIn, has hasMaps) (id idtable.EntryID, err error) {
 	var argSigPrinters []argPrinter
 	var argReturnPrinters []argPrinter
 	var setRetprobe bool
-	var argRetprobe *v1alpha1.KProbeArg
-	var argsBTFSet [api.MaxArgsSupported]bool
+	var argRetprobe *v1alpha1.KProbeArg // holds pointer to arg for return handler
+	var argRetprobeIdx int
+	var allBTFArgs [api.EventConfigMaxArgs][api.MaxBTFArgDepth]api.ConfigBTFArg
 
 	errFn := func(err error) (idtable.EntryID, error) {
 		return idtable.UninitializedEntryID, err
@@ -676,77 +717,155 @@ func addKprobe(funcName string, f *v1alpha1.KProbeSpec, in *addKprobeIn) (id idt
 		return errFn(errors.New("error adding kprobe, the kprobe spec is nil"))
 	}
 
-	config := &api.EventConfig{}
-	config.PolicyID = uint32(in.policyID)
+	eventConfig := initEventConfig()
+	eventConfig.PolicyID = uint32(in.policyID)
+	eventConfig.SelStatsBase = in.selStatsBase
 	if len(f.ReturnArgAction) > 0 {
-		if !kernels.EnableLargeProgs() {
-			return errFn(fmt.Errorf("ReturnArgAction requires kernel >=5.3"))
+		if !config.EnableLargeProgs() {
+			return errFn(errors.New("ReturnArgAction requires kernel >=5.3"))
 		}
-		config.ArgReturnAction = selectors.ActionTypeFromString(f.ReturnArgAction)
-		if config.ArgReturnAction == selectors.ActionTypeInvalid {
+		actionID := selectors.ActionTypeFromString(f.ReturnArgAction)
+		if actionID == selectors.ActionTypeInvalid {
 			return errFn(fmt.Errorf("ReturnArgAction type '%s' unsupported", f.ReturnArgAction))
+		}
+		if actionID != selectors.ActionTypeTrackSock && actionID != selectors.ActionTypeUntrackSock {
+			return errFn(fmt.Errorf("ReturnArgAction type '%s' unsupported; omit returnArgAction or use 'TrackSock'/'UntrackSock'", f.ReturnArgAction))
+		}
+		eventConfig.ArgReturnAction = actionID
+	}
+
+	if selectors.HasOverride(f.Selectors) {
+		if err := validateOverride(f, funcName, in.useMulti); err != nil {
+			return errFn(fmt.Errorf("override validation failed: %w", err))
 		}
 	}
 
-	isSecurityFunc := strings.HasPrefix(funcName, "security_")
-
-	if selectors.HasOverride(f) {
-		if isSecurityFunc && in.useMulti {
-			return errFn(fmt.Errorf("Error: can't override '%s' function with kprobe_multi, use --disable-kprobe-multi option",
-				funcName))
-		}
-		if isSecurityFunc && !bpf.HasModifyReturn() {
-			return errFn(fmt.Errorf("Error: can't override '%s' function without fmodret support",
-				funcName))
-		}
+	if in.useMulti && instance > 0 {
+		return errFn(fmt.Errorf("error: can't have multiple instances of same symbol '%s' with kprobe_multi, use --disable-kprobe-multi option",
+			funcName))
 	}
 
 	msgField, err := getPolicyMessage(f.Message)
 	if errors.Is(err, ErrMsgSyntaxShort) || errors.Is(err, ErrMsgSyntaxEscape) {
-		return errFn(fmt.Errorf("Error: '%v'", err))
+		return errFn(fmt.Errorf("error: '%w'", err))
 	} else if errors.Is(err, ErrMsgSyntaxLong) {
-		logger.GetLogger().WithField("policy-name", in.policyName).Warnf("TracingPolicy 'message' field too long, truncated to %d characters", TpMaxMessageLen)
+		logger.GetLogger().Warn(fmt.Sprintf("TracingPolicy 'message' field too long, truncated to %d characters", TpMaxMessageLen), "policy-name", in.policyName)
 	}
 
-	tagsField, err := getPolicyTags(f.Tags)
+	tagsField, err := GetPolicyTags(f.Tags)
 	if err != nil {
-		return errFn(fmt.Errorf("Error: '%v'", err))
+		return errFn(fmt.Errorf("error: '%w'", err))
 	}
 
-	argRetprobe = nil // holds pointer to arg for return handler
+	addArg := func(j int, a *v1alpha1.KProbeArg, data bool) error {
+		// First try userspace types
+		var argType int
+		userArgType := gt.GenericUserTypeFromString(a.Type)
 
-	// Parse Arguments
-	for j, a := range f.Args {
-		argType := gt.GenericTypeFromString(a.Type)
-		if argType == gt.GenericInvalidType {
-			return errFn(fmt.Errorf("Arg(%d) type '%s' unsupported", j, a.Type))
+		if userArgType != gt.GenericInvalidType {
+			// This is a userspace type, map it to kernel type
+			argType = gt.GenericUserToKernelType(userArgType)
+		} else {
+			argType = gt.GenericTypeFromString(a.Type)
 		}
+
+		var (
+			regArg api.ConfigRegArg
+			ok     bool
+		)
+
+		if hasPtRegsSource(a) {
+			regArg.Offset, regArg.Size, ok = asm.RegOffsetSize(a.Resolve)
+			if !ok {
+				return fmt.Errorf("error: Failed to retrieve register argument '%s'", a.Resolve)
+			}
+		} else if a.Resolve != "" && j < api.EventConfigMaxArgs {
+			if !bpf.HasProgramLargeSize() {
+				return errors.New("error: Resolve flag can't be used for your kernel version. Please update to version 5.4 or higher or disable Resolve flag")
+			}
+			lastBTFType, btfArg, err := resolveBTFArg(f.Call, a, false)
+			if err != nil {
+				return fmt.Errorf("error on hook %q for index %d : %w", f.Call, a.Index, err)
+			}
+			allBTFArgs[j] = btfArg
+			argType = findTypeFromBTFType(a, lastBTFType)
+		}
+
+		if argType == gt.GenericInvalidType {
+			return fmt.Errorf("Arg(%d) type '%s' unsupported", j, a.Type)
+		}
+
 		if a.MaxData {
 			if argType != gt.GenericCharBuffer {
-				logger.GetLogger().Warnf("maxData flag is ignored (supported for char_buf type)")
+				logger.GetLogger().Warn("maxData flag is ignored (supported for char_buf type)")
 			}
-			if !kernels.EnableLargeProgs() {
-				logger.GetLogger().Warnf("maxData flag is ignored (supported from large programs)")
+			if !config.EnableLargeProgs() {
+				logger.GetLogger().Warn("maxData flag is ignored (supported from large programs)")
 			}
 		}
-		argMValue, err := getMetaValue(&a)
+		argMValue, err := getMetaValue(a)
 		if err != nil {
-			return errFn(err)
+			return err
 		}
 		if argReturnCopy(argMValue) {
 			argRetprobe = &f.Args[j]
+			argRetprobeIdx = j
 		}
-		if a.Index > 4 {
-			return errFn(fmt.Errorf("Error add arg: ArgType %s Index %d out of bounds",
-				a.Type, int(a.Index)))
+		if a.Index >= api.MaxAccessibleArgs {
+			return fmt.Errorf("error add arg: ArgType %s Index %d out of bounds",
+				a.Type, int(a.Index))
 		}
-		config.Arg[a.Index] = int32(argType)
-		config.ArgM[a.Index] = uint32(argMValue)
+		eventConfig.ArgType[j] = int32(argType)
+		eventConfig.ArgMeta[j] = uint32(argMValue)
+		eventConfig.ArgIndex[j] = int32(a.Index)
+		eventConfig.RegArg[j] = regArg
 
-		argsBTFSet[a.Index] = true
-		argP := argPrinter{index: j, ty: argType, maxData: a.MaxData, label: a.Label}
+		argP := argPrinter{
+			index:    j,
+			ty:       argType,
+			userType: userArgType,
+			maxData:  a.MaxData,
+			label:    a.Label,
+			data:     data,
+		}
 		argSigPrinters = append(argSigPrinters, argP)
+
+		pathArgWarning(a.Index, argType, f.Selectors)
+		return nil
 	}
+
+	if len(f.Args)+len(f.Data) > api.EventConfigMaxArgs {
+		return errFn(fmt.Errorf("too many arguments, max %d: args(%d) data(%d)", api.EventConfigMaxArgs, len(f.Args), len(f.Data)))
+	}
+
+	var j int
+
+	// Parse Arguments
+	for _, arg := range f.Args {
+		if arg.Source != "" {
+			return errFn(fmt.Errorf("standard argument is not allowed to have source configured, current value: '%s'", arg.Source))
+		}
+		if err := addArg(j, &arg, false); err != nil {
+			return errFn(err)
+		}
+		j = j + 1
+	}
+
+	// Parse Data
+	for _, data := range f.Data {
+		if !hasCurrentTaskSource(&data) && !hasPtRegsSource(&data) {
+			return errFn(fmt.Errorf("data argument has wrong source '%s'", data.Source))
+		}
+		if data.Resolve == "" {
+			return errFn(errors.New("data argument missing 'resolve' setup"))
+		}
+		if err := addArg(j, &data, true); err != nil {
+			return errFn(err)
+		}
+		j = j + 1
+	}
+
+	eventConfig.BTFArg = allBTFArgs
 
 	// Parse ReturnArg, we have two types of return arg parsing. We
 	// support populating a kprobe buffer from kretprobe hooks. This
@@ -759,45 +878,32 @@ func addKprobe(funcName string, f *v1alpha1.KProbeSpec, in *addKprobeIn) (id idt
 	// argReturnPrinters tell golang printer piece how to print the event.
 	if f.Return {
 		if f.ReturnArg == nil {
-			return errFn(fmt.Errorf("ReturnArg not specified with Return=true"))
+			return errFn(errors.New("ReturnArg not specified with Return=true"))
 		}
 		argType := gt.GenericTypeFromString(f.ReturnArg.Type)
 		if argType == gt.GenericInvalidType {
 			if f.ReturnArg.Type == "" {
-				return errFn(fmt.Errorf("ReturnArg not specified with Return=true"))
+				return errFn(errors.New("ReturnArg not specified with Return=true"))
 			}
 			return errFn(fmt.Errorf("ReturnArg type '%s' unsupported", f.ReturnArg.Type))
 		}
-		config.ArgReturn = int32(argType)
-		argsBTFSet[api.ReturnArgIndex] = true
+		eventConfig.ArgReturn = int32(argType)
 		argP := argPrinter{index: api.ReturnArgIndex, ty: argType}
 		argReturnPrinters = append(argReturnPrinters, argP)
 	} else {
-		config.ArgReturn = int32(0)
+		eventConfig.ArgReturn = int32(gt.GenericUnsetType)
 	}
 
 	if argRetprobe != nil {
-		argsBTFSet[api.ReturnArgIndex] = true
 		setRetprobe = true
 
 		argType := gt.GenericTypeFromString(argRetprobe.Type)
-		config.ArgReturnCopy = int32(argType)
+		eventConfig.ArgReturnCopy = int32(argType)
 
-		argP := argPrinter{index: int(argRetprobe.Index), ty: argType, label: argRetprobe.Label}
+		argP := argPrinter{index: argRetprobeIdx, ty: argType, label: argRetprobe.Label}
 		argReturnPrinters = append(argReturnPrinters, argP)
 	} else {
-		config.ArgReturnCopy = int32(0)
-	}
-
-	// Mark remaining arguments as 'nops' the kernel side will skip
-	// copying 'nop' args.
-	for j, a := range argsBTFSet {
-		if !a {
-			if j != api.ReturnArgIndex {
-				config.Arg[j] = gt.GenericNopType
-				config.ArgM[j] = 0
-			}
-		}
+		eventConfig.ArgReturnCopy = int32(gt.GenericUnsetType)
 	}
 
 	// Write attributes into BTF ptr for use with load
@@ -806,9 +912,9 @@ func addKprobe(funcName string, f *v1alpha1.KProbeSpec, in *addKprobeIn) (id idt
 	}
 
 	if f.Syscall {
-		config.Syscall = 1
+		eventConfig.Syscall = 1
 	} else {
-		config.Syscall = 0
+		eventConfig.Syscall = 0
 	}
 
 	// create a new entry on the table, and pass its id to BPF-side
@@ -817,24 +923,32 @@ func addKprobe(funcName string, f *v1alpha1.KProbeSpec, in *addKprobeIn) (id idt
 		loadArgs: kprobeLoadArgs{
 			retprobe: setRetprobe,
 			syscall:  f.Syscall,
-			config:   config,
+			config:   eventConfig,
 		},
 		argSigPrinters:    argSigPrinters,
 		argReturnPrinters: argReturnPrinters,
 		funcName:          funcName,
+		instance:          instance,
 		pendingEvents:     nil,
 		tableId:           idtable.UninitializedEntryID,
 		policyName:        in.policyName,
-		hasOverride:       selectors.HasOverride(f),
+		hasOverride:       selectors.HasOverride(f.Selectors),
+		hasSelector:       selectors.HasSelector(f),
 		customHandler:     in.customHandler,
 		message:           msgField,
 		tags:              tagsField,
-		hasStackTrace:     selectorsHaveStackTrace(f.Selectors),
-		hasRatelimit:      selectorsHaveRateLimit(f.Selectors),
+		hasStackTrace:     selectors.HasStackTrace(f.Selectors),
 	}
 
 	// Parse Filters into kernel filter logic
-	kprobeEntry.loadArgs.selectors.entry, err = selectors.InitKernelSelectorState(f.Selectors, f.Args, &kprobeEntry.actionArgs, nil, in.selMaps)
+	kprobeEntry.loadArgs.selectors.entry, err = selectors.InitKernelSelectorState(&selectors.KernelSelectorArgs{
+		Selectors:      f.Selectors,
+		Args:           f.Args,
+		Data:           f.Data,
+		ActionArgTable: &kprobeEntry.actionArgs,
+		Maps:           in.selMaps,
+		CelExprs:       in.celExprs,
+	})
 	if err != nil {
 		return errFn(err)
 	}
@@ -847,104 +961,114 @@ func addKprobe(funcName string, f *v1alpha1.KProbeSpec, in *addKprobeIn) (id idt
 		}
 	}
 
-	kprobeEntry.pendingEvents, err = lru.New[pendingEventKey, pendingEvent](4096)
+	kprobeEntry.pendingEvents, err = lru.New[pendingEventKey, pendingEvent[*tracing.MsgGenericKprobeUnix]](option.Config.RetprobesCacheSize)
 	if err != nil {
 		return errFn(err)
 	}
 
 	genericKprobeTable.AddEntry(&kprobeEntry)
-	config.FuncId = uint32(kprobeEntry.tableId.ID)
-
-	if in.useMulti {
-		kprobeEntry.pinPathPrefix = multiKprobePinPath(in.sensorPath)
-	} else {
-		kprobeEntry.pinPathPrefix = sensors.PathJoin(in.sensorPath, fmt.Sprintf("gkp-%d", kprobeEntry.tableId.ID))
-	}
+	eventConfig.FuncId = uint32(kprobeEntry.tableId.ID)
 
 	logger.GetLogger().
-		WithField("return", setRetprobe).
-		WithField("function", kprobeEntry.funcName).
-		WithField("override", kprobeEntry.hasOverride).
-		Infof("Added kprobe")
+		Info("Added kprobe", "return", setRetprobe, "function", kprobeEntry.funcName,
+			"override", kprobeEntry.hasOverride, "enforcer", has.enforcer)
 
 	return kprobeEntry.tableId, nil
 }
 
-func createKprobeSensorFromEntry(kprobeEntry *genericKprobe, sensorPath string,
+func createKprobeSensorFromEntry(polInfo *policyInfo, kprobeEntry *genericKprobe,
 	progs []*program.Program, maps []*program.Map, has hasMaps) ([]*program.Program, []*program.Map) {
-
-	loadProgName, loadProgRetName := kernels.GenericKprobeObjs()
+	loadProgName, loadProgRetName := config.GenericKprobeObjs(false)
 	isSecurityFunc := strings.HasPrefix(kprobeEntry.funcName, "security_")
 
-	pinPath := kprobeEntry.pinPathPrefix
-	pinProg := sensors.PathJoin(pinPath, fmt.Sprintf("%s_prog", kprobeEntry.funcName))
+	pinProg := kprobeEntry.instance.PinProg(kprobeEntry.funcName)
 
-	load := program.Builder(
-		path.Join(option.Config.HubbleLib, loadProgName),
-		kprobeEntry.funcName,
-		"kprobe/generic_kprobe",
-		pinProg,
-		"generic_kprobe").
-		SetLoaderData(kprobeEntry.tableId)
+	var load *program.Program
+
+	if has.fentry {
+		data := &program.TracingAttachData{
+			AttachTo: kprobeEntry.funcName,
+		}
+
+		loadProgName, loadProgRetName = config.GenericTracingObjs()
+
+		load = program.Builder(
+			path.Join(option.Config.HubbleLib, loadProgName),
+			kprobeEntry.funcName,
+			"fentry/generic_fentry",
+			pinProg,
+			"generic_fentry").
+			SetAttachData(data)
+
+		tailCalls := program.MapBuilderProgram("fentry_calls", load)
+		maps = append(maps, tailCalls)
+	} else {
+		load = program.Builder(
+			path.Join(option.Config.HubbleLib, loadProgName),
+			kprobeEntry.funcName,
+			"kprobe/generic_kprobe",
+			pinProg,
+			"generic_kprobe")
+
+		tailCalls := program.MapBuilderProgram("kprobe_calls", load)
+		maps = append(maps, tailCalls)
+	}
+
+	load.SetPolicy(kprobeEntry.policyName)
+	load.SetLoaderData(kprobeEntry.tableId)
 	load.Override = kprobeEntry.hasOverride
+
 	if load.Override {
 		load.OverrideFmodRet = isSecurityFunc && bpf.HasModifyReturn()
 	}
 	progs = append(progs, load)
 
-	fdinstall := program.MapBuilderPin("fdinstall_map", sensors.PathJoin(sensorPath, "fdinstall_map"), load)
-	if has.fdInstall {
-		fdinstall.SetMaxEntries(fdInstallMapMaxEntries)
-	}
-	maps = append(maps, fdinstall)
-
-	configMap := program.MapBuilderPin("config_map", sensors.PathJoin(pinPath, "config_map"), load)
+	configMap := program.MapBuilderProgram("config_map", load)
 	maps = append(maps, configMap)
 
-	tailCalls := program.MapBuilderPin("kprobe_calls", sensors.PathJoin(pinPath, "kp_calls"), load)
-	maps = append(maps, tailCalls)
-
-	filterMap := program.MapBuilderPin("filter_map", sensors.PathJoin(pinPath, "filter_map"), load)
+	filterMap := program.MapBuilderProgram("filter_map", load)
 	maps = append(maps, filterMap)
 
-	maps = append(maps, filterMaps(load, pinPath, kprobeEntry)...)
+	workloadsMap := program.MapBuilderProgram("workloads_map", load)
+	maps = append(maps, workloadsMap)
 
-	retProbe := program.MapBuilderPin("retprobe_map", sensors.PathJoin(pinPath, "retprobe_map"), load)
-	maps = append(maps, retProbe)
+	if has.selector {
+		maps = append(maps, createSelectorMaps(load, getProgramSelector(load, kprobeEntry))...)
 
-	callHeap := program.MapBuilderPin("process_call_heap", sensors.PathJoin(pinPath, "process_call_heap"), load)
-	maps = append(maps, callHeap)
-
-	selMatchBinariesMap := program.MapBuilderPin("tg_mb_sel_opts", sensors.PathJoin(pinPath, "tg_mb_sel_opts"), load)
-	maps = append(maps, selMatchBinariesMap)
-
-	matchBinariesPaths := program.MapBuilderPin("tg_mb_paths", sensors.PathJoin(pinPath, "tg_mb_paths"), load)
-	if !kernels.MinKernelVersion("5.9") {
-		// Versions before 5.9 do not allow inner maps to have different sizes.
-		// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
-		matchBinariesPaths.SetInnerMaxEntries(kprobeEntry.loadArgs.selectors.entry.MatchBinariesPathsMaxEntries())
+		selMatchBinariesMap := program.MapBuilderProgram("tg_mb_sel_opts", load)
+		maps = append(maps, selMatchBinariesMap)
 	}
-	maps = append(maps, matchBinariesPaths)
+
+	if kprobeEntry.loadArgs.retprobe {
+		retProbe := program.MapBuilderSensor("retprobe_map", load)
+		maps = append(maps, retProbe)
+	}
+
+	callHeap := program.MapBuilderSensor("process_call_heap", load)
+	maps = append(maps, callHeap)
 
 	// loading the stack trace map in any case so that it does not end up as an
 	// anonymous map (as it's always used by the BPF prog) and is clearly linked
 	// to tetragon
-	stackTraceMap := program.MapBuilderPin("stack_trace_map", sensors.PathJoin(pinPath, "stack_trace_map"), load)
 	if has.stackTrace {
+		stackTraceMap := program.MapBuilderProgram("stack_trace_map", load)
 		// to reduce memory footprint however, the stack map is created with a
 		// max entry of 1, we need to expand that at loading.
 		stackTraceMap.SetMaxEntries(stackTraceMapMaxEntries)
+		maps = append(maps, stackTraceMap)
+		kprobeEntry.data.stackTraceMap = stackTraceMap
 	}
-	maps = append(maps, stackTraceMap)
-	kprobeEntry.data.stackTraceMap = stackTraceMap
 
-	if kernels.EnableLargeProgs() {
-		socktrack := program.MapBuilderPin("socktrack_map", sensors.PathJoin(sensorPath, "socktrack_map"), load)
+	if config.EnableLargeProgs() {
+		socktrack := program.MapBuilderSensor("socktrack_map", load)
+		if has.sockTrack {
+			socktrack.SetMaxEntries(socktrackMapMaxEntries)
+		}
 		maps = append(maps, socktrack)
 	}
 
-	if kernels.EnableLargeProgs() {
-		ratelimitMap := program.MapBuilderPin("ratelimit_map", sensors.PathJoin(pinPath, "ratelimit_map"), load)
+	if config.EnableLargeProgs() {
+		ratelimitMap := program.MapBuilderSensor("ratelimit_map", load)
 		if has.rateLimit {
 			// similarly as for stacktrace, we expand the max size only if
 			// needed to reduce the memory footprint when unused
@@ -953,60 +1077,92 @@ func createKprobeSensorFromEntry(kprobeEntry *genericKprobe, sensorPath string,
 		maps = append(maps, ratelimitMap)
 	}
 
-	enforcerDataMap := enforcerMap(kprobeEntry.policyName, load)
 	if has.enforcer {
-		enforcerDataMap.SetMaxEntries(enforcerMapMaxEntries)
+		maps = append(maps, enforcerMapsUser(load)...)
 	}
-	maps = append(maps, enforcerDataMap)
+
+	if option.Config.EnableCgTrackerID {
+		maps = append(maps, program.MapUser(cgtracker.MapName, load))
+	}
+
+	if has.override {
+		overrideTasksMap := program.MapBuilderProgram("override_tasks", load)
+		overrideTasksMap.SetMaxEntries(overrideMapMaxEntries)
+		maps = append(maps, overrideTasksMap)
+	}
+
+	maps = append(maps, polInfo.policyConfMap(load), polInfo.selectorStatsMap(load))
 
 	if kprobeEntry.loadArgs.retprobe {
-		pinRetProg := sensors.PathJoin(pinPath, fmt.Sprintf("%s_ret_prog", kprobeEntry.funcName))
-		loadret := program.Builder(
-			path.Join(option.Config.HubbleLib, loadProgRetName),
-			kprobeEntry.funcName,
-			"kprobe/generic_retkprobe",
-			pinRetProg,
-			"generic_kprobe").
-			SetRetProbe(true).
-			SetLoaderData(kprobeEntry.tableId)
+		pinRetProg := kprobeEntry.instance.PinProg(sensors.PathJoin(kprobeEntry.funcName + "_return"))
+
+		var loadret *program.Program
+
+		if has.fentry {
+			data := &program.TracingAttachData{
+				AttachTo: kprobeEntry.funcName,
+			}
+
+			loadret = program.Builder(
+				path.Join(option.Config.HubbleLib, loadProgRetName),
+				kprobeEntry.funcName,
+				"fexit/generic_fexit",
+				pinRetProg,
+				"generic_fentry").
+				SetAttachData(data)
+
+			tailCalls := program.MapBuilderProgram("fexit_calls", loadret)
+			maps = append(maps, tailCalls)
+		} else {
+			loadret = program.Builder(
+				path.Join(option.Config.HubbleLib, loadProgRetName),
+				kprobeEntry.funcName,
+				"kprobe/generic_retkprobe",
+				pinRetProg,
+				"generic_kprobe")
+
+			tailCalls := program.MapBuilderProgram("retkprobe_calls", loadret)
+			maps = append(maps, tailCalls)
+		}
+
+		loadret.SetRetProbe(true)
+		loadret.SetLoaderData(kprobeEntry.tableId)
+		loadret.SetPolicy(kprobeEntry.policyName)
+
 		progs = append(progs, loadret)
 
-		retProbe := program.MapBuilderPin("retprobe_map", sensors.PathJoin(pinPath, "retprobe_map"), loadret)
+		retProbe := program.MapBuilderSensor("retprobe_map", loadret)
 		maps = append(maps, retProbe)
 
-		retConfigMap := program.MapBuilderPin("config_map", sensors.PathJoin(pinPath, "retprobe_config_map"), loadret)
+		retConfigMap := program.MapBuilderProgram("config_map", loadret)
 		maps = append(maps, retConfigMap)
 
-		tailCalls := program.MapBuilderPin("retkprobe_calls", sensors.PathJoin(pinPath, "retprobe-kp_calls"), loadret)
-		maps = append(maps, tailCalls)
-
-		filterMap := program.MapBuilderPin("filter_map", sensors.PathJoin(pinPath, "retkprobe_filter_map"), loadret)
+		filterMap := program.MapBuilderProgram("filter_map", loadret)
 		maps = append(maps, filterMap)
 
-		maps = append(maps, filterMaps(loadret, pinPath, kprobeEntry)...)
+		if has.selector {
+			maps = append(maps, createSelectorMaps(loadret, getProgramSelector(loadret, kprobeEntry))...)
+		}
 
 		// add maps with non-default paths (pins) to the retprobe
-		callHeap := program.MapBuilderPin("process_call_heap", sensors.PathJoin(pinPath, "process_call_heap"), loadret)
+		callHeap := program.MapBuilderSensor("process_call_heap", loadret)
 		maps = append(maps, callHeap)
 
-		fdinstall := program.MapBuilderPin("fdinstall_map", sensors.PathJoin(sensorPath, "fdinstall_map"), loadret)
-		if has.fdInstall {
-			fdinstall.SetMaxEntries(fdInstallMapMaxEntries)
-		}
-		maps = append(maps, fdinstall)
-
-		if kernels.EnableLargeProgs() {
-			socktrack := program.MapBuilderPin("socktrack_map", sensors.PathJoin(sensorPath, "socktrack_map"), loadret)
+		if config.EnableLargeProgs() {
+			socktrack := program.MapBuilderSensor("socktrack_map", loadret)
+			if has.sockTrack {
+				socktrack.SetMaxEntries(socktrackMapMaxEntries)
+			}
 			maps = append(maps, socktrack)
 		}
 	}
 
-	logger.GetLogger().WithField("override", kprobeEntry.hasOverride).
-		Infof("Added generic kprobe sensor: %s -> %s", load.Name, load.Attach)
+	logger.GetLogger().Info(fmt.Sprintf("Added generic kprobe sensor: %s -> %s", load.Name, load.Attach),
+		"override", kprobeEntry.hasOverride)
 	return progs, maps
 }
 
-func createSingleKprobeSensor(sensorPath string, ids []idtable.EntryID, has hasMaps) ([]*program.Program, []*program.Map, error) {
+func createSingleKprobeSensor(polInfo *policyInfo, ids []idtable.EntryID, has hasMaps) ([]*program.Program, []*program.Map, error) {
 	var progs []*program.Program
 	var maps []*program.Map
 
@@ -1019,9 +1175,10 @@ func createSingleKprobeSensor(sensorPath string, ids []idtable.EntryID, has hasM
 
 		// setup per kprobe map config
 		has.stackTrace = gk.hasStackTrace
-		has.rateLimit = gk.hasRatelimit
+		has.override = gk.hasOverride
+		has.selector = gk.hasSelector
 
-		progs, maps = createKprobeSensorFromEntry(gk, sensorPath, progs, maps, has)
+		progs, maps = createKprobeSensorFromEntry(polInfo, gk, progs, maps, has)
 	}
 
 	return progs, maps, nil
@@ -1032,39 +1189,51 @@ func getMapLoad(load *program.Program, kprobeEntry *genericKprobe, index uint32)
 	if state == nil {
 		return []*program.MapLoad{}
 	}
-	return selectorsMaploads(state, kprobeEntry.pinPathPrefix, index)
+	return selectorsMaploads(state, index)
 }
 
-func loadSingleKprobeSensor(id idtable.EntryID, bpfDir string, load *program.Program, verbose int) error {
+func loadSingleKprobeSensor(id idtable.EntryID, bpfDir string, load *program.Program, maps []*program.Map,
+	verbose int, fentry bool) error {
 	gk, err := genericKprobeTableGet(id)
 	if err != nil {
 		return err
 	}
+
+	rewriteProg := make(map[string]func(prog *ebpf.ProgramSpec) error)
+	if entry := gk.loadArgs.selectors.entry; entry != nil {
+		if celbpf.EnabledInBPF() {
+			rewriteProg["generic_kprobe_filter_arg"] = entry.CelExprFunctions().RewriteProg
+		}
+	}
+	load.RewriteProg = rewriteProg
 
 	load.MapLoad = append(load.MapLoad, getMapLoad(load, gk, 0)...)
 
 	var configData bytes.Buffer
 	binary.Write(&configData, binary.LittleEndian, gk.loadArgs.config)
 	config := &program.MapLoad{
-		Index: 0,
-		Name:  "config_map",
-		Load: func(m *ebpf.Map, index uint32) error {
-			return m.Update(index, configData.Bytes()[:], ebpf.UpdateAny)
+		Name: "config_map",
+		Load: func(m *ebpf.Map, _ string) error {
+			return m.Update(uint32(0), configData.Bytes()[:], ebpf.UpdateAny)
 		},
 	}
 	load.MapLoad = append(load.MapLoad, config)
 
-	if err := program.LoadKprobeProgram(bpfDir, load, verbose); err == nil {
-		logger.GetLogger().Infof("Loaded generic kprobe program: %s -> %s", load.Name, load.Attach)
+	if fentry {
+		if err = program.LoadTracingProgram(bpfDir, load, maps, verbose); err == nil {
+			logger.GetLogger().Info(fmt.Sprintf("Loaded generic fentry program: %s -> %s", load.Name, load.Attach))
+		}
 	} else {
-		return err
+		if err = program.LoadKprobeProgram(bpfDir, load, maps, verbose); err == nil {
+			logger.GetLogger().Info(fmt.Sprintf("Loaded generic kprobe program: %s -> %s", load.Name, load.Attach))
+		}
 	}
 
 	return err
 }
 
-func loadMultiKprobeSensor(ids []idtable.EntryID, bpfDir string, load *program.Program, verbose int) error {
-	bin_buf := make([]bytes.Buffer, len(ids))
+func loadMultiKprobeSensor(ids []idtable.EntryID, bpfDir string, load *program.Program, maps []*program.Map, verbose int) error {
+	binBuf := make([]bytes.Buffer, len(ids))
 
 	data := &program.MultiKprobeAttachData{}
 
@@ -1074,14 +1243,21 @@ func loadMultiKprobeSensor(ids []idtable.EntryID, bpfDir string, load *program.P
 			return err
 		}
 
+		rewriteProg := make(map[string]func(prog *ebpf.ProgramSpec) error)
+		if entry := gk.loadArgs.selectors.entry; entry != nil {
+			if celbpf.EnabledInBPF() {
+				rewriteProg["generic_kprobe_filter_arg"] = entry.CelExprFunctions().RewriteProg
+			}
+		}
+		load.RewriteProg = rewriteProg
+
 		load.MapLoad = append(load.MapLoad, getMapLoad(load, gk, uint32(index))...)
 
-		binary.Write(&bin_buf[index], binary.LittleEndian, gk.loadArgs.config)
+		binary.Write(&binBuf[index], binary.LittleEndian, gk.loadArgs.config)
 		config := &program.MapLoad{
-			Index: uint32(index),
-			Name:  "config_map",
-			Load: func(m *ebpf.Map, index uint32) error {
-				return m.Update(index, bin_buf[index].Bytes()[:], ebpf.UpdateAny)
+			Name: "config_map",
+			Load: func(m *ebpf.Map, _ string) error {
+				return m.Update(uint32(index), binBuf[index].Bytes()[:], ebpf.UpdateAny)
 			},
 		}
 		load.MapLoad = append(load.MapLoad, config)
@@ -1098,8 +1274,8 @@ func loadMultiKprobeSensor(ids []idtable.EntryID, bpfDir string, load *program.P
 	load.OverrideFmodRet = false
 	load.SetAttachData(data)
 
-	if err := program.LoadMultiKprobeProgram(bpfDir, load, verbose); err == nil {
-		logger.GetLogger().Infof("Loaded generic kprobe sensor: %s -> %s", load.Name, load.Attach)
+	if err := program.LoadMultiKprobeProgram(bpfDir, load, maps, verbose); err == nil {
+		logger.GetLogger().Info(fmt.Sprintf("Loaded generic kprobe sensor: %s -> %s", load.Name, load.Attach))
 	} else {
 		return err
 	}
@@ -1107,27 +1283,24 @@ func loadMultiKprobeSensor(ids []idtable.EntryID, bpfDir string, load *program.P
 	return nil
 }
 
-func loadGenericKprobeSensor(bpfDir string, load *program.Program, verbose int) error {
+func loadGenericKprobeSensor(bpfDir string, load *program.Program, maps []*program.Map, verbose int, fentry bool) error {
 	if id, ok := load.LoaderData.(idtable.EntryID); ok {
-		return loadSingleKprobeSensor(id, bpfDir, load, verbose)
+		return loadSingleKprobeSensor(id, bpfDir, load, maps, verbose, fentry)
 	}
 	if ids, ok := load.LoaderData.([]idtable.EntryID); ok {
-		return loadMultiKprobeSensor(ids, bpfDir, load, verbose)
+		return loadMultiKprobeSensor(ids, bpfDir, load, maps, verbose)
 	}
 	return fmt.Errorf("invalid loadData type: expecting idtable.EntryID/[] and got: %T (%v)",
 		load.LoaderData, load.LoaderData)
 }
 
-var errParseStringSize = errors.New("error parsing string size from binary")
-
-// this is from bpf/process/types/basic.h 'MAX_STRING'
-const maxStringSize = 4096
-const maxStringSizeSmall = 510
-const maxStringSizeTiny = 144
-
 func getUrl(url string) {
 	// We fire and forget URLs, and we don't care if they hit or not.
-	http.Get(url)
+	resp, err := http.Get(url)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
 }
 
 func dnsLookup(fqdn string) {
@@ -1146,14 +1319,14 @@ func handleGenericKprobe(r *bytes.Reader) ([]observer.Event, error) {
 	m := api.MsgGenericKprobe{}
 	err := binary.Read(r, binary.LittleEndian, &m)
 	if err != nil {
-		logger.GetLogger().WithError(err).Warnf("Failed to read process call msg")
-		return nil, fmt.Errorf("Failed to read process call msg")
+		logger.GetLogger().Warn("Failed to read process call msg", logfields.Error, err)
+		return nil, errors.New("failed to read process call msg")
 	}
 
 	gk, err := genericKprobeTableGet(idtable.EntryID{ID: int(m.FuncId)})
 	if err != nil {
-		logger.GetLogger().WithError(err).Warnf("Failed to match id:%d", m.FuncId)
-		return nil, fmt.Errorf("Failed to match id")
+		logger.GetLogger().Warn(fmt.Sprintf("Failed to match id:%d", m.FuncId), logfields.Error, err)
+		return nil, errors.New("failed to match id")
 	}
 
 	ret, err := handleMsgGenericKprobe(&m, gk, r)
@@ -1170,16 +1343,19 @@ func handleMsgGenericKprobe(m *api.MsgGenericKprobe, gk *genericKprobe, r *bytes
 	case selectors.ActionTypeGetUrl, selectors.ActionTypeDnsLookup:
 		actionArgEntry, err := gk.actionArgs.GetEntry(idtable.EntryID{ID: int(m.ActionArgId)})
 		if err != nil {
-			logger.GetLogger().WithError(err).Warnf("Failed to find argument for id:%d", m.ActionArgId)
-			return nil, fmt.Errorf("Failed to find argument for id")
+			gk.LogAttrs(slog.LevelWarn, "GetURL/TypeDnsLookup: failed to find argument",
+				slog.Any(logfields.Error, err),
+				slog.Any("actionArgId", m.ActionArgId),
+			)
+			return nil, errors.New("failed to find argument for id")
 		}
 		actionArg := actionArgEntry.(*selectors.ActionArgEntry).GetArg()
 		switch m.ActionId {
 		case selectors.ActionTypeGetUrl:
-			logger.GetLogger().WithField("URL", actionArg).Trace("Get URL Action")
+			gk.LogAttrs(logger.LevelTrace, "Get URL Action", slog.Any("URL", actionArg))
 			getUrl(actionArg)
 		case selectors.ActionTypeDnsLookup:
-			logger.GetLogger().WithField("FQDN", actionArg).Trace("DNS lookup")
+			gk.LogAttrs(logger.LevelTrace, "DNS lookup", slog.Any("FQDN", actionArg))
 			dnsLookup(actionArg)
 		}
 	}
@@ -1199,7 +1375,7 @@ func handleMsgGenericKprobe(m *api.MsgGenericKprobe, gk *genericKprobe, r *bytes
 		// if this a return event, also read the ktime of the enter event
 		err := binary.Read(r, binary.LittleEndian, &ktimeEnter)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read ktimeEnter")
+			return nil, errors.New("failed to read ktimeEnter")
 		}
 		printers = gk.argReturnPrinters
 	} else {
@@ -1207,15 +1383,15 @@ func handleMsgGenericKprobe(m *api.MsgGenericKprobe, gk *genericKprobe, r *bytes
 		printers = gk.argSigPrinters
 	}
 
-	if m.Common.Flags&(processapi.MSG_COMMON_FLAG_KERNEL_STACKTRACE|processapi.MSG_COMMON_FLAG_USER_STACKTRACE) != 0 {
+	if m.HasKernelStack() || m.HasUserStack() {
 		if m.KernelStackID < 0 {
-			logger.GetLogger().Warnf("failed to retrieve kernel stacktrace: id equal to errno %d", m.KernelStackID)
+			gk.LogAttrs(slog.LevelWarn, "failed to retrieve kernel stacktrace", slog.Any("errno", m.KernelStackID))
 		}
 		if m.UserStackID < 0 {
-			logger.GetLogger().Debugf("failed to retrieve user stacktrace: id equal to errno %d", m.UserStackID)
+			gk.LogAttrs(slog.LevelDebug, "failed to retrieve user stacktrace", slog.Any("errno", m.UserStackID))
 		}
 		if gk.data.stackTraceMap.MapHandle == nil {
-			logger.GetLogger().WithError(err).Warn("failed to load the stacktrace map")
+			gk.LogAttrs(slog.LevelWarn, "failed to load the stacktrace map", slog.Any(logfields.Error, err))
 		}
 		if m.KernelStackID > 0 || m.UserStackID > 0 {
 			// remove the error part
@@ -1223,14 +1399,14 @@ func handleMsgGenericKprobe(m *api.MsgGenericKprobe, gk *genericKprobe, r *bytes
 				id := uint32(m.KernelStackID)
 				err = gk.data.stackTraceMap.MapHandle.Lookup(id, &unix.KernelStackTrace)
 				if err != nil {
-					logger.GetLogger().WithError(err).Warn("failed to lookup the stacktrace map")
+					gk.LogAttrs(slog.LevelWarn, "failed to lookup the kernel stacktrace map", slog.Any(logfields.Error, err))
 				}
 			}
 			if m.UserStackID > 0 {
 				id := uint32(m.UserStackID)
 				err = gk.data.stackTraceMap.MapHandle.Lookup(id, &unix.UserStackTrace)
 				if err != nil {
-					logger.GetLogger().WithError(err).Warn("failed to lookup the stacktrace map")
+					gk.LogAttrs(slog.LevelWarn, "failed to lookup the user stacktrace map", slog.Any(logfields.Error, err))
 				}
 			}
 		}
@@ -1238,12 +1414,16 @@ func handleMsgGenericKprobe(m *api.MsgGenericKprobe, gk *genericKprobe, r *bytes
 
 	// Get argument objects for specific printers/types
 	for _, a := range printers {
-		arg := getArg(r, a)
+		arg := getArg(gk, r, a)
 		// nop or unknown type (already logged)
 		if arg == nil {
 			continue
 		}
-		unix.Args = append(unix.Args, arg)
+		if a.data {
+			unix.Data = append(unix.Data, arg)
+		} else {
+			unix.Args = append(unix.Args, arg)
+		}
 	}
 
 	// Cache return value on merge and run return filters below before
@@ -1251,18 +1431,16 @@ func handleMsgGenericKprobe(m *api.MsgGenericKprobe, gk *genericKprobe, r *bytes
 
 	// there are two events for this probe (entry and return)
 	if gk.loadArgs.retprobe {
-		// if an event exist already, try to merge them. Otherwise, add
-		// the one we have in the map.
-		curr := pendingEvent{ev: unix, returnEvent: returnEvent}
-		key := pendingEventKey{eventId: m.RetProbeId, ktimeEnter: ktimeEnter}
-
-		if prev, exists := gk.pendingEvents.Get(key); exists {
-			gk.pendingEvents.Remove(key)
-			unix = retprobeMerge(prev, curr)
-		} else {
-			gk.pendingEvents.Add(key, curr)
-			kprobemetrics.MergePushedInc()
-			unix = nil
+		var other *tracing.MsgGenericKprobeUnix
+		_, unix, other = retprobeMergeEvents[*tracing.MsgGenericKprobeUnix](
+			unix,
+			gk.pendingEvents,
+			returnEvent,
+			m.RetProbeId,
+			ktimeEnter,
+			reportMergeError[*tracing.MsgGenericKprobeUnix])
+		if unix != nil {
+			unix.ReturnAction = other.Msg.ActionId
 		}
 	}
 	if unix == nil {
@@ -1278,98 +1456,6 @@ func handleMsgGenericKprobe(m *api.MsgGenericKprobe, gk *genericKprobe, r *bytes
 	return []observer.Event{unix}, err
 }
 
-func reportMergeError(curr pendingEvent, prev pendingEvent) {
-	currFn := "UNKNOWN"
-	if curr.ev != nil {
-		currFn = curr.ev.FuncName
-	}
-	currType := kprobemetrics.MergeErrorTypeEnter
-	if curr.returnEvent {
-		currType = kprobemetrics.MergeErrorTypeExit
-	}
-
-	prevFn := "UNKNOWN"
-	if prev.ev != nil {
-		prevFn = prev.ev.FuncName
-	}
-	prevType := kprobemetrics.MergeErrorTypeEnter
-	if prev.returnEvent {
-		prevType = kprobemetrics.MergeErrorTypeExit
-	}
-
-	kprobemetrics.MergeErrorsInc(currFn, prevFn, currType, prevType)
-	logger.GetLogger().WithFields(logrus.Fields{
-		"currFn":   currFn,
-		"currType": currType.String(),
-		"prevFn":   prevFn,
-		"prevType": prevType.String(),
-	}).Debugf("failed to merge events")
-}
-
-// retprobeMerge merges the two events: the one from the entry probe with the one from the return probe
-func retprobeMerge(prev pendingEvent, curr pendingEvent) *tracing.MsgGenericKprobeUnix {
-	var retEv, enterEv *tracing.MsgGenericKprobeUnix
-
-	if prev.returnEvent && !curr.returnEvent {
-		retEv = prev.ev
-		enterEv = curr.ev
-	} else if !prev.returnEvent && curr.returnEvent {
-		retEv = curr.ev
-		enterEv = prev.ev
-	} else {
-		reportMergeError(curr, prev)
-		return nil
-	}
-
-	kprobemetrics.MergeOkTotalInc()
-
-	for _, retArg := range retEv.Args {
-		index := retArg.GetIndex()
-		if uint64(len(enterEv.Args)) > index {
-			enterEv.Args[index] = retArg
-		} else {
-			enterEv.Args = append(enterEv.Args, retArg)
-		}
-	}
-	enterEv.ReturnAction = retEv.Msg.ActionId
-	return enterEv
-}
-
 func (k *observerKprobeSensor) LoadProbe(args sensors.LoadProbeArgs) error {
-	return loadGenericKprobeSensor(args.BPFDir, args.Load, args.Verbose)
-}
-
-func selectorsHaveRateLimit(selectors []v1alpha1.KProbeSelector) bool {
-	for _, selector := range selectors {
-		for _, matchAction := range selector.MatchActions {
-			if len(matchAction.RateLimit) > 0 {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func selectorsHaveStackTrace(selectors []v1alpha1.KProbeSelector) bool {
-	for _, selector := range selectors {
-		for _, matchAction := range selector.MatchActions {
-			if matchAction.KernelStackTrace || matchAction.UserStackTrace {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func selectorsHaveFDInstall(sel []v1alpha1.KProbeSelector) bool {
-	for _, selector := range sel {
-		for _, matchAction := range selector.MatchActions {
-			if a := selectors.ActionTypeFromString(matchAction.Action); a == selectors.ActionTypeFollowFd ||
-				a == selectors.ActionTypeUnfollowFd ||
-				a == selectors.ActionTypeCopyFd {
-				return true
-			}
-		}
-	}
-	return false
+	return loadGenericKprobeSensor(args.BPFDir, args.Load, args.Maps, args.Verbose, false)
 }

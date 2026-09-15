@@ -61,7 +61,7 @@ See further resources:
 
 ## Join the community
 
-Join the Tetragon [💬 Slack channel](https://cilium.herokuapp.com/) and the
+Join the Tetragon [💬 Slack channel](https://slack.cilium.io) and the
 [📅 Community Call](https://isogo.to/tetragon-meeting-notes) to chat with
 developers, maintainers, and other users. This is a good first stop to ask
 questions and share your experiences.
@@ -72,3 +72,9 @@ For getting started with local development, you can refer to the
 [Contribution Guide](https://tetragon.io/docs/contribution-guide/). If
 you plan to submit a PR, please ["sign-off"](https://tetragon.io/docs/contribution-guide/developer-certificate-of-origin/)
 your commits.
+
+## Adopters
+
+A list of adopters of the Tetragon project and who is deploying it in
+production, and of their use cases, can be found in the
+[USERS.md](https://github.com/cilium/tetragon/blob/main/USERS.md) file.

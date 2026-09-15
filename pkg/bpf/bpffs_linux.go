@@ -1,120 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Cilium
 
-//go:build linux
-// +build linux
-
 package bpf
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 	"syscall"
 
 	"github.com/cilium/ebpf/rlimit"
+
 	"github.com/cilium/tetragon/pkg/defaults"
 	"github.com/cilium/tetragon/pkg/logger"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
 	"github.com/cilium/tetragon/pkg/mountinfo"
 )
 
-var (
-	// Path to where bpffs is mounted
-	mapRoot = defaults.DefaultMapRoot
-
+const (
 	// Path to where debugfs is mounted
 	debugFSRoot = "/sys/kernel/debug"
-
+	// Path to where tracefs is mounted
+	traceFSRoot = "/sys/kernel/tracing"
 	// Path to where cgroup2 is mounted
 	cgroup2Root = defaults.Cgroup2Dir
-
-	// Prefix for all maps (default: tc/globals)
-	mapPrefix = defaults.DefaultMapPrefix
-
-	// Set to true on first get request to detect misorder
-	lockedDown      = false
-	once            sync.Once
-	readMountInfo   sync.Once
-	mountInfoPrefix string
 )
 
-func lockDown() {
-	lockedDown = true
-}
-
-func SetMapRoot(path string) {
-	if lockedDown {
-		panic("SetMapRoot() call after MapRoot was read")
-	}
-	mapRoot = path
-}
-
-func GetMapRoot() string {
-	once.Do(lockDown)
-	return mapRoot
-}
-
-func SetMapPrefix(path string) {
-	if lockedDown {
-		panic("SetMapPrefix() call after MapPrefix was read")
-	}
-	mapPrefix = path
-}
-
-func MapPrefixPath() string {
-	once.Do(lockDown)
-	return filepath.Join(mapRoot, mapPrefix)
-}
-
-func mapPathFromMountInfo(name string) string {
-	readMountInfo.Do(func() {
-		mountInfos, err := mountinfo.GetMountInfo()
-		if err != nil {
-			logger.GetLogger().WithError(err).Warn("Could not get mount info for map root lookup")
-		}
-
-		for _, mountInfo := range mountInfos {
-			if mountInfo.FilesystemType == mountinfo.FilesystemTypeBPFFS {
-				mountInfoPrefix = filepath.Join(mountInfo.MountPoint, mapPrefix)
-				return
-			}
-		}
-
-		logger.GetLogger().Warn("Could not find BPF map root")
-	})
-
-	return filepath.Join(mountInfoPrefix, name)
-}
-
-// MapPath returns a path for a BPF map with a given name.
-func MapPath(name string) string {
-	return mapPathFromMountInfo(name)
-}
-
-// LocalMapName returns the name for a BPF map that is local to the specified ID.
-func LocalMapName(name string, id uint16) string {
-	return fmt.Sprintf("%s%05d", name, id)
-}
-
-// LocalMapPath returns the path for a BPF map that is local to the specified ID.
-func LocalMapPath(name string, id uint16) string {
-	return MapPath(LocalMapName(name, id))
-}
-
-// Environment returns a list of environment variables which are needed to make
-// BPF programs and tc aware of the actual BPFFS mount path.
-func Environment() []string {
-	return append(
-		os.Environ(),
-		fmt.Sprintf("CILIUM_BPF_MNT=%s", GetMapRoot()),
-		fmt.Sprintf("TC_BPF_MNT=%s", GetMapRoot()),
-	)
-}
-
-var (
-	mountOnce sync.Once
-)
+var mountOnce sync.Once
 
 // mountFS mounts the BPFFS filesystem into the desired mapRoot directory.
 func mountFS(root, kind string) error {
@@ -122,10 +35,10 @@ func mountFS(root, kind string) error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			if err := os.MkdirAll(root, 0755); err != nil {
-				return fmt.Errorf("unable to create %s mount directory: %s", kind, err)
+				return fmt.Errorf("unable to create %s mount directory: %w", kind, err)
 			}
 		} else {
-			return fmt.Errorf("failed to stat the mount path %s: %s", root, err)
+			return fmt.Errorf("failed to stat the mount path %s: %w", root, err)
 
 		}
 	} else if !mapRootStat.IsDir() {
@@ -133,7 +46,7 @@ func mountFS(root, kind string) error {
 	}
 
 	if err := syscall.Mount(root, root, kind, 0, ""); err != nil {
-		return fmt.Errorf("failed to mount %s %s: %s", root, kind, err)
+		return fmt.Errorf("failed to mount %s %s: %w", root, kind, err)
 	}
 	return nil
 }
@@ -181,7 +94,7 @@ func checkOrMountCustomLocation(bpfRoot string) error {
 		return fmt.Errorf("mount in the custom directory %s has a different filesystem than BPFFS", bpfRoot)
 	}
 
-	logger.GetLogger().Debugf("Detected mounted BPF filesystem at %s", mapRoot)
+	logger.GetLogger().Debug("Detected mounted BPF filesystem at " + mapRoot)
 
 	return nil
 }
@@ -201,7 +114,26 @@ func checkOrMountDebugFSDefaultLocations() error {
 		return mountFS(debugFSRoot, mountinfo.FilesystemTypeDebugFS)
 	}
 	if !debugfsInstance {
-		return fmt.Errorf("instance exists with othe type")
+		return errors.New("instance exists with other type")
+	}
+	return nil
+}
+
+func checkOrMountTraceFSDefaultLocations() error {
+	infos, err := mountinfo.GetMountInfo()
+	if err != nil {
+		return err
+	}
+
+	mounted, tracefsInstance := mountinfo.IsMountFS(infos, mountinfo.FilesystemTypeTraceFS, traceFSRoot)
+
+	// If /sys/kernel/tracing is not mounted at all, we should mount
+	// traceFS there.
+	if !mounted {
+		return mountFS(traceFSRoot, mountinfo.FilesystemTypeTraceFS)
+	}
+	if !tracefsInstance {
+		return errors.New("instance exists with other type")
 	}
 	return nil
 }
@@ -222,7 +154,7 @@ func checkOrMountCgroupDefaultLocation() error {
 		return mountFS(cgroup2Root, mountinfo.FilesystemTypeCgroup2)
 	}
 	if !cgroupInstance {
-		return fmt.Errorf("instance exists with other type")
+		return errors.New("instance exists with other type")
 	}
 	return nil
 }
@@ -264,12 +196,11 @@ func checkOrMountDefaultLocations() error {
 		// such as the connection tracking table of the BPF programs to
 		// be released which will cause all connections into local
 		// containers to be dropped. User is going to be warned.
-		logger.GetLogger().Warnf("BPF filesystem is going to be mounted automatically "+
+		logger.GetLogger().Warn(fmt.Sprintf("BPF filesystem is going to be mounted automatically "+
 			"in %s. However, it probably means that Cilium is running "+
 			"inside container and BPFFS is not mounted on the host. "+
 			"for more information, see: https://cilium.link/err-bpf-mount",
-			defaults.DefaultMapRootFallback,
-		)
+			defaults.DefaultMapRootFallback))
 		SetMapRoot(defaults.DefaultMapRootFallback)
 
 		infos, err = mountinfo.GetMountInfo()
@@ -283,11 +214,11 @@ func checkOrMountDefaultLocations() error {
 				return err
 			}
 		} else if !cBpffsInstance {
-			logger.GetLogger().Warnf("%s is mounted but has a different filesystem than BPFFS", defaults.DefaultMapRootFallback)
+			logger.GetLogger().Warn(defaults.DefaultMapRootFallback + " is mounted but has a different filesystem than BPFFS")
 		}
 	}
 
-	logger.GetLogger().Debugf("Detected mounted BPF filesystem at %s", mapRoot)
+	logger.GetLogger().Debug("Detected mounted BPF filesystem at " + mapRoot)
 
 	return nil
 }
@@ -320,13 +251,23 @@ func checkOrMountFS(bpfRoot string) error {
 func CheckOrMountFS(bpfRoot string) {
 	mountOnce.Do(func() {
 		if err := checkOrMountFS(bpfRoot); err != nil {
-			logger.GetLogger().WithError(err).Warn("Unable to mount BPF filesystem")
+			logger.GetLogger().Warn("Unable to mount BPF filesystem", logfields.Error, err)
 		}
 	})
 }
 
-func CheckOrMountDebugFS() error {
-	return checkOrMountDebugFSDefaultLocations()
+// CheckOrMountTraceFS tries to mount tracefs.
+// TraceFS is available since linux 4.1.
+// In case it isn't available, fallbacks at mounting debugfs.
+// By 2030, debugfs tracing automount will be killed upstream:
+// https://github.com/torvalds/linux/commit/9ba817fb7c6afd3c86a6d4c3b822924b87ef0348
+func CheckOrMountTraceFS() error {
+	err := checkOrMountTraceFSDefaultLocations()
+	if err != nil {
+		logger.GetLogger().Warn("TraceFS not available; fallback at using debugFS. Please file an issue on cilium/tetragon sharing your OS info", "tracefs", traceFSRoot, "debugfs", debugFSRoot)
+		err = checkOrMountDebugFSDefaultLocations()
+	}
+	return err
 }
 
 func CheckOrMountCgroup2() error {

@@ -8,28 +8,29 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf"
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/cilium/tetragon/pkg/logger"
+	"github.com/cilium/tetragon/pkg/metrics"
 	"github.com/cilium/tetragon/pkg/metrics/mapmetrics"
 	"github.com/cilium/tetragon/pkg/option"
 	"github.com/cilium/tetragon/pkg/sensors"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
 )
 
-// bpfCollector implements prometheus.Collector. It collects metrics directly from BPF maps.
-type bpfCollector struct{}
-
-func NewBPFCollector() prometheus.Collector {
-	return &bpfCollector{}
+func NewBPFCollector() metrics.CollectorWithInit {
+	return metrics.NewCustomCollector(
+		metrics.CustomMetrics{
+			mapmetrics.MapSize,
+			mapmetrics.MapCapacity,
+			mapmetrics.MapErrorsUpdate,
+			mapmetrics.MapErrorsDelete,
+		},
+		collect,
+		collectForDocs,
+	)
 }
 
-func (c *bpfCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- mapmetrics.MapSize.Desc()
-	ch <- mapmetrics.MapCapacity.Desc()
-	ch <- mapmetrics.MapErrors.Desc()
-}
-
-func (c *bpfCollector) Collect(ch chan<- prometheus.Metric) {
+func collect(ch chan<- prometheus.Metric) {
 	statsSuffix := "_stats"
 	// Depending on the sensors that are loaded and the dependencies between them,
 	// sensors.AllMaps may have the same map name multiple times. This can cause in
@@ -37,7 +38,7 @@ func (c *bpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// collected metric "XXX" {...} was collected before with the same name and label values
 	// To avoid that we keep a map and we process each map only once.
 	processedMaps := make(map[string]bool)
-	for _, m := range sensors.AllMaps {
+	for _, m := range sensors.AllMaps() {
 		name := m.Name
 		if ok := processedMaps[name]; ok {
 			// We have already got the stats of this map
@@ -64,26 +65,32 @@ func (c *bpfCollector) Collect(ch chan<- prometheus.Metric) {
 		if err != nil {
 			// We have already opened the map with _stats suffix
 			// so we don't expect that to fail.
-			logger.GetLogger().WithFields(logrus.Fields{
-				"MapName":      pin,
-				"StatsMapName": pinStats,
-			}).Warn("Failed to open the corresponding map for an existing stats map.")
+			logger.GetLogger().Warn("Failed to open the corresponding map for an existing stats map.",
+				"MapName", pin, "StatsMapName", pinStats)
 			continue
 		}
 		defer mapLink.Close()
 
-		updateMapSize(ch, mapLinkStats, name)
 		ch <- mapmetrics.MapCapacity.MustMetric(
 			float64(mapLink.MaxEntries()),
 			name,
 		)
-		updateMapErrors(ch, mapLinkStats, name)
+		update(mapLinkStats, 0, func(sum float64) {
+			ch <- mapmetrics.MapSize.MustMetric(sum, name)
+		})
+		update(mapLinkStats, 1, func(sum float64) {
+			ch <- mapmetrics.MapErrorsUpdate.MustMetric(sum, name)
+		})
+		update(mapLinkStats, 2, func(sum float64) {
+			ch <- mapmetrics.MapErrorsDelete.MustMetric(sum, name)
+		})
 	}
 }
 
-func updateMapSize(ch chan<- prometheus.Metric, mapLinkStats *ebpf.Map, name string) {
+func update(mapLinkStats *ebpf.Map, key int32, update func(sum float64)) {
 	var values []int64
-	if err := mapLinkStats.Lookup(int32(0), &values); err != nil {
+
+	if err := mapLinkStats.Lookup(key, &values); err != nil {
 		return
 	}
 
@@ -91,65 +98,14 @@ func updateMapSize(ch chan<- prometheus.Metric, mapLinkStats *ebpf.Map, name str
 	for _, n := range values {
 		sum += n
 	}
-	ch <- mapmetrics.MapSize.MustMetric(
-		float64(sum),
-		name,
-	)
+	update(float64(sum))
 }
 
-func updateMapErrors(ch chan<- prometheus.Metric, mapLinkStats *ebpf.Map, name string) {
-	var values []int64
-	if err := mapLinkStats.Lookup(int32(1), &values); err != nil {
-		return
-	}
-
-	sum := int64(0)
-	for _, n := range values {
-		sum += n
-	}
-	ch <- mapmetrics.MapErrors.MustMetric(
-		float64(sum),
-		name,
-	)
-}
-
-// bpfZeroCollector implements prometheus.Collector. It collects "zero" metrics.
-// It's intended to be used when BPF metrics are not collected, but we still want
-// Prometheus metrics to be exposed.
-type bpfZeroCollector struct {
-	bpfCollector
-}
-
-func NewBPFZeroCollector() prometheus.Collector {
-	return &bpfZeroCollector{
-		bpfCollector: bpfCollector{},
-	}
-}
-
-func (c *bpfZeroCollector) Describe(ch chan<- *prometheus.Desc) {
-	c.bpfCollector.Describe(ch)
-}
-
-func (c *bpfZeroCollector) Collect(ch chan<- prometheus.Metric) {
-	// This list should contain all monitored maps.
-	// These are not maps from which metrics are read in the "real" collector -
-	// the metrics are stored in separate maps suffixed with "_stats".
-	monitoredMaps := []string{
-		"execve_map",
-		"tg_execve_joined_info_map",
-	}
-	for _, m := range monitoredMaps {
-		ch <- mapmetrics.MapSize.MustMetric(
-			0,
-			m,
-		)
-		ch <- mapmetrics.MapCapacity.MustMetric(
-			0,
-			m,
-		)
-		ch <- mapmetrics.MapErrors.MustMetric(
-			0,
-			m,
-		)
+func collectForDocs(ch chan<- prometheus.Metric) {
+	for _, m := range mapmetrics.MapLabel.Values {
+		ch <- mapmetrics.MapSize.MustMetric(0, m)
+		ch <- mapmetrics.MapCapacity.MustMetric(0, m)
+		ch <- mapmetrics.MapErrorsUpdate.MustMetric(0, m)
+		ch <- mapmetrics.MapErrorsDelete.MustMetric(0, m)
 	}
 }

@@ -4,29 +4,46 @@
 package base
 
 import (
+	"fmt"
 	"log"
 	"sync"
+	"testing"
+	"unsafe"
 
+	"github.com/cilium/tetragon/pkg/config"
+	"github.com/cilium/tetragon/pkg/errmetrics"
+	"github.com/cilium/tetragon/pkg/execvemapupdater"
 	"github.com/cilium/tetragon/pkg/ksyms"
 	"github.com/cilium/tetragon/pkg/logger"
+	"github.com/cilium/tetragon/pkg/mbset"
 	"github.com/cilium/tetragon/pkg/option"
 	"github.com/cilium/tetragon/pkg/sensors"
-	"github.com/cilium/tetragon/pkg/sensors/exec/config"
+	"github.com/cilium/tetragon/pkg/sensors/exec/execvemap"
 	"github.com/cilium/tetragon/pkg/sensors/program"
+	"github.com/cilium/tetragon/pkg/strutils"
 )
 
 const (
-	cgroupRateMaxEntries = 32768 // this value could be fine tuned
+	execveMapMaxEntries = 32768
+	RingBufMapName      = "tg_rb_events"
 )
 
 var (
 	Execve = program.Builder(
 		config.ExecObj(),
 		"sched/sched_process_exec",
-		"tracepoint/sys_execve",
+		"raw_tracepoint/sys_execve",
 		"event_execve",
 		"execve",
-	)
+	).SetPolicy(sensors.BaseSensorName)
+
+	ExecveMapUpdate = program.Builder(
+		config.ExecUpdateObj(),
+		"socket",
+		"socket",
+		"execve_map_update",
+		"socket",
+	).SetPolicy(sensors.BaseSensorName)
 
 	ExecveBprmCommit = program.Builder(
 		"bpf_execve_bprm_commit_creds.o",
@@ -34,39 +51,35 @@ var (
 		"kprobe/security_bprm_committing_creds",
 		"tg_kp_bprm_committing_creds",
 		"kprobe",
-	)
+	).SetPolicy(sensors.BaseSensorName)
 
 	Exit = program.Builder(
-		"bpf_exit.o",
+		config.ExitObj(),
 		"acct_process",
 		"kprobe/acct_process",
 		"event_exit",
 		"kprobe",
-	)
+	).SetPolicy(sensors.BaseSensorName)
 
 	Fork = program.Builder(
-		"bpf_fork.o",
+		config.ForkObj(),
 		"wake_up_new_task",
 		"kprobe/wake_up_new_task",
 		"kprobe_pid_clear",
 		"kprobe",
-	)
-
-	CgroupRmdir = program.Builder(
-		"bpf_cgroup.o",
-		"cgroup/cgroup_rmdir",
-		"raw_tracepoint/cgroup_rmdir",
-		"tg_cgroup_rmdir",
-		"raw_tracepoint",
-	)
+	).SetPolicy(sensors.BaseSensorName)
 
 	/* Event Ring map */
-	TCPMonMap = program.MapBuilder("tcpmon_map", Execve)
+	TCPMonMap     = program.MapBuilder("tcpmon_map", Execve)
+	RingBufEvents = program.MapBuilder(RingBufMapName, Execve, Exit, Fork)
 	/* Networking and Process Monitoring maps */
-	ExecveMap          = program.MapBuilder("execve_map", Execve)
-	ExecveTailCallsMap = program.MapBuilderPin("execve_calls", "execve_calls", Execve)
+	ExecveMap           = program.MapBuilder("execve_map", Execve, Exit, Fork, ExecveBprmCommit, ExecveMapUpdate)
+	ExecveTailCallsMap  = program.MapBuilderProgram("execve_calls", Execve)
+	ExecveMapUpdateData = program.MapBuilder("execve_map_update_data", ExecveMapUpdate)
 
 	ExecveJoinMap = program.MapBuilder("tg_execve_joined_info_map", ExecveBprmCommit)
+
+	ParentBinariesMap = program.MapBuilder("tg_parents_bin", Execve, Exit)
 
 	/* Tetragon runtime configuration */
 	TetragonConfMap = program.MapBuilder("tg_conf_map", Execve)
@@ -76,39 +89,90 @@ var (
 	ExecveJoinMapStats = program.MapBuilder("tg_execve_joined_info_map_stats", ExecveBprmCommit)
 	StatsMap           = program.MapBuilder("tg_stats_map", Execve)
 
-	/* Cgroup rate data, attached to execve sensor */
-	CgroupRateMap        = program.MapBuilder("cgroup_rate_map", Execve, Exit, Fork, CgroupRmdir)
-	CgroupRateOptionsMap = program.MapBuilder("cgroup_rate_options_map", Execve)
+	MatchBinariesSetMap = program.MapBuilder(mbset.MapName, Execve)
+	MatchBinariesGenMap = program.MapBuilder(mbset.GenName, Execve)
 
-	sensor = sensors.Sensor{
-		Name: "__base__",
-	}
-	sensorInit sync.Once
-
-	sensorTest = sensors.Sensor{
-		Name: "__base__",
-	}
-	sensorTestInit sync.Once
+	ErrMetricsMap = program.MapBuilder(errmetrics.MapName, Execve)
 )
 
-func setupExitProgram() {
+func parseExecveMapSize(str string) (int, error) {
+	// set entries based on size
+	size, err := strutils.ParseSize(str)
+	if err != nil {
+		return 0, err
+	}
+	val := size / int(unsafe.Sizeof(execvemap.ExecveValue{}))
+	return val, nil
+}
+
+func GetExecveEntries(configEntries int, configSize string) int {
+	// Setup execve_map max entries
+	if configEntries != 0 && len(configSize) != 0 {
+		log.Fatal("Both ExecveMapEntries and ExecveMapSize set, confused..")
+	}
+
+	var (
+		entries int
+		err     error
+	)
+
+	if configEntries != 0 {
+		entries = configEntries
+	} else if len(configSize) != 0 {
+		if entries, err = parseExecveMapSize(configSize); err != nil {
+			log.Fatal("Failed to parse ExecveMapSize value")
+		}
+	} else {
+		entries = execveMapMaxEntries
+	}
+
+	return entries
+}
+
+func setupSensor() {
+	// exit program function
 	ks, err := ksyms.KernelSymbols()
 	if err == nil {
-		has_acct_process := ks.IsAvailable("acct_process")
-		has_disassociate_ctty := ks.IsAvailable("disassociate_ctty")
+		hasAcctProcess := ks.IsAvailable("acct_process")
+		hasDisassociateCtty := ks.IsAvailable("disassociate_ctty")
 
 		/* Preffer acct_process over disassociate_ctty */
-		if has_acct_process {
+		if hasAcctProcess {
 			Exit.Attach = "acct_process"
 			Exit.Label = "kprobe/acct_process"
-		} else if has_disassociate_ctty {
+		} else if hasDisassociateCtty {
 			Exit.Attach = "disassociate_ctty"
 			Exit.Label = "kprobe/disassociate_ctty"
 		} else {
 			log.Fatal("Failed to detect exit probe symbol.")
 		}
 	}
-	logger.GetLogger().Infof("Exit probe on %s", Exit.Attach)
+	logger.GetLogger().Info("Exit probe on " + Exit.Attach)
+
+	entries := GetExecveEntries(option.Config.ExecveMapEntries, option.Config.ExecveMapSize)
+	ExecveMap.SetMaxEntries(entries)
+
+	logger.GetLogger().Info(fmt.Sprintf("Set execve_map entries %d", entries),
+		"size", strutils.SizeWithSuffix(entries*int(unsafe.Sizeof(execvemap.ExecveValue{}))))
+
+	if !config.EnableV511Progs() && option.Config.EnableProcessEnvironmentVariables {
+		Execve.RewriteConstants["ENV_VARS_ENABLED"] = uint8(1)
+	}
+
+	if !config.EnableV511Progs() && option.Config.ParentsMapEnabled {
+		Execve.RewriteConstants["PARENTS_MAP_ENABLED"] = uint8(1)
+	}
+
+	if !config.EnableV511Progs() && len(option.Config.BPFDebugAreas.Values) > 0 {
+		Execve.RewriteConstants["BPF_DEBUG_ENABLED"] = option.Config.BPFDebugAreas.ToBPFConfig()
+	}
+
+	if option.Config.ParentsMapEnabled {
+		entries = GetExecveEntries(option.Config.ParentsMapEntries, option.Config.ParentsMapSize)
+		ParentBinariesMap.SetMaxEntries(entries)
+		logger.GetLogger().Info(fmt.Sprintf("Set parents_map entries %d", entries),
+			"size", strutils.SizeWithSuffix(entries*int(unsafe.Sizeof(execvemap.ExecveValue{}))))
+	}
 }
 
 func GetExecveMap() *program.Map {
@@ -123,60 +187,44 @@ func GetTetragonConfMap() *program.Map {
 	return TetragonConfMap
 }
 
-func GetDefaultPrograms(cgroupRate bool) []*program.Program {
-	progs := []*program.Program{
-		Exit,
-		Fork,
-		Execve,
-		ExecveBprmCommit,
+func initBaseSensor() *sensors.Sensor {
+	sensor := sensors.Sensor{
+		Name: sensors.BaseSensorName,
 	}
-	if cgroupRate {
-		progs = append(progs, CgroupRmdir)
+	setupSensor()
+	if config.EnableLargeProgs() {
+		mbset.SetMBSetUpdater(&execvemapupdater.ExecveMapUpdater{
+			Load: ExecveMapUpdate,
+			Map:  ExecveMapUpdateData,
+		})
 	}
-	return progs
+	sensor.Progs = GetDefaultPrograms()
+	sensor.Maps = GetDefaultMaps()
+	return ApplyExtensions(&sensor)
 }
 
-func GetDefaultMaps(cgroupRate bool) []*program.Map {
-	maps := []*program.Map{
-		ExecveMap,
-		ExecveJoinMap,
-		ExecveStats,
-		ExecveJoinMapStats,
-		ExecveTailCallsMap,
-		TCPMonMap,
-		TetragonConfMap,
-		StatsMap,
+func initBaseSensorFn() func(tb testing.TB) *sensors.Sensor {
+	var (
+		s *sensors.Sensor
+		m sync.Mutex
+	)
+	return func(tb testing.TB) *sensors.Sensor {
+		m.Lock()
+		defer m.Unlock()
+		if s == nil {
+			s = initBaseSensor()
+			tb.Cleanup(func() {
+				tb.Logf("cleanup: unloading base sensor")
+				s.Unload(true)
+				s = nil
+			})
+		}
+		return s
 	}
-	if cgroupRate {
-		maps = append(maps, CgroupRateMap, CgroupRateOptionsMap)
-	}
-	return maps
-
 }
 
-// GetInitialSensor returns the base sensor
-func GetInitialSensor() *sensors.Sensor {
-	sensorInit.Do(func() {
-		setupExitProgram()
-		sensor.Progs = GetDefaultPrograms(option.CgroupRateEnabled())
-		sensor.Maps = GetDefaultMaps(option.CgroupRateEnabled())
-	})
-	return &sensor
-}
-
-func GetInitialSensorTest() *sensors.Sensor {
-	sensorTestInit.Do(func() {
-		setupExitProgram()
-		sensorTest.Progs = GetDefaultPrograms(true)
-		sensorTest.Maps = GetDefaultMaps(true)
-	})
-	return &sensorTest
-}
-
-func ConfigCgroupRate(opts *option.CgroupRate) {
-	if opts.Events == 0 || opts.Interval == 0 {
-		return
-	}
-
-	CgroupRateMap.SetMaxEntries(cgroupRateMaxEntries)
-}
+var (
+	// GetInitialSensor returns the base sensor
+	GetInitialSensor     = sync.OnceValue(initBaseSensor)
+	GetInitialSensorTest = initBaseSensorFn()
+)

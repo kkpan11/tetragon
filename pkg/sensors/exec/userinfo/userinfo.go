@@ -7,7 +7,6 @@ import (
 	"errors"
 
 	"github.com/cilium/tetragon/pkg/api/processapi"
-	"github.com/cilium/tetragon/pkg/grpc/exec"
 	"github.com/cilium/tetragon/pkg/metrics/errormetrics"
 	"github.com/cilium/tetragon/pkg/option"
 	"github.com/cilium/tetragon/pkg/reader/namespace"
@@ -34,16 +33,16 @@ func getAccountUnix(uid uint32, ns *processapi.MsgNamespaces) (string, error) {
 	return "", ErrNotInHostNs
 }
 
-func MsgToExecveAccountUnix(m *exec.MsgExecveEventUnix) error {
+func MsgToExecveAccountUnix(unix *processapi.MsgExecveEventUnix) error {
 	if option.Config.UsernameMetadata == int(option.USERNAME_METADATA_UNIX) {
-		username, err := getAccountUnix(m.Unix.Process.UID, &m.Unix.Msg.Namespaces)
+		username, err := getAccountUnix(unix.Process.UID, &unix.Msg.Namespaces)
 		if err == nil {
-			m.Unix.Process.User.Name = username
+			unix.Process.User.Name = username
 			return nil
 		}
 
 		if errors.Is(err, ErrNotInHostNs) {
-			errormetrics.ErrorTotalInc(errormetrics.ProcessMetadataUsernameIgnoredNotInHost)
+			errormetrics.DebugTotalInc(errormetrics.ProcessMetadataUsernameIgnoredNotInHost)
 		} else {
 			errormetrics.ErrorTotalInc(errormetrics.ProcessMetadataUsernameFailed)
 		}

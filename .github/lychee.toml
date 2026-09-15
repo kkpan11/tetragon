@@ -1,13 +1,18 @@
-verbose = "info"
+verbose = "warn"
+# In our use case, we do not care about certificate-related issue
+# https://lychee.cli.rs/troubleshooting/network-errors/
+insecure = true
 
 exclude = [
   # this application is down from time to time
-  'cilium.herokuapp.com', 
+  'slack.cilium.io',
   # the relative link in README is implicit,
   # see https://github.blog/2013-01-31-relative-links-in-markup-files/
   'docs/assets/icons/logo.*\.svg', 
   # the virtualbox website sends 500 regularly
   'virtualbox.org',
+  # this blog has transient certificate issues
+  'nakryiko.com',
   # this is for the documentation contributor guide
   '^http://localhost:1313/docs$',
   # this is a form POST link in the index.html

@@ -5,6 +5,7 @@ package durationmatcher
 
 import (
 	json "encoding/json"
+	"errors"
 	fmt "fmt"
 	strings "strings"
 	time "time"
@@ -35,7 +36,7 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 }
 
 func (d Duration) MarshalJSON() ([]byte, error) {
-	return json.Marshal(d.Duration.String())
+	return json.Marshal(d.String())
 }
 
 type durationBetween struct {
@@ -43,15 +44,16 @@ type durationBetween struct {
 	Upper *Duration `json:"upper"`
 }
 
-type durationValue interface {
-	// *Duration
-	// *durationBetween
-}
+//	{
+//		*Duration
+//		*durationBetween
+//	}
+type durationValue any
 
 func (m *DurationMatcher) checkFull(duration *time.Duration) error {
 	value, ok := m.Value.(*Duration)
 	if !ok {
-		return fmt.Errorf("value is not a duration")
+		return errors.New("value is not a duration")
 	}
 
 	if *duration != value.Duration {
@@ -64,10 +66,10 @@ func (m *DurationMatcher) checkFull(duration *time.Duration) error {
 func (m *DurationMatcher) checkLess(duration *time.Duration) error {
 	value, ok := m.Value.(*Duration)
 	if !ok {
-		return fmt.Errorf("value is not a duration")
+		return errors.New("value is not a duration")
 	}
 
-	if !(*duration <= value.Duration) {
+	if *duration > value.Duration {
 		return fmt.Errorf("%s is not less than %s", *duration, value.Duration)
 	}
 
@@ -77,10 +79,10 @@ func (m *DurationMatcher) checkLess(duration *time.Duration) error {
 func (m *DurationMatcher) checkGreater(duration *time.Duration) error {
 	value, ok := m.Value.(*Duration)
 	if !ok {
-		return fmt.Errorf("value is not a duration")
+		return errors.New("value is not a duration")
 	}
 
-	if !(*duration >= value.Duration) {
+	if *duration < value.Duration {
 		return fmt.Errorf("%s is not greater than %s", *duration, value.Duration)
 	}
 
@@ -90,18 +92,18 @@ func (m *DurationMatcher) checkGreater(duration *time.Duration) error {
 func (m *DurationMatcher) checkBetween(duration *time.Duration) error {
 	value, ok := m.Value.(*durationBetween)
 	if !ok {
-		return fmt.Errorf("value is not a duration")
+		return errors.New("value is not a duration")
 	}
 
 	if value.Upper == nil || value.Lower == nil {
-		return fmt.Errorf("value is nil")
+		return errors.New("value is nil")
 	}
 
-	if !(*duration <= value.Upper.Duration) {
+	if *duration > value.Upper.Duration {
 		return fmt.Errorf("%s is not less than %s", *duration, value.Upper.Duration)
 	}
 
-	if !(*duration >= value.Lower.Duration) {
+	if *duration < value.Lower.Duration {
 		return fmt.Errorf("%s is not greater than %s", *duration, value.Lower.Duration)
 	}
 
@@ -140,7 +142,7 @@ func operatorFromString(str string) (Operator, error) {
 		return opLess, nil
 
 	default:
-		return opUnknown, fmt.Errorf("Invalid value for DurationMatcher operator: %s", str)
+		return opUnknown, fmt.Errorf("invalid value for DurationMatcher operator: %s", str)
 	}
 }
 
@@ -181,49 +183,45 @@ func (m *DurationMatcher) Match(value *durationpb.Duration) error {
 	case opBetween:
 		{
 			if m.Value == nil {
-				return fmt.Errorf("matcher value is nil")
+				return errors.New("matcher value is nil")
 			}
 			if value == nil {
-				return fmt.Errorf("duration is nil")
+				return errors.New("duration is nil")
 			}
-			dur := value.AsDuration()
-			return m.checkBetween(&dur)
+			return m.checkBetween(new(value.AsDuration()))
 		}
 	case opFull:
 		{
 			if m.Value == nil {
-				return fmt.Errorf("matcher value is nil")
+				return errors.New("matcher value is nil")
 			}
 			if value == nil {
-				return fmt.Errorf("duration is nil")
+				return errors.New("duration is nil")
 			}
-			dur := value.AsDuration()
-			return m.checkFull(&dur)
+			return m.checkFull(new(value.AsDuration()))
 		}
 	case opGreater:
 		{
 			if m.Value == nil {
-				return fmt.Errorf("matcher value is nil")
+				return errors.New("matcher value is nil")
 			}
 			if value == nil {
-				return fmt.Errorf("duration is nil")
+				return errors.New("duration is nil")
 			}
-			dur := value.AsDuration()
-			return m.checkGreater(&dur)
+			return m.checkGreater(new(value.AsDuration()))
 		}
 	case opLess:
 		{
 			if m.Value == nil {
-				return fmt.Errorf("matcher value is nil")
+				return errors.New("matcher value is nil")
 			}
 			if value == nil {
-				return fmt.Errorf("duration is nil")
+				return errors.New("duration is nil")
 			}
-			dur := value.AsDuration()
-			return m.checkLess(&dur)
+			return m.checkLess(new(value.AsDuration()))
 		}
 	default:
-		return fmt.Errorf("Unhandled DurationMatcher operator %s", m.Operator)
+		return fmt.Errorf("unhandled DurationMatcher operator %s", m.Operator)
 	}
 }
 
@@ -248,7 +246,7 @@ func (m DurationMatcher) MarshalJSON() ([]byte, error) {
 			Alias: (*Alias)(&m),
 		})
 	default:
-		return nil, fmt.Errorf("Marshal DurationMatcher: Invalid match value")
+		return nil, errors.New("marshal DurationMatcher: Invalid match value")
 	}
 }
 
@@ -284,7 +282,7 @@ func (m *DurationMatcher) UnmarshalJSON(b []byte) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("Unmarshal DurationMatcher: Failed to unmarshal")
+	return errors.New("unmarshal DurationMatcher: Failed to unmarshal")
 }
 
 // Between constructs a new DurationMatcher that matches using the Between operator

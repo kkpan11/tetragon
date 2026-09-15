@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package cgrouprate
 
 import (
@@ -10,6 +12,8 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf"
+	"github.com/stretchr/testify/assert"
+
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/api/processapi"
 	"github.com/cilium/tetragon/pkg/bpf"
@@ -17,7 +21,6 @@ import (
 	"github.com/cilium/tetragon/pkg/reader/notify"
 	"github.com/cilium/tetragon/pkg/sensors/program"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestMain(m *testing.M) {
@@ -240,8 +243,8 @@ func TestProcessCgroup(t *testing.T) {
 		NewTestCgroupRate(l, hash, &d.opts)
 
 		// setup cgrouprate cgroup
-		handle.cgroups[key.Id] = cgroup
-		assert.NotEqual(t, nil, handle)
+		glSt.handle.cgroups[key.Id] = cgroup
+		assert.NotNil(t, glSt.handle)
 
 		// store hash values
 		values[0] = d.values[0]
@@ -252,7 +255,7 @@ func TestProcessCgroup(t *testing.T) {
 		}
 
 		t.Logf("Test %d", idx)
-		ret := handle.processCgroup(key.Id, cgroup, d.last)
+		ret := glSt.handle.processCgroup(key.Id, cgroup, d.last)
 
 		assert.Equal(t, d.ret, ret)
 		assert.Equal(t, d.throttle, l.throttle)

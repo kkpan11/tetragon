@@ -10,20 +10,21 @@ import (
 	"io"
 	"os"
 
-	hubbleV1 "github.com/cilium/cilium/pkg/hubble/api/v1"
-	hubbleFilters "github.com/cilium/cilium/pkg/hubble/filters"
-	"github.com/cilium/tetragon/api/v1/tetragon"
-	"github.com/cilium/tetragon/pkg/fieldfilters"
-	"github.com/cilium/tetragon/pkg/filters"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/encoding/protojson"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/cmd/tetra/common"
+	"github.com/cilium/tetragon/pkg/event"
+	"github.com/cilium/tetragon/pkg/fieldfilters"
+	"github.com/cilium/tetragon/pkg/filters"
 )
 
 // ioReaderClient implements tetragon.FineGuidanceSensors_GetEventsClient.
 // ioReaderObserver implements tetragon.FineGuidanceSensorsClient interface. It reads Tetragon events
 type ioReaderClient struct {
 	scanner      *bufio.Scanner
-	allowlist    hubbleFilters.FilterFuncs
+	allowlist    filters.FilterFuncs
 	fieldFilters []*fieldfilters.FieldFilter
 	unmarshaller protojson.UnmarshalOptions
 	debug        bool
@@ -31,8 +32,11 @@ type ioReaderClient struct {
 }
 
 func newIOReaderClient(reader io.Reader, debug bool) *ioReaderClient {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(nil, max(bufio.MaxScanTokenSize, common.MaxRecvMsgSize))
+
 	return &ioReaderClient{
-		scanner:      bufio.NewScanner(reader),
+		scanner:      scanner,
 		unmarshaller: protojson.UnmarshalOptions{DiscardUnknown: true},
 		debug:        debug,
 	}
@@ -95,11 +99,15 @@ func (i *ioReaderClient) DisableSensor(_ context.Context, _ *tetragon.DisableSen
 	panic("stub")
 }
 
-func (i *ioReaderClient) GetStackTraceTree(_ context.Context, _ *tetragon.GetStackTraceTreeRequest, _ ...grpc.CallOption) (*tetragon.GetStackTraceTreeResponse, error) {
+func (i *ioReaderClient) ListDomains(_ context.Context, _ *tetragon.ListDomainsRequest, _ ...grpc.CallOption) (*tetragon.ListDomainsResponse, error) {
 	panic("stub")
 }
 
 func (i *ioReaderClient) GetVersion(_ context.Context, _ *tetragon.GetVersionRequest, _ ...grpc.CallOption) (*tetragon.GetVersionResponse, error) {
+	panic("stub")
+}
+
+func (i *ioReaderClient) GetInfo(_ context.Context, _ *tetragon.GetInfoRequest, _ ...grpc.CallOption) (*tetragon.GetInfoResponse, error) {
 	panic("stub")
 }
 
@@ -108,11 +116,13 @@ func (i *ioReaderClient) Recv() (*tetragon.GetEventsResponse, error) {
 		res := &tetragon.GetEventsResponse{}
 		line := i.scanner.Bytes()
 		err := i.unmarshaller.Unmarshal(line, res)
-		if err != nil && i.debug {
-			fmt.Fprintf(os.Stderr, "DEBUG: failed unmarshal: %s: %s\n", line, err)
+		if err != nil {
+			if i.debug {
+				fmt.Fprintf(os.Stderr, "DEBUG: failed unmarshal: %s: %s\n", line, err)
+			}
 			continue
 		}
-		if !hubbleFilters.Apply(i.allowlist, nil, &hubbleV1.Event{Event: res}) {
+		if !filters.Apply(i.allowlist, nil, &event.Event{Event: res}) {
 			continue
 		}
 		for _, filter := range i.fieldFilters {
@@ -130,5 +140,17 @@ func (i *ioReaderClient) Recv() (*tetragon.GetEventsResponse, error) {
 }
 
 func (i *ioReaderClient) RuntimeHook(_ context.Context, _ *tetragon.RuntimeHookRequest, _ ...grpc.CallOption) (*tetragon.RuntimeHookResponse, error) {
+	panic("stub")
+}
+
+func (i *ioReaderClient) GetDebug(_ context.Context, _ *tetragon.GetDebugRequest, _ ...grpc.CallOption) (*tetragon.GetDebugResponse, error) {
+	panic("stub")
+}
+
+func (i *ioReaderClient) SetDebug(_ context.Context, _ *tetragon.SetDebugRequest, _ ...grpc.CallOption) (*tetragon.SetDebugResponse, error) {
+	panic("stub")
+}
+
+func (i *ioReaderClient) ConfigureTracingPolicy(_ context.Context, _ *tetragon.ConfigureTracingPolicyRequest, _ ...grpc.CallOption) (*tetragon.ConfigureTracingPolicyResponse, error) {
 	panic("stub")
 }

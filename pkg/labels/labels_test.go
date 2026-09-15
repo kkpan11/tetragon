@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !nok8s
+
 package labels
 
 import (
-	"fmt"
 	"testing"
 
-	slimv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/stretchr/testify/require"
+
+	slimv1 "github.com/cilium/tetragon/pkg/k8s/slim/k8s/apis/meta/v1"
 )
 
 type testLabel struct {
@@ -193,7 +195,6 @@ type testCmp struct {
 }
 
 func TestCmp(t *testing.T) {
-
 	cases := []testCmp{
 		{l1: map[string]string{}, l2: map[string]string{}, expected: false},
 		{l1: map[string]string{"label1": "a"}, l2: map[string]string{}, expected: true},
@@ -203,7 +204,7 @@ func TestCmp(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		require.Equal(t, tc.expected, Labels(tc.l1).Cmp(tc.l2), fmt.Sprintf("test: %+v", tc))
-		require.Equal(t, tc.expected, Labels(tc.l2).Cmp(tc.l1), fmt.Sprintf("reverse-test: %+v", tc))
+		require.Equal(t, tc.expected, Labels(tc.l1).Cmp(tc.l2), "test: %+v", tc)
+		require.Equal(t, tc.expected, Labels(tc.l2).Cmp(tc.l1), "reverse-test: %+v", tc)
 	}
 }

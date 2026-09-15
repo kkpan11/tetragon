@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build linux
+
 package observertesthelper
 
 // NB(kkourt): Function(t *testing.T, ctx context.Context) is the reasonable
@@ -19,52 +21,48 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cilium/tetragon/pkg/cgrouprate"
-	"github.com/cilium/tetragon/pkg/encoder"
-	"github.com/cilium/tetragon/pkg/metricsconfig"
-	"github.com/cilium/tetragon/pkg/observer"
-	"github.com/cilium/tetragon/pkg/policyfilter"
-	"github.com/cilium/tetragon/pkg/tracingpolicy"
-	"github.com/sirupsen/logrus"
-
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/bpf"
 	"github.com/cilium/tetragon/pkg/btf"
 	"github.com/cilium/tetragon/pkg/bugtool"
+	"github.com/cilium/tetragon/pkg/cgrouprate"
+	"github.com/cilium/tetragon/pkg/defaults"
+	"github.com/cilium/tetragon/pkg/encoder"
 	"github.com/cilium/tetragon/pkg/exporter"
 	tetragonGrpc "github.com/cilium/tetragon/pkg/grpc"
 	"github.com/cilium/tetragon/pkg/logger"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
+	"github.com/cilium/tetragon/pkg/metricsconfig"
+	"github.com/cilium/tetragon/pkg/observer"
 	"github.com/cilium/tetragon/pkg/option"
+	"github.com/cilium/tetragon/pkg/policyfilter"
 	"github.com/cilium/tetragon/pkg/process"
 	"github.com/cilium/tetragon/pkg/reader/namespace"
 	"github.com/cilium/tetragon/pkg/rthooks"
 	"github.com/cilium/tetragon/pkg/sensors"
 	"github.com/cilium/tetragon/pkg/sensors/base"
+	"github.com/cilium/tetragon/pkg/sensors/exec/procevents"
 	"github.com/cilium/tetragon/pkg/testutils"
+	"github.com/cilium/tetragon/pkg/tracingpolicy"
 	"github.com/cilium/tetragon/pkg/watcher"
-	"github.com/cilium/tetragon/pkg/watcher/crd"
-
-	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8stypes "k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/cache"
 )
 
 var (
-	metricsAddr    = "localhost:2112"
-	metricsEnabled = false
+	metricsAddr       = "localhost:2112"
+	metricsEnableOnce sync.Once
 )
 
 type testObserverOptions struct {
-	crd    bool
-	config string
-	lib    string
+	config              string
+	lib                 string
+	procCacheGCInterval time.Duration
+	keepCollection      bool
 }
 
 type testExporterOptions struct {
-	watcher   watcher.K8sResourceWatcher
-	allowList []*tetragon.Filter
-	denyList  []*tetragon.Filter
+	podAccessor watcher.PodAccessor
+	allowList   []*tetragon.Filter
+	denyList    []*tetragon.Filter
 }
 
 type TestOptions struct {
@@ -79,6 +77,22 @@ func WithMyPid() TestOption {
 	return func(o *TestOptions) {
 		o.exporter.allowList = append(o.exporter.allowList, &tetragon.Filter{
 			PidSet: []uint32{GetMyPid()},
+		})
+	}
+}
+
+// Enable KeepCollection config flag
+func WithKeepCollection() TestOption {
+	return func(o *TestOptions) {
+		o.observer.keepCollection = true
+	}
+}
+
+// Filter for a container id by prefix in event export
+func WithContainerId(id string) TestOption {
+	return func(o *TestOptions) {
+		o.exporter.allowList = append(o.exporter.allowList, &tetragon.Filter{
+			ContainerId: []string{"^" + id},
 		})
 	}
 }
@@ -101,9 +115,9 @@ func WithConfig(config string) TestOption {
 	}
 }
 
-func withK8sWatcher(w watcher.K8sResourceWatcher) TestOption {
+func WithProcCacheGCInterval(GCInterval time.Duration) TestOption {
 	return func(o *TestOptions) {
-		o.exporter.watcher = w
+		o.observer.procCacheGCInterval = GCInterval
 	}
 }
 
@@ -116,12 +130,10 @@ func WithLib(lib string) TestOption {
 func testDone(tb testing.TB, obs *observer.Observer) {
 	if tb.Failed() {
 		bugtoolFname := "/tmp/tetragon-bugtool.tar.gz"
-		if err := bugtool.Bugtool(bugtoolFname, "", ""); err == nil {
-			logger.GetLogger().WithField("test", tb.Name()).
-				WithField("file", bugtoolFname).Info("Dumped bugtool info")
+		if err := bugtool.Bugtool(bugtoolFname, "", "", 1024*1024, nil, nil); err == nil {
+			logger.GetLogger().Info("Dumped bugtool info", "test", tb.Name(), "file", bugtoolFname)
 		} else {
-			logger.GetLogger().WithField("test", tb.Name()).
-				WithField("file", bugtoolFname).Warnf("Failed to dump bugtool info: %v", err)
+			logger.GetLogger().Warn("Failed to dump bugtool info", logfields.Error, err, "test", tb.Name(), "file", bugtoolFname)
 		}
 	}
 
@@ -133,46 +145,38 @@ func testDone(tb testing.TB, obs *observer.Observer) {
 func saveInitInfo(o *TestOptions, exportFile string) error {
 	exportPath, err := filepath.Abs(exportFile)
 	if err != nil {
-		logger.GetLogger().Warnf("Failed to get export path when saving init info: %v", err)
+		logger.GetLogger().Warn("Failed to get export path when saving init info", logfields.Error, err)
 	}
 	btfPath, err := filepath.Abs(btf.GetCachedBTFFile())
 	if err != nil {
-		logger.GetLogger().Warnf("Failed to get BTF path when saving init info: %v", err)
+		logger.GetLogger().Warn("Failed to get BTF path when saving init info", logfields.Error, err)
 	}
 	libPath, err := filepath.Abs(o.observer.lib)
 	if err != nil {
-		logger.GetLogger().Warnf("Failed to get lib path when saving init info: %v", err)
+		logger.GetLogger().Warn("Failed to get lib path when saving init info", logfields.Error, err)
 	}
 	info := bugtool.InitInfo{
 		ExportFname: exportPath,
 		LibDir:      libPath,
-		BtfFname:    btfPath,
+		BTFFname:    btfPath,
 		MetricsAddr: metricsAddr,
 		ServerAddr:  "",
 	}
 	return bugtool.SaveInitInfo(&info)
 }
 
-// Create a fake K8s watcher to avoid delayed event due to missing pod info
-func createFakeWatcher(testPod, testNamespace string) *fakeK8sWatcher {
-	return &fakeK8sWatcher{
-		fakePod:       testPod,
-		fakeNamespace: testNamespace,
-	}
-}
-
 func newDefaultTestOptions(opts ...TestOption) *TestOptions {
 	// default values
 	options := &TestOptions{
 		observer: testObserverOptions{
-			crd:    false,
-			config: "",
-			lib:    "",
+			config:         "",
+			lib:            "",
+			keepCollection: false,
 		},
 		exporter: testExporterOptions{
-			watcher:   watcher.NewFakeK8sWatcher(nil),
-			allowList: []*tetragon.Filter{},
-			denyList:  []*tetragon.Filter{},
+			podAccessor: watcher.NewFakeK8sWatcher(nil),
+			allowList:   []*tetragon.Filter{},
+			denyList:    []*tetragon.Filter{},
 		},
 	}
 	// apply user options
@@ -189,7 +193,7 @@ func newDefaultObserver() *observer.Observer {
 }
 
 func getDefaultObserver(tb testing.TB, ctx context.Context, initialSensor *sensors.Sensor, opts ...TestOption) (*observer.Observer, error) {
-	testutils.CaptureLog(tb, logger.GetLogger().(*logrus.Logger))
+	testutils.CaptureLog(tb, logger.GetLogger())
 
 	o := newDefaultTestOptions(opts...)
 
@@ -204,7 +208,7 @@ func getDefaultObserver(tb testing.TB, ctx context.Context, initialSensor *senso
 
 	obs := newDefaultObserver()
 	if testing.Verbose() {
-		option.Config.Verbosity = 1
+		option.Config.VerifierLogLevel = 1
 	}
 
 	if err := loadExporter(tb, ctx, obs, &o.exporter, &o.observer); err != nil {
@@ -224,7 +228,7 @@ func getDefaultObserver(tb testing.TB, ctx context.Context, initialSensor *senso
 		return nil, err
 	}
 
-	cgrouprate.Config(base.CgroupRateOptionsMap)
+	cgrouprate.Config()
 
 	exportFname, err := testutils.GetExportFilename(tb)
 	if err != nil {
@@ -240,32 +244,32 @@ func getDefaultObserver(tb testing.TB, ctx context.Context, initialSensor *senso
 	// This is horrifically ugly, so we may want to figure out a better way to do this
 	// at some point in the future. I just don't see a better way that doesn't involve
 	// a lot of code changes in a lot of a files.
-	if !metricsEnabled {
-		go metricsconfig.EnableMetrics(metricsAddr)
-		metricsconfig.InitAllMetrics(metricsconfig.GetRegistry())
-		metricsEnabled = true
-	}
+	metricsEnableOnce.Do(func() {
+		// The stop function is intentionally discarded: this server is a
+		// singleton for the whole test binary, so it must outlive whichever
+		// test happened to run first, and the OS reclaims it at exit.
+		if _, err := metricsconfig.EnableMetrics(metricsAddr); err != nil {
+			logger.GetLogger().Warn("Failed to start test metrics server, continuing without it",
+				"addr", metricsAddr, logfields.Error, err)
+			return
+		}
+		metricsconfig.InitHealthMetrics(metricsconfig.GetRegistry())
+		metricsconfig.InitEventsMetrics(metricsconfig.GetRegistry())
+	})
 
 	tb.Cleanup(func() {
 		testDone(tb, obs)
 	})
 
-	logger.GetLogger().Info("BPF detected features: ", bpf.LogFeatures())
+	logger.GetLogger().Info("BPF detected features: " + bpf.LogFeatures())
 
 	obs.PerfConfig = bpf.DefaultPerfEventConfig()
 	obs.PerfConfig.MapName = filepath.Join(bpf.MapPrefixPath(), "tcpmon_map")
+	obs.RingBufMapPath = filepath.Join(bpf.MapPrefixPath(), bpf.RingBufEventsMapName)
 	return obs, nil
 }
 
 func GetDefaultObserverWithWatchers(tb testing.TB, ctx context.Context, base *sensors.Sensor, opts ...TestOption) (*observer.Observer, error) {
-	const (
-		testPod       = "pod-1"
-		testNamespace = "ns-1"
-	)
-
-	w := createFakeWatcher(testPod, testNamespace)
-
-	opts = append(opts, withK8sWatcher(w))
 	return getDefaultObserver(tb, ctx, base, opts...)
 }
 
@@ -280,17 +284,29 @@ func GetDefaultObserverWithFile(tb testing.TB, ctx context.Context, file, lib st
 	opts = append(opts, WithConfig(file))
 	opts = append(opts, WithLib(lib))
 
-	b := base.GetInitialSensor()
+	b := base.GetInitialSensorTest(tb)
 	return GetDefaultObserverWithWatchers(tb, ctx, b, opts...)
+}
+
+func GetDefaultSensorsWithBase(tb testing.TB, b *sensors.Sensor, file, lib string, opts ...TestOption) ([]*sensors.Sensor, error) {
+	opts = append(opts, WithConfig(file))
+	opts = append(opts, WithLib(lib))
+
+	return getDefaultSensors(tb, b, opts...)
 }
 
 func GetDefaultSensorsWithFile(tb testing.TB, file, lib string, opts ...TestOption) ([]*sensors.Sensor, error) {
 	opts = append(opts, WithConfig(file))
 	opts = append(opts, WithLib(lib))
 
+	b := base.GetInitialSensorTest(tb)
+	return getDefaultSensors(tb, b, opts...)
+}
+
+func getDefaultSensors(tb testing.TB, initialSensor *sensors.Sensor, opts ...TestOption) ([]*sensors.Sensor, error) {
 	option.Config.BpfDir = bpf.MapPrefixPath()
 
-	testutils.CaptureLog(tb, logger.GetLogger().(*logrus.Logger))
+	testutils.CaptureLog(tb, logger.GetLogger())
 
 	o := newDefaultTestOptions(opts...)
 
@@ -299,13 +315,16 @@ func GetDefaultSensorsWithFile(tb testing.TB, file, lib string, opts ...TestOpti
 		option.Config.HubbleLib = o.observer.lib
 	}
 
+	option.Config.KeepCollection = o.observer.keepCollection
+	defer func() { option.Config.KeepCollection = false }()
+
 	procfs := os.Getenv("TETRAGON_PROCFS")
 	if procfs != "" {
 		option.Config.ProcFS = procfs
 	}
 
 	if testing.Verbose() {
-		option.Config.Verbosity = 1
+		option.Config.VerifierLogLevel = 1
 	}
 
 	var tp tracingpolicy.TracingPolicy
@@ -327,13 +346,11 @@ func GetDefaultSensorsWithFile(tb testing.TB, file, lib string, opts ...TestOpti
 		}
 	}
 
-	base := base.GetInitialSensor()
-
-	if err = loadSensors(tb, base, sens); err != nil {
+	if err = loadSensors(tb, initialSensor, sens); err != nil {
 		return nil, err
 	}
 
-	sens = append(sens, base)
+	sens = append(sens, initialSensor)
 	ret := make([]*sensors.Sensor, 0, len(sens))
 	for _, si := range sens {
 		if s, ok := si.(*sensors.Sensor); ok {
@@ -344,11 +361,12 @@ func GetDefaultSensorsWithFile(tb testing.TB, file, lib string, opts ...TestOpti
 }
 
 func loadExporter(tb testing.TB, ctx context.Context, obs *observer.Observer, opts *testExporterOptions, oo *testObserverOptions) error {
-	watcher := opts.watcher
+	k8sWatcher := opts.podAccessor
 	processCacheSize := 32768
 	dataCacheSize := 1024
+	procCacheGCInterval := defaults.DefaultProcessCacheGCInterval
 
-	if err := obs.InitSensorManager(nil); err != nil {
+	if err := obs.InitSensorManager(); err != nil {
 		return err
 	}
 
@@ -356,19 +374,18 @@ func loadExporter(tb testing.TB, ctx context.Context, obs *observer.Observer, op
 	// this up and remove/hide the global variable.
 	sensorManager := observer.GetSensorManager()
 	tb.Cleanup(func() {
-		sensorManager.StopSensorManager(ctx)
 		observer.ResetSensorManager()
 	})
-
-	if oo.crd {
-		crd.WatchTracePolicy(ctx, sensorManager)
-	}
 
 	if err := btf.InitCachedBTF(option.Config.HubbleLib, ""); err != nil {
 		return err
 	}
 
-	if err := process.InitCache(watcher, processCacheSize); err != nil {
+	if oo.procCacheGCInterval > 0 {
+		procCacheGCInterval = oo.procCacheGCInterval
+	}
+
+	if err := process.InitCache(k8sWatcher, processCacheSize, procCacheGCInterval); err != nil {
 		return err
 	}
 
@@ -376,14 +393,10 @@ func loadExporter(tb testing.TB, ctx context.Context, obs *observer.Observer, op
 		return err
 	}
 
-	// Tracks when its safe to close application when write ops are comnpleted.
-	// We don't currently track work group or contexts correctly in testing infra
-	// its not clear if its even useful considering the test infra doesn't get
-	// signals from users.
 	var cancelWg sync.WaitGroup
 
 	// use an empty hooks runner
-	hookRunner := (&rthooks.Runner{}).WithWatcher(watcher)
+	hookRunner := (&rthooks.Runner{}).WithWatcher(k8sWatcher)
 
 	// For testing we disable the eventcache and cilium cache by default. If we
 	// enable these then every tests would need to wait for the 1.5 mimutes needed
@@ -392,10 +405,15 @@ func loadExporter(tb testing.TB, ctx context.Context, obs *observer.Observer, op
 	// report nil or a pre-defined value. So no cache needed.
 	option.Config.EnableProcessNs = true
 	option.Config.EnableProcessCred = true
-	processManager, err := tetragonGrpc.NewProcessManager(ctx, &cancelWg, sensorManager, hookRunner)
+	processManager, err := tetragonGrpc.NewProcessManager(ctx, &cancelWg, sensorManager, hookRunner, nil)
 	if err != nil {
 		return err
 	}
+	tb.Cleanup(func() {
+		// wait until the export file is closed. This ensures that ExportFile::Close() is
+		// called before the test terminates.
+		cancelWg.Wait()
+	})
 	outF, err := testutils.CreateExportFile(tb)
 	if err != nil {
 		return err
@@ -403,7 +421,10 @@ func loadExporter(tb testing.TB, ctx context.Context, obs *observer.Observer, op
 	encoder := encoder.NewProtojsonEncoder(outF)
 
 	req := tetragon.GetEventsRequest{AllowList: opts.allowList, DenyList: opts.denyList}
-	exporter := exporter.NewExporter(ctx, &req, processManager.Server, encoder, outF, nil)
+	exporter, err := exporter.NewExporter(ctx, &req, processManager.Server, encoder, outF, nil)
+	if err != nil {
+		return err
+	}
 	logger.GetLogger().Info("Starting JSON exporter")
 	if err := exporter.Start(); err != nil {
 		return err
@@ -413,15 +434,20 @@ func loadExporter(tb testing.TB, ctx context.Context, obs *observer.Observer, op
 		obs.RemoveListener(processManager)
 	})
 
-	cgrouprate.NewCgroupRate(ctx, processManager, base.CgroupRateMap, &option.Config.CgroupRate)
-	return nil
+	return cgrouprate.NewCgroupRate(ctx, processManager, &option.Config.CgroupRate)
 }
 
 func loadObserver(tb testing.TB, ctx context.Context, base *sensors.Sensor,
 	tp tracingpolicy.TracingPolicy) error {
-
 	if err := base.Load(option.Config.BpfDir); err != nil {
 		tb.Fatalf("Load base error: %s\n", err)
+	}
+	tb.Cleanup(func() {
+		base.Unload(true)
+	})
+
+	if err := procevents.GetRunningProcs(); err != nil {
+		return err
 	}
 
 	if tp != nil {
@@ -432,7 +458,6 @@ func loadObserver(tb testing.TB, ctx context.Context, base *sensors.Sensor,
 
 	tb.Cleanup(func() {
 		observer.RemoveSensors(ctx)
-		base.Unload()
 	})
 	return nil
 }
@@ -440,6 +465,10 @@ func loadObserver(tb testing.TB, ctx context.Context, base *sensors.Sensor,
 func loadSensors(tb testing.TB, base sensors.SensorIface, sens []sensors.SensorIface) error {
 	if err := base.Load(option.Config.BpfDir); err != nil {
 		tb.Fatalf("Load base error: %s\n", err)
+	}
+
+	if err := procevents.GetRunningProcs(); err != nil {
+		tb.Fatalf("procevents.GetRunningProcs: %s", err)
 	}
 
 	for _, s := range sens {
@@ -467,100 +496,17 @@ func ExecWGCurl(readyWG *sync.WaitGroup, retries uint, args ...string) error {
 
 	var err error
 	// retries=0 -> 1 try, retries=1 -> 2 tries, and so on...
-	for try := uint(0); try < retries+1; try++ {
+	for try := range uint(retries + 1) {
 		cmd := exec.Command("/usr/bin/curl", args...)
 		err = cmd.Run()
 		if err == nil {
 			break
 		}
-		logger.GetLogger().Warnf("%v failed with %v (attempt %d/%d)", cmd, err, try+1, retries)
+		logger.GetLogger().Warn(fmt.Sprintf("%v failed with %v (attempt %d/%d)", cmd, err, try+1, retries))
 	}
 
 	return err
 }
-
-// dockerRun starts a new docker container in the background. The container will
-// be killed and removed on test cleanup.
-// It returns the containerId on success, or an error if spawning the container failed.
-func DockerRun(tb testing.TB, args ...string) (containerId string) {
-	// note: we are not using `--rm` so we can choose to wait on the container
-	// with `docker wait`. We remove it manually below in t.Cleanup instead
-	args = append([]string{"run", "--detach"}, args...)
-	id, err := exec.Command("docker", args...).Output()
-	if err != nil {
-		tb.Fatalf("failed to spawn docker container %v: %s", args, err)
-	}
-
-	containerId = strings.TrimSpace(string(id))
-	tb.Cleanup(func() {
-		err := exec.Command("docker", "rm", "--force", containerId).Run()
-		if err != nil {
-			tb.Logf("failed to remove container %s: %s", containerId, err)
-		}
-	})
-
-	return containerId
-}
-
-type fakeK8sWatcher struct {
-	fakePod, fakeNamespace string
-}
-
-func (f *fakeK8sWatcher) FindPod(podID string) (*corev1.Pod, error) {
-	if podID == "" {
-		return nil, fmt.Errorf("empty podID")
-	}
-
-	return &corev1.Pod{
-		ObjectMeta: v1.ObjectMeta{
-			Name:      f.fakePod,
-			Namespace: f.fakeNamespace,
-			UID:       k8stypes.UID(podID),
-		},
-	}, nil
-}
-
-func (f *fakeK8sWatcher) FindContainer(containerID string) (*corev1.Pod, *corev1.ContainerStatus, bool) {
-	if containerID == "" {
-		return nil, nil, false
-	}
-
-	container := corev1.ContainerStatus{
-		Name:        containerID,
-		Image:       "image",
-		ImageID:     "id",
-		ContainerID: "docker://" + containerID,
-		State: corev1.ContainerState{
-			Running: &corev1.ContainerStateRunning{
-				StartedAt: v1.Time{
-					Time: time.Unix(1, 2),
-				},
-			},
-		},
-	}
-	pod := corev1.Pod{
-		ObjectMeta: v1.ObjectMeta{
-			Name:      f.fakePod,
-			Namespace: f.fakeNamespace,
-		},
-		Status: corev1.PodStatus{
-			ContainerStatuses: []corev1.ContainerStatus{
-				container,
-			},
-		},
-	}
-
-	return &pod, &container, true
-}
-
-func (f *fakeK8sWatcher) AddInformers(_ watcher.InternalSharedInformerFactory, _ ...*watcher.InternalInformer) {
-}
-
-func (f *fakeK8sWatcher) GetInformer(_ string) cache.SharedIndexInformer {
-	return nil
-}
-
-func (f *fakeK8sWatcher) Start() {}
 
 // Used to wait for a process to start, we do a lookup on PROCFS because this
 // may be called before obs is created.
@@ -573,9 +519,8 @@ func WaitForProcess(process string) error {
 		procfs = "/proc/"
 	}
 	procDir, _ := os.ReadDir(procfs)
-	for i := 0; i < 120; i++ {
+	for range 120 {
 		for _, d := range procDir {
-
 			cmdline, err := os.ReadFile(filepath.Join(procfs, d.Name(), "/cmdline"))
 			if err != nil {
 				continue
@@ -596,14 +541,14 @@ func WriteConfigFile(fileName, config string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := out.Write([]byte(config)); err != nil {
+	if _, err := out.WriteString(config); err != nil {
 		return err
 	}
 	return out.Sync()
 }
 
 func GetDefaultObserver(tb testing.TB, ctx context.Context, lib string, opts ...TestOption) (*observer.Observer, error) {
-	b := base.GetInitialSensorTest()
+	b := base.GetInitialSensorTest(tb)
 
 	opts = append(opts, WithLib(lib))
 
@@ -611,7 +556,7 @@ func GetDefaultObserver(tb testing.TB, ctx context.Context, lib string, opts ...
 }
 
 func GetDefaultObserverWithConfig(tb testing.TB, ctx context.Context, config, lib string, opts ...TestOption) (*observer.Observer, error) {
-	b := base.GetInitialSensor()
+	b := base.GetInitialSensorTest(tb)
 
 	opts = append(opts, WithConfig(config))
 	opts = append(opts, WithLib(lib))

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 import (
@@ -9,12 +11,22 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"uuid"
+
+	"github.com/containerd/cgroups/v3"
+	cgroupsv1 "github.com/containerd/cgroups/v3/cgroup1"
+	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
+	"github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/stretchr/testify/require"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/cilium/tetragon/pkg/api/tracingapi"
 	"github.com/cilium/tetragon/pkg/bpf"
+	"github.com/cilium/tetragon/pkg/build"
 	tgcgroups "github.com/cilium/tetragon/pkg/cgroups"
 	grpcexec "github.com/cilium/tetragon/pkg/grpc/exec"
 	"github.com/cilium/tetragon/pkg/grpc/tracing"
@@ -22,29 +34,23 @@ import (
 	"github.com/cilium/tetragon/pkg/logger"
 	"github.com/cilium/tetragon/pkg/observer"
 	"github.com/cilium/tetragon/pkg/option"
+	"github.com/cilium/tetragon/pkg/podhelpers"
 	"github.com/cilium/tetragon/pkg/policyfilter"
 	"github.com/cilium/tetragon/pkg/reader/notify"
-	"github.com/cilium/tetragon/pkg/sensors/base"
 	"github.com/cilium/tetragon/pkg/sensors/config/confmap"
 	testsensor "github.com/cilium/tetragon/pkg/sensors/test"
 	"github.com/cilium/tetragon/pkg/testutils"
+	tuo "github.com/cilium/tetragon/pkg/testutils/observer"
 	"github.com/cilium/tetragon/pkg/testutils/perfring"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
 	"github.com/cilium/tetragon/pkg/tracingpolicy"
-	"github.com/google/uuid"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"github.com/containerd/cgroups"
-	cgroupsv2 "github.com/containerd/cgroups/v2"
-	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/sirupsen/logrus"
-	"github.com/stretchr/testify/require"
 )
 
 func createCgroup(t *testing.T, dir string, pids ...uint64) policyfilter.CgroupID {
 	cgMode := cgroups.Mode()
 	var path string
-	if cgMode == cgroups.Unified {
+	switch cgMode {
+	case cgroups.Unified:
 		cgroupFs := "/sys/fs/cgroup"
 		res := cgroupsv2.Resources{}
 		m, err := cgroupsv2.NewSystemd("/", dir, -1, &res)
@@ -60,13 +66,13 @@ func createCgroup(t *testing.T, dir string, pids ...uint64) policyfilter.CgroupI
 		path = filepath.Join(cgroupFs, dir)
 		require.NoError(t, err)
 
-	} else if cgMode == cgroups.Hybrid {
+	case cgroups.Hybrid:
 		cgroupFs := "/sys/fs/cgroup"
 		slice := "system.slice"
 		// NB(kkourt): this is just for our vmtests VM
 		cmd := exec.Command("sudo", "mount", "-o", "remount,rw", cgroupFs)
 		cmd.Run()
-		control, err := cgroups.New(cgroups.V1, cgroups.Slice(slice, dir), &specs.LinuxResources{
+		control, err := cgroupsv1.New(cgroupsv1.Slice(slice, dir), &specs.LinuxResources{
 			Devices: []specs.LinuxDeviceCgroup{},
 			Memory:  &specs.LinuxMemory{},
 			CPU:     &specs.LinuxCPU{},
@@ -77,14 +83,14 @@ func createCgroup(t *testing.T, dir string, pids ...uint64) policyfilter.CgroupI
 			control.Delete()
 		})
 		for _, pid := range pids {
-			err = control.Add(cgroups.Process{Pid: int(pid)})
+			err = control.Add(cgroupsv1.Process{Pid: int(pid)})
 			require.NoError(t, err)
 		}
 		require.NoError(t, err)
 		// Example: "/sys/fs/cgroup/memory/system.slice/TestNamespacedPolicies.cgroup1.20230302140421.slice"
 		path = filepath.Join(cgroupFs, tgcgroups.GetCgrpControllerName(), slice, dir)
 		require.NoError(t, err)
-	} else {
+	default:
 		t.Skipf("Unsupported cgroup mode: %d", cgMode)
 	}
 
@@ -93,14 +99,21 @@ func createCgroup(t *testing.T, dir string, pids ...uint64) policyfilter.CgroupI
 	}
 
 	id, err := tgcgroups.GetCgroupIdFromPath(path)
-	require.NoError(t, err, fmt.Sprintf("failed to get cgroup id for path=%s", path))
+	require.NoError(t, err, "failed to get cgroup id for path="+path)
 	t.Logf("cgroup path:%s cgroup id:%d", path, id)
 	return policyfilter.CgroupID(id)
 }
 
 // TestNamespacedPolicies tests namespace filtering on tracepoints and kprobes
 func TestNamespacedPolicies(t *testing.T) {
-	testutils.CaptureLog(t, logger.GetLogger().(*logrus.Logger))
+	build.SkipIfK8sDisabled(t)
+	oldEnableK8s := option.Config.EnableK8s
+	option.Config.EnableK8s = true
+	t.Cleanup(func() {
+		option.Config.EnableK8s = oldEnableK8s
+	})
+
+	testutils.CaptureLog(t, logger.GetLogger())
 	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
 	defer cancel()
 
@@ -114,9 +127,9 @@ func TestNamespacedPolicies(t *testing.T) {
 
 	policyfilter.TestingEnableAndReset(t)
 
-	tus.LoadSensor(t, base.GetInitialSensor())
+	tus.LoadInitialSensor(t)
 	tus.LoadSensor(t, testsensor.GetTestSensor())
-	sm := tus.GetTestSensorManager(ctx, t)
+	sm := tuo.GetTestSensorManager(t)
 
 	// First, we create two lseek-pipe commands and add them to a different cgroup. See
 	// contrib/tester-progs/go/lseek-pipe for details of how lseek-pipe wowkrs, but basically it
@@ -168,7 +181,7 @@ func TestNamespacedPolicies(t *testing.T) {
 			{MatchArgs: []v1alpha1.ArgSelector{{
 				Index:    0,
 				Operator: "Equal",
-				Values:   []string{fmt.Sprintf("%d", bogusFD)},
+				Values:   []string{strconv.Itoa(bogusFD)},
 			}}},
 		},
 	}
@@ -232,8 +245,7 @@ func TestNamespacedPolicies(t *testing.T) {
 					if ok {
 						// cast uint64 to int32 so that we can have a single
 						// runTest function.
-						x := int32(arg)
-						return &x
+						return new(int32(arg))
 					}
 				} else if execEvent, ok := x.(*grpcexec.MsgExecveEventUnix); ok {
 					if strings.HasSuffix(execEvent.Unix.Process.Filename, "lseek-pipe") {
@@ -269,18 +281,18 @@ func TestNamespacedPolicies(t *testing.T) {
 	podId1 := uuid.New()
 	podId2 := uuid.New()
 	require.NoError(t, err)
-	err = pfState.AddPodContainer(policyfilter.PodID(podId1), "ns1", "wl1", "kind1", nil,
-		"pod1-container1", cgID1, "container-name1")
+	err = pfState.AddPodContainer(policyfilter.PodID(podId1), "ns1", nil,
+		"pod1-container1", cgID1, podhelpers.ContainerInfo{Name: "container-name1", Repo: "container-repo1"})
 	require.NoError(t, err)
-	err = pfState.AddPodContainer(policyfilter.PodID(podId2), "ns2", "wl2", "kind2", nil,
-		"pod1-container2", cgID2, "container-name2")
+	err = pfState.AddPodContainer(policyfilter.PodID(podId2), "ns2", nil,
+		"pod1-container2", cgID2, podhelpers.ContainerInfo{Name: "container-name2", Repo: "container-repo2"})
 	require.NoError(t, err)
 
 	// Hence, we expect one event with whence value of 4444
 	runTest(map[int32]int{4444: 1})
 
 	// Let's delete the tracing policy, and check that we get no events
-	err = sm.Manager.DeleteTracingPolicy(ctx, "lseek-test", "ns1")
+	err = sm.Manager.DeleteTracingPolicy(ctx, "lseek-test", "ns1", kpPolicyConf.TpDomain())
 	require.NoError(t, err)
 	runTest(map[int32]int{})
 
@@ -290,10 +302,80 @@ func TestNamespacedPolicies(t *testing.T) {
 	runTest(map[int32]int{4444: 1})
 
 	// delete policy, and see that we still don't get any events
-	err = sm.Manager.DeleteTracingPolicy(ctx, "lseek-test", "ns1")
+	err = sm.Manager.DeleteTracingPolicy(ctx, "lseek-test", "ns1", kpPolicyConf.TpDomain())
 	require.NoError(t, err)
 	runTest(map[int32]int{})
 
 	lseekPipeCmd1.Close()
 	lseekPipeCmd2.Close()
+}
+
+// TestUprobeNamespacedPolicy tests namespace filtering on uprobes
+func TestUprobeNamespacedPolicy(t *testing.T) {
+	build.SkipIfK8sDisabled(t)
+	oldEnableK8s := option.Config.EnableK8s
+	option.Config.EnableK8s = true
+	t.Cleanup(func() {
+		option.Config.EnableK8s = oldEnableK8s
+	})
+
+	testutils.CaptureLog(t, logger.GetLogger())
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	policyfilter.TestingEnableAndReset(t)
+	sm := tuo.GetTestSensorManager(t)
+
+	// A namespaced policy may not attach a uprobe: its target is resolved in the
+	// agent's host mount namespace, so it is rejected at load.
+	upPolicyConf := tracingpolicy.GenericTracingPolicyNamespaced{
+		Metadata: v1.ObjectMeta{
+			Name:      "uprobe-test",
+			Namespace: "ns1",
+		},
+		Spec: v1alpha1.TracingPolicySpec{
+			UProbes: []v1alpha1.UProbeSpec{{
+				Path:    testutils.RepoRootPath("contrib/tester-progs/lseek-pipe"),
+				Symbols: []string{"main.main"},
+			}},
+		},
+	}
+	err := sm.Manager.AddTracingPolicy(ctx, &upPolicyConf)
+	require.ErrorContains(t, err, "uprobe")
+}
+
+// TestUsdtNamespacedPolicy verifies a namespaced policy may not attach a usdt
+// probe.
+func TestUsdtNamespacedPolicy(t *testing.T) {
+	build.SkipIfK8sDisabled(t)
+	oldEnableK8s := option.Config.EnableK8s
+	option.Config.EnableK8s = true
+	t.Cleanup(func() {
+		option.Config.EnableK8s = oldEnableK8s
+	})
+
+	testutils.CaptureLog(t, logger.GetLogger())
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	policyfilter.TestingEnableAndReset(t)
+	sm := tuo.GetTestSensorManager(t)
+
+	// A namespaced policy may not attach a usdt probe: its target is resolved in
+	// the agent's host mount namespace, so it is rejected at load.
+	usdtPolicyConf := tracingpolicy.GenericTracingPolicyNamespaced{
+		Metadata: v1.ObjectMeta{
+			Name:      "usdt-test",
+			Namespace: "ns1",
+		},
+		Spec: v1alpha1.TracingPolicySpec{
+			Usdts: []v1alpha1.UsdtSpec{{
+				Path:     testutils.RepoRootPath("contrib/tester-progs/usdt"),
+				Provider: "test",
+				Name:     "usdt0",
+			}},
+		},
+	}
+	err := sm.Manager.AddTracingPolicy(ctx, &usdtPolicyConf)
+	require.ErrorContains(t, err, "usdt")
 }

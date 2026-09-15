@@ -8,6 +8,7 @@ package helpers
 import (
 	fmt "fmt"
 	tetragon "github.com/cilium/tetragon/api/v1/tetragon"
+	proto "google.golang.org/protobuf/proto"
 )
 
 // ResponseTypeString returns an event's type as a string
@@ -36,6 +37,10 @@ func ResponseTypeString(response *tetragon.GetEventsResponse) (string, error) {
 		return tetragon.EventType_PROCESS_UPROBE.String(), nil
 	case *tetragon.GetEventsResponse_ProcessThrottle:
 		return tetragon.EventType_PROCESS_THROTTLE.String(), nil
+	case *tetragon.GetEventsResponse_ProcessLsm:
+		return tetragon.EventType_PROCESS_LSM.String(), nil
+	case *tetragon.GetEventsResponse_ProcessUsdt:
+		return tetragon.EventType_PROCESS_USDT.String(), nil
 	case *tetragon.GetEventsResponse_Test:
 		return tetragon.EventType_TEST.String(), nil
 	case *tetragon.GetEventsResponse_RateLimitInfo:
@@ -72,6 +77,10 @@ func ResponseInnerGetProcess(event tetragon.IsGetEventsResponse_Event) *tetragon
 		return ev.ProcessTracepoint.Process
 	case *tetragon.GetEventsResponse_ProcessUprobe:
 		return ev.ProcessUprobe.Process
+	case *tetragon.GetEventsResponse_ProcessUsdt:
+		return ev.ProcessUsdt.Process
+	case *tetragon.GetEventsResponse_ProcessLsm:
+		return ev.ProcessLsm.Process
 	case *tetragon.GetEventsResponse_ProcessLoader:
 		return ev.ProcessLoader.Process
 
@@ -115,7 +124,117 @@ func ResponseInnerGetParent(event tetragon.IsGetEventsResponse_Event) *tetragon.
 		return ev.ProcessTracepoint.Parent
 	case *tetragon.GetEventsResponse_ProcessUprobe:
 		return ev.ProcessUprobe.Parent
+	case *tetragon.GetEventsResponse_ProcessUsdt:
+		return ev.ProcessUsdt.Parent
+	case *tetragon.GetEventsResponse_ProcessLsm:
+		return ev.ProcessLsm.Parent
+	case *tetragon.GetEventsResponse_ProcessLoader:
+		return ev.ProcessLoader.Parent
 
 	}
 	return nil
+}
+
+// ResponseGetAncestors returns a GetEventsResponse's ancestors processes if they exists
+func ResponseGetAncestors(response *tetragon.GetEventsResponse) []*tetragon.Process {
+	if response == nil {
+		return nil
+	}
+
+	event := response.Event
+	if event == nil {
+		return nil
+	}
+
+	return ResponseInnerGetAncestors(event)
+}
+
+// ResponseInnerGetAncestors returns a GetEventsResponse inner event's ancestors processes if they exists
+func ResponseInnerGetAncestors(event tetragon.IsGetEventsResponse_Event) []*tetragon.Process {
+	switch ev := event.(type) {
+	case *tetragon.GetEventsResponse_ProcessExec:
+		return ev.ProcessExec.Ancestors
+	case *tetragon.GetEventsResponse_ProcessExit:
+		return ev.ProcessExit.Ancestors
+	case *tetragon.GetEventsResponse_ProcessKprobe:
+		return ev.ProcessKprobe.Ancestors
+	case *tetragon.GetEventsResponse_ProcessTracepoint:
+		return ev.ProcessTracepoint.Ancestors
+	case *tetragon.GetEventsResponse_ProcessUprobe:
+		return ev.ProcessUprobe.Ancestors
+	case *tetragon.GetEventsResponse_ProcessUsdt:
+		return ev.ProcessUsdt.Ancestors
+	case *tetragon.GetEventsResponse_ProcessLsm:
+		return ev.ProcessLsm.Ancestors
+	case *tetragon.GetEventsResponse_ProcessLoader:
+		return ev.ProcessLoader.Ancestors
+
+	}
+	return nil
+}
+
+// ResponseTypeMap returns a map from event field names (e.g. "process_exec") to corresponding
+// protobuf messages (e.g. &tetragon.ProcessExec{}).
+func ResponseTypeMap() map[string]proto.Message {
+	return map[string]proto.Message{
+		"process_exec":       &tetragon.ProcessExec{},
+		"process_exit":       &tetragon.ProcessExit{},
+		"process_kprobe":     &tetragon.ProcessKprobe{},
+		"process_tracepoint": &tetragon.ProcessTracepoint{},
+		"process_loader":     &tetragon.ProcessLoader{},
+		"process_uprobe":     &tetragon.ProcessUprobe{},
+		"process_throttle":   &tetragon.ProcessThrottle{},
+		"process_lsm":        &tetragon.ProcessLsm{},
+		"process_usdt":       &tetragon.ProcessUsdt{},
+		"test":               &tetragon.Test{},
+		"rate_limit_info":    &tetragon.RateLimitInfo{},
+	}
+}
+
+// ProcessEventMapTuple returns a tuple from event field name (e.g. "process_exec") to corresponding
+// protobuf messages for a given tetragon.GetEventsResponse (e.g. response.GetProcessExec()).
+func ProcessEventMapTuple(response *tetragon.GetEventsResponse) (string, any, any) {
+	switch response.Event.(type) {
+	case *tetragon.GetEventsResponse_ProcessExec:
+		return "process_exec", response.GetProcessExec(), (*tetragon.ProcessExec)(nil)
+	case *tetragon.GetEventsResponse_ProcessExit:
+		return "process_exit", response.GetProcessExit(), (*tetragon.ProcessExit)(nil)
+	case *tetragon.GetEventsResponse_ProcessKprobe:
+		return "process_kprobe", response.GetProcessKprobe(), (*tetragon.ProcessKprobe)(nil)
+	case *tetragon.GetEventsResponse_ProcessTracepoint:
+		return "process_tracepoint", response.GetProcessTracepoint(), (*tetragon.ProcessTracepoint)(nil)
+	case *tetragon.GetEventsResponse_ProcessLoader:
+		return "process_loader", response.GetProcessLoader(), (*tetragon.ProcessLoader)(nil)
+	case *tetragon.GetEventsResponse_ProcessUprobe:
+		return "process_uprobe", response.GetProcessUprobe(), (*tetragon.ProcessUprobe)(nil)
+	case *tetragon.GetEventsResponse_ProcessThrottle:
+		return "process_throttle", response.GetProcessThrottle(), (*tetragon.ProcessThrottle)(nil)
+	case *tetragon.GetEventsResponse_ProcessLsm:
+		return "process_lsm", response.GetProcessLsm(), (*tetragon.ProcessLsm)(nil)
+	case *tetragon.GetEventsResponse_ProcessUsdt:
+		return "process_usdt", response.GetProcessUsdt(), (*tetragon.ProcessUsdt)(nil)
+	case *tetragon.GetEventsResponse_Test:
+		return "test", response.GetTest(), (*tetragon.Test)(nil)
+	case *tetragon.GetEventsResponse_RateLimitInfo:
+		return "rate_limit_info", response.GetRateLimitInfo(), (*tetragon.RateLimitInfo)(nil)
+
+	}
+	return "", nil, nil
+}
+
+// ProcessEventMapEmpty returns a map from event field names (e.g. "process_exec") with nil as value
+func ProcessEventMapEmpty() map[string]any {
+	return map[string]any{
+		"process_exec":       (*tetragon.ProcessExec)(nil),
+		"process_exit":       (*tetragon.ProcessExit)(nil),
+		"process_kprobe":     (*tetragon.ProcessKprobe)(nil),
+		"process_tracepoint": (*tetragon.ProcessTracepoint)(nil),
+		"process_loader":     (*tetragon.ProcessLoader)(nil),
+		"process_uprobe":     (*tetragon.ProcessUprobe)(nil),
+		"process_throttle":   (*tetragon.ProcessThrottle)(nil),
+		"process_lsm":        (*tetragon.ProcessLsm)(nil),
+		"process_usdt":       (*tetragon.ProcessUsdt)(nil),
+		"test":               (*tetragon.Test)(nil),
+		"rate_limit_info":    (*tetragon.RateLimitInfo)(nil),
+	}
 }

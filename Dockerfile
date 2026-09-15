@@ -10,44 +10,61 @@
 # https://www.docker.com/blog/faster-multi-platform-builds-dockerfile-cross-compilation-guide/
 
 # First builder (cross-)compile the BPF programs
-FROM --platform=$BUILDPLATFORM quay.io/cilium/clang:aeaada5cf60efe8d0e772d032fe3cc2bc613739c@sha256:b440ae7b3591a80ffef8120b2ac99e802bbd31dee10f5f15a48566832ae0866f AS bpf-builder
+FROM --platform=$BUILDPLATFORM quay.io/cilium/clang:969f95f8ef7923af36bf657ba6d4c65691f56882@sha256:ff83e52d3ea150b3d93e4ae40ae86620003ac3f6d91fe6e939dcc95469f83ff2 AS bpf-builder
 WORKDIR /go/src/github.com/cilium/tetragon
-RUN apt-get update && apt-get install -y linux-libc-dev
+RUN apt-get update && apt-get install -y linux-libc-dev gzip ccache
 COPY . ./
 ARG TARGETARCH
-RUN make tetragon-bpf LOCAL_CLANG=1 TARGET_ARCH=$TARGETARCH
+ARG COMPRESS_BPF
+RUN --mount=type=cache,target=/root/.cache/ccache \ 
+    make tetragon-bpf LOCAL_CLANG=1 TARGET_ARCH=$TARGETARCH DEBUG=$DEBUG CLANG="ccache clang"
+RUN if [ "$COMPRESS_BPF" = "gzip" ]; then gzip bpf/objs/*.o; fi
 
 # Second builder (cross-)compile tetragon and tetra
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.22.5@sha256:829eff99a4b2abffe68f6a3847337bf6455d69d17e49ec1a97dac78834754bd6 AS tetragon-builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.1@sha256:512690a5660563b57d37ecc31129e7f136e831db2aed24a1dbeb8ad7380dc0fa AS tetragon-builder
 WORKDIR /go/src/github.com/cilium/tetragon
 ARG TETRAGON_VERSION TARGETARCH
 COPY . .
-RUN make VERSION=$TETRAGON_VERSION TARGET_ARCH=$TARGETARCH tetragon tetra tetragon-oci-hook tetragon-oci-hook-setup
+RUN --mount=type=cache,target=/go/pkg/mod \ 
+    --mount=type=cache,target=/root/.cache/go-build \
+    make VERSION=$TETRAGON_VERSION TARGET_ARCH=$TARGETARCH tetragon tetra
 
 # Third builder (cross-)compile a stripped gops
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.22.5-alpine@sha256:8c9183f715b0b4eca05b8b3dbf59766aaedb41ec07477b132ee2891ac0110a07 AS gops
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.1-alpine@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS gops
 ARG TARGETARCH
 RUN apk add --no-cache git \
 # renovate: datasource=github-releases depName=google/gops
- && git clone --depth 1 --branch v0.3.28 https://github.com/google/gops /gops \
+ && git clone --depth 1 --branch v0.3.29 https://github.com/google/gops /gops \
  && cd /gops \
  && GOARCH=$TARGETARCH go build -ldflags="-s -w" .
 
 # This builder (cross-)compile a stripped static version of bpftool.
 # This step was kept because the downloaded version includes LLVM libs with the
 # disassembler that makes the static binary grow from ~2Mo to ~30Mo.
-FROM --platform=$BUILDPLATFORM quay.io/cilium/clang:aeaada5cf60efe8d0e772d032fe3cc2bc613739c@sha256:b440ae7b3591a80ffef8120b2ac99e802bbd31dee10f5f15a48566832ae0866f AS bpftool-builder
+FROM --platform=$BUILDPLATFORM quay.io/cilium/clang:969f95f8ef7923af36bf657ba6d4c65691f56882@sha256:ff83e52d3ea150b3d93e4ae40ae86620003ac3f6d91fe6e939dcc95469f83ff2 AS bpftool-builder
 WORKDIR /bpftool
 ARG TARGETARCH BUILDARCH
 RUN if [ $BUILDARCH != $TARGETARCH ]; \
-    then apt-get update && echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse\n\
-deb [arch=amd64] http://security.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse\n\
-deb [arch=amd64] http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse\n\
-deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse\n\
-deb [arch=arm64] http://ports.ubuntu.com/ jammy main restricted universe multiverse\n\
-deb [arch=arm64] http://ports.ubuntu.com/ jammy-updates main restricted universe multiverse\n\
-deb [arch=arm64] http://ports.ubuntu.com/ jammy-security main restricted universe multiverse\n\
-deb [arch=arm64] http://ports.ubuntu.com/ jammy-backports main restricted universe multiverse" > /etc/apt/sources.list \
+    then apt-get update && echo "Types: deb\n\
+URIs: http://archive.ubuntu.com/ubuntu/\n\
+Suites: noble noble-updates noble-backports\n\
+Components: main universe restricted multiverse\n\
+Architectures: amd64\n\
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\
+\n\
+Types: deb\n\
+URIs: http://archive.ubuntu.com/ubuntu/\n\
+Suites: noble-security\n\
+Components: main universe restricted multiverse\n\
+Architectures: amd64\n\
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\
+\n\
+Types: deb\n\
+URIs: http://ports.ubuntu.com/\n\
+Suites: noble noble-updates noble-backports noble-security\n\
+Components: main universe restricted multiverse\n\
+Architectures: arm64\n\
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg" > /etc/apt/sources.list.d/ubuntu.sources \
     && dpkg --add-architecture arm64; fi
 RUN apt-get update
 RUN if [ $BUILDARCH != $TARGETARCH ]; \
@@ -56,6 +73,8 @@ RUN if [ $BUILDARCH != $TARGETARCH ]; \
 # v7.3.0
 ENV BPFTOOL_REV="687e7f06f2ee104ed6515ec3a9816af77bfa7a17"
 RUN git clone https://github.com/libbpf/bpftool.git . && git checkout ${BPFTOOL_REV} && git submodule update --init --recursive
+# From Ubuntu 24.04 builder image, libzstd must be added at the end of LIBS and LIBS_BOOTSTRAP to compile statically
+RUN sed -i 's/\(LIBS = $(LIBBPF) -lelf -lz\)/\1 -lzstd/; s/\(LIBS_BOOTSTRAP = $(LIBBPF_BOOTSTRAP) -lelf -lz\)/\1 -lzstd/' src/Makefile
 RUN if [ $BUILDARCH != $TARGETARCH ]; \
     then make -C src EXTRA_CFLAGS=--static CC=aarch64-linux-gnu-gcc -j $(nproc) && aarch64-linux-gnu-strip src/bpftool; \
     else make -C src EXTRA_CFLAGS=--static -j $(nproc) && strip src/bpftool; fi
@@ -66,20 +85,31 @@ ARG TARGETARCH
 ARG BPFTOOL_TAG=v7.2.0-snapshot.0
 RUN curl -L https://github.com/libbpf/bpftool/releases/download/${BPFTOOL_TAG}/bpftool-${BPFTOOL_TAG}-${TARGETARCH}.tar.gz | tar xz && chmod +x bpftool
 
+# Get bash-completion manifests and generate tetra CLI bash
+# autocompletions (we don't want all bash-completions in the base-build)
+FROM docker.io/library/alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS cli-autocomplete
+COPY --from=tetragon-builder /go/src/github.com/cilium/tetragon/tetra /usr/bin/
+RUN apk add --no-cache bash-completion && \
+    tetra completion bash > /etc/bash_completion.d/tetra && \
+    chmod a+r /etc/bash_completion.d/tetra
+
 # Almost final step runs on target platform (might need emulation) and
 # retrieves (cross-)compiled binaries from builders
-FROM docker.io/library/alpine:3.20.1@sha256:b89d9c93e9ed3597455c90a0b88a8bbb5cb7188438f70953fede212a0c4394e0 AS base-build
-RUN apk add iproute2
+FROM docker.io/library/alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS base-build
+RUN apk add --no-cache iproute2
 RUN mkdir /var/lib/tetragon/ && \
     mkdir -p /etc/tetragon/tetragon.conf.d/ && \
     mkdir -p /etc/tetragon/tetragon.tp.d/ && \
     apk add --no-cache --update bash
 COPY --from=tetragon-builder /go/src/github.com/cilium/tetragon/tetragon /usr/bin/
 COPY --from=tetragon-builder /go/src/github.com/cilium/tetragon/tetra /usr/bin/
-COPY --from=tetragon-builder /go/src/github.com/cilium/tetragon/contrib/tetragon-rthooks/tetragon-oci-hook /usr/bin/
-COPY --from=tetragon-builder /go/src/github.com/cilium/tetragon/contrib/tetragon-rthooks/tetragon-oci-hook-setup /usr/bin/
 COPY --from=gops /gops/gops /usr/bin/
-COPY --from=bpf-builder /go/src/github.com/cilium/tetragon/bpf/objs/*.o /var/lib/tetragon/
+COPY --from=bpf-builder /go/src/github.com/cilium/tetragon/bpf/objs/* /var/lib/tetragon/
+COPY --from=cli-autocomplete /etc/bash/bash_completion.sh /etc/bash/bash_completion.sh
+COPY --from=cli-autocomplete /etc/bash_completion.d/000_bash_completion_compat.bash /etc/bash_completion.d/000_bash_completion_compat.bash
+COPY --from=cli-autocomplete /etc/bash_completion.d/tetra /etc/bash_completion.d/tetra
+COPY --from=cli-autocomplete /usr/share/bash-completion/bash_completion /usr/share/bash-completion/bash_completion
+COPY --from=cli-autocomplete /usr/share/bash-completion/completions/ip /usr/share/bash-completion/completions/ip
 ENTRYPOINT ["/usr/bin/tetragon"]
 
 # This target only builds with the `--target release` option and reduces the

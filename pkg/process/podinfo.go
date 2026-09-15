@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !nok8s
+
 package process
 
 import (
@@ -8,11 +10,17 @@ import (
 	"github.com/cilium/tetragon/pkg/filters"
 	"github.com/cilium/tetragon/pkg/logger"
 	"github.com/cilium/tetragon/pkg/metrics/watchermetrics"
+	"github.com/cilium/tetragon/pkg/option"
+	"github.com/cilium/tetragon/pkg/podhelpers"
 	"github.com/cilium/tetragon/pkg/watcher"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	corev1 "k8s.io/api/core/v1"
+)
+
+var (
+	k8s watcher.PodAccessor
 )
 
 func getExecCommand(probe *corev1.Probe) []string {
@@ -31,24 +39,56 @@ func getProbes(pod *corev1.Pod, containerStatus *corev1.ContainerStatus) ([]stri
 	return nil, nil
 }
 
+func isContainerPrivileged(pod *corev1.Pod, container *corev1.ContainerStatus) bool {
+	for _, c := range pod.Spec.Containers {
+		if c.Name == container.Name {
+			if c.SecurityContext != nil && c.SecurityContext.Privileged != nil {
+				return *c.SecurityContext.Privileged
+			}
+			return false
+		}
+	}
+
+	for _, c := range pod.Spec.InitContainers {
+		if c.Name == container.Name {
+			if c.SecurityContext != nil && c.SecurityContext.Privileged != nil {
+				return *c.SecurityContext.Privileged
+			}
+			return false
+		}
+	}
+
+	for _, c := range pod.Spec.EphemeralContainers {
+		if c.Name == container.Name {
+			if c.SecurityContext != nil && c.SecurityContext.Privileged != nil {
+				return *c.SecurityContext.Privileged
+			}
+			return false
+		}
+	}
+
+	return false
+}
+
 func getPodInfo(
-	w watcher.K8sResourceWatcher,
+	w watcher.PodAccessor,
 	containerID string,
 	binary string,
 	args string,
 	nspid uint32,
 ) *tetragon.Pod {
-	if containerID == "" {
+	if w == nil || containerID == "" {
 		return nil
 	}
 	pod, container, ok := w.FindContainer(containerID)
 	if !ok {
 		watchermetrics.GetWatcherErrors(watchermetrics.K8sWatcher, watchermetrics.FailedToGetPodError).Inc()
-		logger.GetLogger().WithField("container id", containerID).Trace("failed to get pod")
+		logger.Trace(logger.GetLogger(), "failed to get pod", "container_id", containerID)
 		return nil
 	}
 	var startTime *timestamppb.Timestamp
 	livenessProbe, readinessProbe := getProbes(pod, container)
+	isPrivileged := isContainerPrivileged(pod, container)
 	maybeExecProbe := filters.MaybeExecProbe(binary, args, livenessProbe) ||
 		filters.MaybeExecProbe(binary, args, readinessProbe)
 	if container.State.Running != nil {
@@ -62,13 +102,14 @@ func getPodInfo(
 			Value: nspid,
 		}
 	}
-	workloadObject, workloadType := GetWorkloadMetaFromPod(pod)
+	workloadObject, workloadType := podhelpers.GetWorkloadMetaFromPod(pod)
 	watchermetrics.GetWatcherEvents(watchermetrics.K8sWatcher).Inc()
-	return &tetragon.Pod{
+	podInfo := &tetragon.Pod{
 		Namespace:    pod.Namespace,
 		Workload:     workloadObject.Name,
 		WorkloadKind: workloadType.Kind,
 		Name:         pod.Name,
+		Uid:          string(pod.UID),
 		PodLabels:    pod.Labels,
 		Container: &tetragon.Container{
 			Id:   container.ContainerID,
@@ -80,6 +121,13 @@ func getPodInfo(
 			},
 			StartTime:      startTime,
 			MaybeExecProbe: maybeExecProbe,
+			SecurityContext: &tetragon.SecurityContext{
+				Privileged: isPrivileged,
+			},
 		},
 	}
+	if option.Config.EnablePodAnnotations {
+		podInfo.PodAnnotations = pod.Annotations
+	}
+	return podInfo
 }

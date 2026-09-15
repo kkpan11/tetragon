@@ -1,144 +1,236 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 import (
 	"fmt"
 
 	"github.com/cilium/ebpf"
+
 	"github.com/cilium/tetragon/pkg/api/processapi"
 	"github.com/cilium/tetragon/pkg/bpf"
 	"github.com/cilium/tetragon/pkg/kernels"
+	"github.com/cilium/tetragon/pkg/mbset"
 	"github.com/cilium/tetragon/pkg/selectors"
 	"github.com/cilium/tetragon/pkg/sensors"
 	"github.com/cilium/tetragon/pkg/sensors/program"
 )
 
-func selectorsMaploads(ks *selectors.KernelSelectorState, pinPathPrefix string, index uint32) []*program.MapLoad {
-	selBuff := ks.Buffer()
+func selectorsMaploads(ks *selectors.KernelSelectorState, index uint32) []*program.MapLoad {
+	selBuff := ks.CopyToFixedBuffer()
 	maps := []*program.MapLoad{
 		{
-			Index: index,
-			Name:  "filter_map",
-			Load: func(m *ebpf.Map, index uint32) error {
+			Name: "filter_map",
+			Load: func(m *ebpf.Map, _ string) error {
 				return m.Update(index, selBuff[:], ebpf.UpdateAny)
 			},
 		}, {
-			Index: 0,
-			Name:  "argfilter_maps",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "argfilter_maps",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateArgFilterMaps(ks, pinPathPrefix, outerMap)
 			},
 		}, {
-			Index: 0,
-			Name:  "addr4lpm_maps",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "addr4lpm_maps",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateAddr4FilterMaps(ks, pinPathPrefix, outerMap)
 			},
 		}, {
-			Index: 0,
-			Name:  "addr6lpm_maps",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "addr6lpm_maps",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateAddr6FilterMaps(ks, pinPathPrefix, outerMap)
 			},
 		}, {
-			Index: 0,
-			Name:  "tg_mb_sel_opts",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "tg_mb_sel_opts",
+			Load: func(outerMap *ebpf.Map, _ string) error {
 				return populateMatchBinariesMaps(ks, outerMap)
 			},
 		}, {
-			Index: 0,
-			Name:  "tg_mb_paths",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "tg_mb_paths",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateMatchBinariesPathsMaps(ks, pinPathPrefix, outerMap)
 			},
 		}, {
-			Index: 0,
-			Name:  "string_prefix_maps",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "string_prefix_maps",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateStringPrefixFilterMaps(ks, pinPathPrefix, outerMap)
 			},
 		}, {
-			Index: 0,
-			Name:  "string_postfix_maps",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "string_postfix_maps",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateStringPostfixFilterMaps(ks, pinPathPrefix, outerMap)
 			},
 		}, {
-			Index: 0,
-			Name:  "string_maps_0",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "string_maps_0",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateStringFilterMaps(ks, pinPathPrefix, outerMap, 0)
 			},
 		}, {
-			Index: 0,
-			Name:  "string_maps_1",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "string_maps_1",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateStringFilterMaps(ks, pinPathPrefix, outerMap, 1)
 			},
 		}, {
-			Index: 0,
-			Name:  "string_maps_2",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "string_maps_2",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateStringFilterMaps(ks, pinPathPrefix, outerMap, 2)
 			},
 		}, {
-			Index: 0,
-			Name:  "string_maps_3",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "string_maps_3",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateStringFilterMaps(ks, pinPathPrefix, outerMap, 3)
 			},
 		}, {
-			Index: 0,
-			Name:  "string_maps_4",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "string_maps_4",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateStringFilterMaps(ks, pinPathPrefix, outerMap, 4)
 			},
 		}, {
-			Index: 0,
-			Name:  "string_maps_5",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "string_maps_5",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateStringFilterMaps(ks, pinPathPrefix, outerMap, 5)
 			},
 		}, {
-			Index: 0,
-			Name:  "string_maps_6",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "string_maps_6",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateStringFilterMaps(ks, pinPathPrefix, outerMap, 6)
 			},
 		}, {
-			Index: 0,
-			Name:  "string_maps_7",
-			Load: func(outerMap *ebpf.Map, _ uint32) error {
+			Name: "string_maps_7",
+			Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 				return populateStringFilterMaps(ks, pinPathPrefix, outerMap, 7)
 			},
+		}, {
+			Name: "substring_map",
+			Load: func(outerMap *ebpf.Map, _ string) error {
+				return populateSubStringMap(outerMap, ks)
+			},
 		},
+	}
+	if len(ks.MatchWorkloadIDs()) > 0 {
+		maps = append(maps, &program.MapLoad{
+			Name: "workloads_map",
+			Load: func(m *ebpf.Map, _ string) error {
+				for selID, polID := range ks.MatchWorkloadIDs() {
+					if err := m.Update(uint32(selID), polID, ebpf.UpdateAny); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		})
 	}
 	if kernels.MinKernelVersion("5.11") {
 		maps = append(maps, []*program.MapLoad{
 			{
-				Index: 0,
-				Name:  "string_maps_8",
-				Load: func(outerMap *ebpf.Map, _ uint32) error {
+				Name: "string_maps_8",
+				Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 					return populateStringFilterMaps(ks, pinPathPrefix, outerMap, 8)
 				},
 			}, {
-				Index: 0,
-				Name:  "string_maps_9",
-				Load: func(outerMap *ebpf.Map, _ uint32) error {
+				Name: "string_maps_9",
+				Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 					return populateStringFilterMaps(ks, pinPathPrefix, outerMap, 9)
 				},
 			}, {
-				Index: 0,
-				Name:  "string_maps_10",
-				Load: func(outerMap *ebpf.Map, _ uint32) error {
+				Name: "string_maps_10",
+				Load: func(outerMap *ebpf.Map, pinPathPrefix string) error {
 					return populateStringFilterMaps(ks, pinPathPrefix, outerMap, 10)
 				},
 			},
 		}...)
 	}
+	return maps
+}
+
+func populateSubStringMap(m *ebpf.Map, k *selectors.KernelSelectorState) error {
+	for idx, ss := range k.SubStrings() {
+		dst := make([]byte, 100)
+		copy(dst, ss[:])
+
+		if err := m.Update(uint32(idx), dst, ebpf.UpdateAny); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func createSelectorMaps(load *program.Program, state *selectors.KernelSelectorState) []*program.Map {
+	var maps []*program.Map
+
+	argFilterMaps := program.MapBuilderProgram("argfilter_maps", load)
+	if state != nil && !kernels.MinKernelVersion("5.9") {
+		// Versions before 5.9 do not allow inner maps to have different sizes.
+		// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
+		maxEntries := state.ValueMapsMaxEntries()
+		argFilterMaps.SetInnerMaxEntries(maxEntries)
+	}
+	maps = append(maps, argFilterMaps)
+
+	addr4FilterMaps := program.MapBuilderProgram("addr4lpm_maps", load)
+	if state != nil && !kernels.MinKernelVersion("5.9") {
+		// Versions before 5.9 do not allow inner maps to have different sizes.
+		// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
+		maxEntries := state.Addr4MapsMaxEntries()
+		addr4FilterMaps.SetInnerMaxEntries(maxEntries)
+	}
+	maps = append(maps, addr4FilterMaps)
+
+	addr6FilterMaps := program.MapBuilderProgram("addr6lpm_maps", load)
+	if state != nil && !kernels.MinKernelVersion("5.9") {
+		// Versions before 5.9 do not allow inner maps to have different sizes.
+		// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
+		maxEntries := state.Addr6MapsMaxEntries()
+		addr6FilterMaps.SetInnerMaxEntries(maxEntries)
+	}
+	maps = append(maps, addr6FilterMaps)
+
+	var stringFilterMap [selectors.StringMapsNumSubMaps]*program.Map
+	numSubMaps := selectors.StringMapsNumSubMaps
+	if !kernels.MinKernelVersion("5.11") {
+		numSubMaps = selectors.StringMapsNumSubMapsSmall
+	}
+
+	for stringMapIndex := range numSubMaps {
+		stringFilterMap[stringMapIndex] = program.MapBuilderProgram(fmt.Sprintf("string_maps_%d", stringMapIndex), load)
+		if state != nil && !kernels.MinKernelVersion("5.9") {
+			// Versions before 5.9 do not allow inner maps to have different sizes.
+			// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
+			maxEntries := state.StringMapsMaxEntries(stringMapIndex)
+			stringFilterMap[stringMapIndex].SetInnerMaxEntries(maxEntries)
+		}
+		maps = append(maps, stringFilterMap[stringMapIndex])
+	}
+
+	stringPrefixFilterMaps := program.MapBuilderProgram("string_prefix_maps", load)
+	if state != nil && !kernels.MinKernelVersion("5.9") {
+		// Versions before 5.9 do not allow inner maps to have different sizes.
+		// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
+		maxEntries := state.StringPrefixMapsMaxEntries()
+		stringPrefixFilterMaps.SetInnerMaxEntries(maxEntries)
+	}
+	maps = append(maps, stringPrefixFilterMaps)
+
+	stringPostfixFilterMaps := program.MapBuilderProgram("string_postfix_maps", load)
+	if state != nil && !kernels.MinKernelVersion("5.9") {
+		// Versions before 5.9 do not allow inner maps to have different sizes.
+		// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
+		maxEntries := state.StringPostfixMapsMaxEntries()
+		stringPostfixFilterMaps.SetInnerMaxEntries(maxEntries)
+	}
+	maps = append(maps, stringPostfixFilterMaps)
+
+	matchBinariesPaths := program.MapBuilderProgram("tg_mb_paths", load)
+	if state != nil && !kernels.MinKernelVersion("5.9") {
+		// Versions before 5.9 do not allow inner maps to have different sizes.
+		// See: https://lore.kernel.org/bpf/20200828011800.1970018-1-kafai@fb.com/
+		maxEntries := state.MatchBinariesPathsMaxEntries()
+		matchBinariesPaths.SetInnerMaxEntries(maxEntries)
+	}
+	maps = append(maps, matchBinariesPaths)
+
 	return maps
 }
 
@@ -405,6 +497,7 @@ func populateMatchBinariesPathsMaps(
 	outerMap *ebpf.Map,
 ) error {
 	maxEntriesFromAllSelector := k.MatchBinariesPathsMaxEntries()
+	matchBinaries := k.MatchBinaries()
 	for selectorID, paths := range k.MatchBinariesPaths() {
 		maxEntries := len(paths)
 		// Versions before 5.9 do not allow inner maps to have different sizes.
@@ -440,6 +533,12 @@ func populateMatchBinariesPathsMaps(
 			return fmt.Errorf("failed to insert %s: %w", innerName, err)
 		}
 
+		mbSelector := matchBinaries[selectorID]
+		if mbSelector.MBSetID != mbset.InvalidID {
+			if err := mbset.UpdateMap(mbSelector.MBSetID, paths); err != nil {
+				return fmt.Errorf("updating mbset map failed: %w", err)
+			}
+		}
 	}
 	return nil
 }

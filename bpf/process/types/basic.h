@@ -9,6 +9,11 @@
 #include "bpf_cred.h"
 #include "skb.h"
 #include "sock.h"
+#include "sockaddr.h"
+#if defined(__V511_BPF_PROG)
+#include "sockaddr_un.h"
+#endif
+#include "socket.h"
 #include "net_device.h"
 #include "../bpf_process_event.h"
 #include "bpfattr.h"
@@ -22,6 +27,14 @@
 #include "common.h"
 #include "process/data_event.h"
 #include "process/bpf_enforcer.h"
+#include "../syscall64.h"
+#include "process/ratelimit_maps.h"
+#include "process/heap.h"
+#include "../bpf_mbset.h"
+#include "bpf_ktime.h"
+#include "config.h"
+#include "../cel_expr.h"
+#include "process/event_config.h"
 
 /* Type IDs form API with user space generickprobe.go */
 enum {
@@ -80,6 +93,15 @@ enum {
 
 	net_dev_ty = 39,
 
+	sockaddr_type = 40,
+	socket_type = 41,
+
+	dentry_type = 42,
+
+	bpf_prog_type = 43,
+
+	sockaddr_un_type = 44,
+
 	nop_s64_ty = -10,
 	nop_u64_ty = -11,
 	nop_u32_ty = -12,
@@ -95,19 +117,21 @@ enum {
 
 enum {
 	ACTION_POST = 0,
-	ACTION_FOLLOWFD = 1,
+	// ACTION_FOLLOWFD = 1, deprecated
 	/* Actual SIGKILL value, but we dont want to pull headers in */
 	ACTION_SIGKILL = 2,
-	ACTION_UNFOLLOWFD = 3,
+	// ACTION_UNFOLLOWFD = 3, deprecated
 	ACTION_OVERRIDE = 4,
-	ACTION_COPYFD = 5,
+	// ACTION_COPYFD = 5, deprecated
 	ACTION_GETURL = 6,
 	ACTION_DNSLOOKUP = 7,
 	ACTION_NOPOST = 8,
 	ACTION_SIGNAL = 9,
 	ACTION_TRACKSOCK = 10,
 	ACTION_UNTRACKSOCK = 11,
-	ACTION_NOTIFY_KILLER = 12,
+	ACTION_NOTIFY_ENFORCER = 12,
+	ACTION_CLEANUP_ENFORCER_NOTIFICATION = 13,
+	ACTION_SET = 14,
 };
 
 enum {
@@ -115,19 +139,15 @@ enum {
 };
 
 enum {
+	TAIL_CALL_SETUP = 0,
 	TAIL_CALL_PROCESS = 1,
 	TAIL_CALL_FILTER = 2,
 	TAIL_CALL_ARGS = 3,
 	TAIL_CALL_ACTIONS = 4,
 	TAIL_CALL_SEND = 5,
-};
-
-struct generic_maps {
-	struct bpf_map_def *heap;
-	struct bpf_map_def *calls;
-	struct bpf_map_def *config;
-	struct bpf_map_def *filter;
-	struct bpf_map_def *override;
+	TAIL_CALL_PATH = 6,
+	TAIL_CALL_PROCESS_2 = 7,
+	TAIL_CALL_ARGS_2 = 8,
 };
 
 struct selector_action {
@@ -148,43 +168,11 @@ struct selector_arg_filters {
 	__u32 argoff[5];
 } __attribute__((packed));
 
-#define IS_32BIT 0x80000000
+#define MAX_ARGS_SIZE	     80
+#define MAX_ARGS_ENTRIES     8
+#define MAX_MATCH_VALUES     4
+#define MAX_SUBSTRING_VALUES 100
 
-struct event_config {
-	__u32 func_id;
-	__s32 arg0;
-	__s32 arg1;
-	__s32 arg2;
-	__s32 arg3;
-	__s32 arg4;
-	__u32 arg0m;
-	__u32 arg1m;
-	__u32 arg2m;
-	__u32 arg3m;
-	__u32 arg4m;
-	__u32 t_arg0_ctx_off;
-	__u32 t_arg1_ctx_off;
-	__u32 t_arg2_ctx_off;
-	__u32 t_arg3_ctx_off;
-	__u32 t_arg4_ctx_off;
-	__u32 syscall;
-	__s32 argreturncopy;
-	__s32 argreturn;
-	/* arg return action specifies to act on the return value; currently
-	 * supported actions include: TrackSock and UntrackSock.
-	 */
-	__u32 argreturnaction;
-	/* policy id identifies the policy of this generic hook and is used to
-	 * apply policies only on certain processes. A value of 0 indicates
-	 * that the hook always applies and no check will be performed.
-	 */
-	__u32 policy_id;
-	__u32 flags;
-} __attribute__((packed));
-
-#define MAX_ARGS_SIZE	 80
-#define MAX_ARGS_ENTRIES 8
-#define MAX_MATCH_VALUES 4
 /* String parsing consumes instructions so this adds an additional
  * knob to tune how many instructions we should spend parsing
  * strings.
@@ -208,7 +196,7 @@ struct event_config {
  * buffer size information.
  */
 #ifdef __LARGE_BPF_PROG
-#ifdef __LARGE_MAP_KEYS
+#ifdef __V511_BPF_PROG
 #define MAX_STRING (STRING_MAPS_SIZE_10 - 2)
 #else
 #define MAX_STRING (STRING_MAPS_SIZE_7 - 2)
@@ -230,10 +218,6 @@ FUNC_INLINE __u32 get_index(void *ctx)
 #define get_index(ctx) 0
 #endif
 
-// We do one tail-call per selector, we can have up to 5 selectors.
-#define MAX_SELECTORS	   5
-#define MAX_SELECTORS_MASK 7
-
 FUNC_INLINE long
 filter_32ty_map(struct selector_arg_filter *filter, char *args);
 
@@ -246,9 +230,12 @@ FUNC_INLINE int return_error(int *s, int err)
 FUNC_INLINE char *
 args_off(struct msg_generic_kprobe *e, unsigned long off)
 {
-	asm volatile("%[off] &= 0x3fff;\n" ::[off] "+r"(off)
-		     :);
-	return e->args + off;
+	char *args = e->args;
+
+	asm volatile("%[off] &= 0x3fff;\n"
+		     "%[args] += %[off];\n"
+		     : [args] "+r"(args), [off] "+r"(off));
+	return args;
 }
 
 /* Error writer for use when pointer *s is lost to stack and can not
@@ -261,8 +248,9 @@ return_stack_error(char *args, int orig, int err)
 	asm volatile("%[orig] &= 0xfff;\n"
 		     "r1 = *(u64 *)%[args];\n"
 		     "r1 += %[orig];\n"
-		     "*(u32 *)(r1 + 0) = %[err];\n" ::[orig] "r+"(orig),
-		     [args] "m+"(args), [err] "r+"(err)
+		     "*(u32 *)(r1 + 0) = %[err];\n"
+		     : [orig] "+r"(orig), [args] "+m"(args), [err] "+r"(err)
+		     :
 		     : "r1");
 	return sizeof(int);
 }
@@ -285,8 +273,8 @@ parse_iovec_array(long off, unsigned long arg, int i, unsigned long max,
 		size = max;
 	if (size > 4094)
 		return char_buf_toolarge;
-	asm volatile("%[size] &= 0xfff;\n" ::[size] "+r"(size)
-		     :);
+	asm volatile("%[size] &= 0xfff;\n"
+		     : [size] "+r"(size));
 	err = probe_read(args_off(e, off), size, (char *)iov.iov_base);
 	if (err < 0)
 		return char_buf_pagefault;
@@ -334,20 +322,15 @@ parse_iovec_array(long off, unsigned long arg, int i, unsigned long max,
 #define MAX_STRING_FILTER 32
 #endif
 
-FUNC_INLINE long copy_path(char *args, const struct path *arg)
+FUNC_INLINE long store_path(char *args, char *buffer, const struct path *arg,
+			    int size, int flags)
 {
 	int *s = (int *)args;
-	int size = 0, flags = 0;
-	char *buffer;
 	void *curr = &args[4];
 	umode_t i_mode;
 
-	buffer = d_path_local(arg, &size, &flags);
-	if (!buffer)
-		return 0;
-
-	asm volatile("%[size] &= 0xff;\n" ::[size] "+r"(size)
-		     :);
+	asm volatile("%[size] &= 0xfff;\n"
+		     : [size] "+r"(size));
 	probe_read(curr, size, buffer);
 	*s = size;
 	size += 4;
@@ -362,24 +345,23 @@ FUNC_INLINE long copy_path(char *args, const struct path *arg)
 	 * -----------------------------------------
 	 * Next we set up the flags.
 	 */
-	asm volatile goto(
-		"r1 = *(u64 *)%[pid];\n"
-		"r7 = *(u32 *)%[offset];\n"
-		"if r7 s< 0 goto %l[a];\n"
-		"if r7 s> 1188 goto %l[a];\n"
-		"r1 += r7;\n"
-		"r2 = *(u32 *)%[flags];\n"
-		"*(u32 *)(r1 + 0) = r2;\n"
-		"r2 = *(u16 *)%[mode];\n"
-		"*(u16 *)(r1 + 4) = r2;\n"
-		:
-		: [pid] "m"(args), [flags] "m"(flags), [offset] "+m"(size), [mode] "m"(i_mode)
-		: "r0", "r1", "r2", "r7", "memory"
-		: a);
-a:
+	*(u32 *)&args[size] = (u32)flags;
+	*(u16 *)&args[size + sizeof(u32)] = (u16)i_mode;
 	size += sizeof(u32) + sizeof(u16); // for the flags + i_mode
 
 	return size;
+}
+
+FUNC_INLINE long copy_path(char *args, const struct path *arg)
+{
+	int size = 0, flags = 0;
+	char *buffer;
+
+	buffer = d_path_local(arg, &size, &flags);
+	if (!buffer)
+		return 0;
+
+	return store_path(args, buffer, arg, size, flags);
 }
 
 FUNC_INLINE long copy_strings(char *args, char *arg, int max_size)
@@ -391,8 +373,8 @@ FUNC_INLINE long copy_strings(char *args, char *arg, int max_size)
 	// So add one to the length to allow for it. This should
 	// result in us honouring our max_size correctly.
 	size = probe_read_str(&args[4], max_size + 1, arg);
-	if (size <= 1)
-		return invalid_ty;
+	if (size < 0)
+		return size;
 	// Remove the nul character from end.
 	size--;
 	*s = size;
@@ -423,6 +405,38 @@ FUNC_INLINE long copy_sock(char *args, unsigned long arg)
 	struct sk_type *sk_event = (struct sk_type *)args;
 
 	set_event_from_sock(sk_event, sk);
+
+	return sizeof(struct sk_type);
+}
+
+FUNC_INLINE long copy_sockaddr(char *args, unsigned long arg)
+{
+	struct sockaddr_in_type *sockaddr_event = (struct sockaddr_in_type *)args;
+	struct sockaddr *address = (struct sockaddr *)arg;
+
+	set_event_from_sockaddr_in(sockaddr_event, address);
+
+	return sizeof(struct sockaddr_in_type);
+}
+
+#if defined(__V511_BPF_PROG)
+FUNC_INLINE long copy_sockaddr_un(char *args, unsigned long arg)
+{
+	struct sockaddr_un_type *sockaddr_un_event = (struct sockaddr_un_type *)args;
+	struct sockaddr *address = (struct sockaddr *)arg;
+
+	set_event_from_sockaddr_un(sockaddr_un_event, address);
+
+	return sizeof(struct sockaddr_un_type);
+}
+#endif
+
+FUNC_INLINE long copy_socket(char *args, unsigned long arg)
+{
+	struct socket *sock = (struct socket *)arg;
+	struct sk_type *sk_event = (struct sk_type *)args;
+
+	set_event_from_socket(sk_event, sock);
 
 	return sizeof(struct sk_type);
 }
@@ -486,6 +500,14 @@ FUNC_INLINE long copy_load_module(char *args, unsigned long arg)
 	const struct load_info *mod = (struct load_info *)arg;
 	struct tg_kernel_module *info = (struct tg_kernel_module *)args;
 
+	/*
+	 * Make sure we don't crash on kernel without module support,
+	 * 'struct load_info' is internal modules struct available only
+	 * if there's module support compiled in.
+	 */
+	if (!bpf_core_type_exists(struct load_info))
+		return 0;
+
 	memset(info, 0, sizeof(struct tg_kernel_module));
 
 	if (BPF_CORE_READ_INTO(&name, mod, name) != 0)
@@ -523,11 +545,14 @@ FUNC_INLINE long copy_kernel_module(char *args, unsigned long arg)
 	return sizeof(struct tg_kernel_module);
 }
 
-#define ARGM_INDEX_MASK	 0xf
-#define ARGM_RETURN_COPY BIT(4)
-#define ARGM_MAX_DATA	 BIT(5)
+#define ARGM_INDEX_MASK	  0xf
+#define ARGM_RETURN_COPY  BIT(4)
+#define ARGM_MAX_DATA	  BIT(5)
+#define ARGM_CURRENT_TASK BIT(6)
+#define ARGM_PT_REGS	  BIT(7)
+#define ARGM_PRELOAD	  BIT(8)
 
-FUNC_INLINE bool hasReturnCopy(unsigned long argm)
+FUNC_INLINE bool has_return_copy(unsigned long argm)
 {
 	return (argm & ARGM_RETURN_COPY) != 0;
 }
@@ -539,78 +564,21 @@ FUNC_INLINE bool has_max_data(unsigned long argm)
 
 FUNC_INLINE unsigned long get_arg_meta(int meta, struct msg_generic_kprobe *e)
 {
-	switch (meta & ARGM_INDEX_MASK) {
-	case 1:
-		return e->a0;
-	case 2:
-		return e->a1;
-	case 3:
-		return e->a2;
-	case 4:
-		return e->a3;
-	case 5:
-		return e->a4;
-	}
-	return 0;
-}
+	int idx = meta & ARGM_INDEX_MASK;
 
-FUNC_INLINE long
-__copy_char_buf(void *ctx, long off, unsigned long arg, unsigned long bytes,
-		bool max_data, struct msg_generic_kprobe *e,
-		struct bpf_map_def *data_heap)
-{
-	int *s = (int *)args_off(e, off);
-	size_t rd_bytes, extra = 8;
-	int err;
+	if (idx < 1 || idx > MAX_POSSIBLE_ARGS)
+		return 0;
 
-#ifdef __LARGE_BPF_PROG
-	if (max_data && data_heap) {
-		/* The max_data flag is enabled, the first int value indicates
-		 * if we use (1) data events or not (0).
-		 */
-		if (bytes >= 0x1000) {
-			s[0] = 1;
-			return data_event_bytes(ctx,
-						(struct data_event_desc *)&s[1],
-						arg, bytes, data_heap) +
-			       4;
-		}
-		s[0] = 0;
-		s = (int *)args_off(e, off + 4);
-		extra += 4;
-	}
-#endif // __LARGE_BPF_PROG
-
-	/* Bound bytes <4095 to ensure bytes does not read past end of buffer */
-	rd_bytes = bytes < 0x1000 ? bytes : 0xfff;
-	asm volatile("%[rd_bytes] &= 0xfff;\n" ::[rd_bytes] "+r"(rd_bytes)
-		     :);
-	err = probe_read(&s[2], rd_bytes, (char *)arg);
-	if (err < 0)
-		return return_error(s, char_buf_pagefault);
-	s[0] = (int)bytes;
-	s[1] = (int)rd_bytes;
-	return rd_bytes + extra;
-}
-
-FUNC_INLINE long
-copy_char_buf(void *ctx, long off, unsigned long arg, int argm,
-	      struct msg_generic_kprobe *e,
-	      struct bpf_map_def *data_heap)
-{
-	int *s = (int *)args_off(e, off);
-	unsigned long meta;
-	size_t bytes = 0;
-
-	if (hasReturnCopy(argm)) {
-		u64 retid = retprobe_map_get_key(ctx);
-
-		retprobe_map_set(e->func_id, retid, e->common.ktime, arg);
-		return return_error(s, char_buf_saved_for_retprobe);
-	}
-	meta = get_arg_meta(argm, e);
-	probe_read(&bytes, sizeof(bytes), &meta);
-	return __copy_char_buf(ctx, off, arg, bytes, has_max_data(argm), e, data_heap);
+	/* Mask after the decrement so the bound holds unconditionally:
+	 * clang > 20 copies the index before its own range check, and
+	 * pre-5.7 verifiers do not propagate the narrowed range to the
+	 * copy.
+	 */
+	idx -= 1;
+	asm volatile("%[idx] &= %[mask];\n"
+		     : [idx] "+r"(idx)
+		     : [mask] "i"(MAX_POSSIBLE_ARGS_MASK));
+	return (&e->a0)[idx];
 }
 
 FUNC_INLINE u16 string_padded_len(u16 len)
@@ -618,14 +586,14 @@ FUNC_INLINE u16 string_padded_len(u16 len)
 	u16 padded_len = len;
 
 	if (len < STRING_MAPS_SIZE_5) {
-		if (len % STRING_MAPS_KEY_INC_SIZE != 0)
+		if (!len || len % STRING_MAPS_KEY_INC_SIZE != 0)
 			padded_len = ((len / STRING_MAPS_KEY_INC_SIZE) + 1) * STRING_MAPS_KEY_INC_SIZE;
 		return padded_len;
 	}
 	if (len <= STRING_MAPS_SIZE_6 - 2)
 		return STRING_MAPS_SIZE_6 - 2;
 #ifdef __LARGE_BPF_PROG
-#ifdef __LARGE_MAP_KEYS
+#ifdef __V511_BPF_PROG
 	if (len <= STRING_MAPS_SIZE_7 - 2)
 		return STRING_MAPS_SIZE_7 - 2;
 	if (len <= STRING_MAPS_SIZE_8 - 2)
@@ -647,7 +615,7 @@ FUNC_INLINE int string_map_index(u16 padded_len)
 		return (padded_len / STRING_MAPS_KEY_INC_SIZE) - 1;
 
 #ifdef __LARGE_BPF_PROG
-#ifdef __LARGE_MAP_KEYS
+#ifdef __V511_BPF_PROG
 	switch (padded_len) {
 	case STRING_MAPS_SIZE_6 - 2:
 		return 6;
@@ -689,7 +657,7 @@ FUNC_INLINE void *get_string_map(int index, __u32 map_idx)
 		return map_lookup_elem(&string_maps_6, &map_idx);
 	case 7:
 		return map_lookup_elem(&string_maps_7, &map_idx);
-#ifdef __LARGE_MAP_KEYS
+#ifdef __V511_BPF_PROG
 	case 8:
 		return map_lookup_elem(&string_maps_8, &map_idx);
 	case 9:
@@ -715,15 +683,15 @@ filter_char_buf_equal(struct selector_arg_filter *filter, char *arg_str, uint or
 	int index;
 
 #ifdef __LARGE_BPF_PROG
-#ifdef __LARGE_MAP_KEYS
-	if (orig_len > STRING_MAPS_SIZE_10 - 2 || !orig_len)
+#ifdef __V511_BPF_PROG
+	if (orig_len > STRING_MAPS_SIZE_10 - 2)
 		return 0;
 #else
-	if (orig_len > STRING_MAPS_SIZE_7 - 2 || !orig_len)
+	if (orig_len > STRING_MAPS_SIZE_7 - 2)
 		return 0;
 #endif
 #else
-	if (orig_len > STRING_MAPS_SIZE_5 - 1 || !orig_len)
+	if (orig_len > STRING_MAPS_SIZE_5 - 1)
 		return 0;
 #endif
 
@@ -739,7 +707,7 @@ filter_char_buf_equal(struct selector_arg_filter *filter, char *arg_str, uint or
 		return 0;
 
 	heap = (char *)map_lookup_elem(&string_maps_heap, &zero);
-	zero_heap = (char *)map_lookup_elem(&string_maps_ro_zero, &zero);
+	zero_heap = (char *)map_lookup_elem(&heap_ro_zero, &zero);
 	if (!heap || !zero_heap)
 		return 0;
 
@@ -759,9 +727,9 @@ filter_char_buf_equal(struct selector_arg_filter *filter, char *arg_str, uint or
 		     : "i"(STRING_MAPS_HEAP_MASK));
 #ifdef __LARGE_BPF_PROG
 	if (index <= 5)
-		probe_read(&heap[1], len, arg_str);
+		with_errmetrics(probe_read, &heap[1], len, arg_str);
 	else
-		probe_read(&heap[2], len, arg_str);
+		with_errmetrics(probe_read, &heap[2], len, arg_str);
 #else
 	probe_read(&heap[1], len, arg_str);
 #endif
@@ -773,9 +741,9 @@ filter_char_buf_equal(struct selector_arg_filter *filter, char *arg_str, uint or
 			     : "i"(STRING_MAPS_HEAP_MASK));
 #ifdef __LARGE_BPF_PROG
 		if (index <= 5)
-			probe_read(heap + len + 1, (padded_len - len) & STRING_MAPS_COPY_MASK, zero_heap);
+			with_errmetrics(probe_read, heap + len + 1, (padded_len - len) & STRING_MAPS_COPY_MASK, zero_heap);
 		else
-			probe_read(heap + len + 2, (padded_len - len) & STRING_MAPS_COPY_MASK, zero_heap);
+			with_errmetrics(probe_read, heap + len + 2, (padded_len - len) & STRING_MAPS_COPY_MASK, zero_heap);
 #else
 		probe_read(heap + len + 1, (padded_len - len) & STRING_MAPS_COPY_MASK, zero_heap);
 #endif
@@ -819,24 +787,26 @@ filter_char_buf_prefix(struct selector_arg_filter *filter, char *arg_str, uint a
 		     : [arg_len] "+r"(arg_len)
 		     : [mask] "i"(STRING_PREFIX_MAX_LENGTH - 1));
 
-	probe_read(arg->data, arg_len & (STRING_PREFIX_MAX_LENGTH - 1), arg_str);
+	with_errmetrics(probe_read, arg->data, arg_len & (STRING_PREFIX_MAX_LENGTH - 1), arg_str);
 
 	__u8 *pass = map_lookup_elem(addrmap, arg);
 
 	return !!pass;
 }
 
-// Define a mask for the maximum path length on Linux.
-#define PATH_MASK (4096 - 1)
+struct copy_reverse_data {
+	__u8 *dest;
+	__u8 *src;
+	uint len;
+	uint offset;
+	uint mask;
+};
 
-FUNC_INLINE void copy_reverse(__u8 *dest, uint len, __u8 *src, uint offset)
+FUNC_INLINE int do_copy_reverse(uint i, struct copy_reverse_data *data)
 {
-	uint i;
+	uint len = data->len, offset = data->offset, mask = data->mask;
 
 	len &= STRING_POSTFIX_MAX_MASK;
-#ifndef __LARGE_BPF_PROG
-#pragma unroll
-#endif
 	// Maximum we can go to is one less than the absolute maximum.
 	// This is to allow the masking and indexing to work correctly.
 	// (Appreciate this is a bit ugly.)
@@ -847,11 +817,49 @@ FUNC_INLINE void copy_reverse(__u8 *dest, uint len, __u8 *src, uint offset)
 	// reverse copy the string as if it was 127 chars long.
 	// Alternative (prettier) fixes resulted in a confused verifier
 	// unfortunately.
-	for (i = 0; i < (STRING_POSTFIX_MAX_MATCH_LENGTH - 1); i++) {
-		dest[i & STRING_POSTFIX_MAX_MASK] = src[(len + offset - 1 - i) & PATH_MASK];
-		if (len + offset == (i + 1))
-			return;
+	data->dest[i & STRING_POSTFIX_MAX_MASK] = data->src[(len + offset - 1 - i) & mask];
+	return len + offset == (i + 1) ? 1 : 0;
+}
+
+FUNC_INLINE void __copy_reverse(__u8 *dest, uint len, __u8 *src, uint offset, uint mask)
+{
+	struct copy_reverse_data data = {
+		.dest = dest,
+		.src = src,
+		.len = len,
+		.offset = offset,
+		.mask = mask,
+	};
+	uint i;
+
+	if (CONFIG(ITER_NUM)) {
+		bpf_for(i, 0, STRING_POSTFIX_MAX_MATCH_LENGTH - 1)
+		{
+			if (do_copy_reverse(i, &data))
+				return;
+		}
+	} else {
+#ifndef __LARGE_BPF_PROG
+#pragma unroll
+#endif
+		for (i = 0; i < (STRING_POSTFIX_MAX_MATCH_LENGTH - 1); i++) {
+			if (do_copy_reverse(i, &data))
+				return;
+		}
 	}
+}
+
+// Define a mask for the maximum path length on Linux.
+#define PATH_MASK (4096 - 1)
+
+FUNC_INLINE void copy_reverse(__u8 *dest, uint len, __u8 *src, uint offset)
+{
+	__copy_reverse(dest, len, src, offset, PATH_MASK);
+}
+
+FUNC_INLINE void file_copy_reverse(__u8 *dest, uint len, __u8 *src, uint offset)
+{
+	__copy_reverse(dest, len, src, offset, STRING_POSTFIX_MAX_LENGTH - 1);
 }
 
 FUNC_LOCAL long
@@ -882,20 +890,124 @@ filter_char_buf_postfix(struct selector_arg_filter *filter, char *arg_str, uint 
 	return !!pass;
 }
 
+#ifdef __LARGE_BPF_PROG
+struct filter_char_substring_data {
+	struct selector_arg_filter *filter;
+	char *arg_str;
+	uint arg_len;
+	bool igncase;
+	bool match;
+};
+
+FUNC_INLINE long
+do_filter_char_substring(__u32 i, struct filter_char_substring_data *data, bool igncase)
+{
+	__u32 id = ((__u32 *)&data->filter->value)[i];
+	char *sub_str;
+	int idx;
+
+	sub_str = map_lookup_elem(&substring_map, &id);
+	if (!sub_str)
+		return 0;
+
+	if (igncase) {
+		if (!bpf_ksym_exists(bpf_strncasestr))
+			return 0;
+		idx = bpf_strncasestr(data->arg_str, sub_str, data->arg_len);
+	} else {
+		if (!bpf_ksym_exists(bpf_strnstr))
+			return 0;
+		idx = bpf_strnstr(data->arg_str, sub_str, data->arg_len);
+	}
+
+	return idx >= 0 ? 1 : 0;
+}
+
+#ifdef __V61_BPF_PROG
+FUNC_LOCAL long
+do_filter_char_substring_loop(__u32 i, struct filter_char_substring_data *data)
+{
+	/*
+	 * The verifier does not preserve the bpf_loop callback index bound when
+	 * it is used for pointer arithmetic. Force a verifier-visible upper bound
+	 * before indexing filter->value. bpf_loop itself only supplies 0..99.
+	 */
+	asm volatile("%[i] &= 0x7f;\n" : [i] "+r"(i));
+	if (i >= MAX_SUBSTRING_VALUES)
+		return 1;
+
+	/* Match the original loop's post-iteration vallen check. */
+	if (i && i * sizeof(__u32) + 8 >= data->filter->vallen)
+		return 1;
+
+	if (do_filter_char_substring(i, data, data->igncase)) {
+		data->match = true;
+		return 1;
+	}
+	return 0;
+}
+#endif
+
+FUNC_LOCAL long
+filter_char_substring(struct selector_arg_filter *filter, char *arg_str, uint arg_len, bool igncase)
+{
+	struct filter_char_substring_data data = {
+		.filter = filter,
+		.arg_str = arg_str,
+		.arg_len = arg_len,
+		.igncase = igncase,
+	};
+
+#ifdef __V61_BPF_PROG
+	loop(MAX_SUBSTRING_VALUES, do_filter_char_substring_loop, &data, 0);
+	return data.match;
+#else
+	int i, j = 0;
+
+	if (CONFIG(ITER_NUM)) {
+		bpf_for(i, 0, MAX_SUBSTRING_VALUES)
+		{
+			if (do_filter_char_substring(i, &data, igncase))
+				return 1;
+			j += 4;
+			if (j + 8 >= data.filter->vallen)
+				break;
+		}
+	} else {
+		for (i = 0; i < MAX_SUBSTRING_VALUES; i++) {
+			if (do_filter_char_substring(i, &data, igncase))
+				return 1;
+			j += 4;
+			if (j + 8 >= data.filter->vallen)
+				break;
+		}
+	}
+	return 0;
+#endif
+}
+#endif /* __LARGE_BPF_PROG */
+
 FUNC_INLINE bool is_not_operator(__u32 op)
 {
-	return (op == op_filter_neq || op == op_filter_str_notprefix || op == op_filter_str_notpostfix || op == op_filter_notin);
+	return (op == op_filter_neq || op == op_filter_str_notprefix || op == op_filter_str_notpostfix || op == op_filter_notin || op == op_filter_not_file_type);
 }
 
 FUNC_LOCAL long
-filter_char_buf(struct selector_arg_filter *filter, char *args, int value_off)
+filter_char_buf_value(struct selector_arg_filter *filter, char *arg_str, uint len)
 {
 	long match = 0;
-	// Arg length is 4 bytes before the value data
-	uint len = *(uint *)&args[value_off - 4];
-	char *arg_str = &args[value_off];
 
 	switch (filter->op) {
+#ifdef __LARGE_BPF_PROG
+	case op_substring_igncase:
+		if (bpf_ksym_exists(bpf_strncasestr))
+			match = filter_char_substring(filter, arg_str, len, true);
+		break;
+	case op_substring:
+		if (bpf_ksym_exists(bpf_strnstr))
+			match = filter_char_substring(filter, arg_str, len, false);
+		break;
+#endif
 	case op_filter_eq:
 	case op_filter_neq:
 		match = filter_char_buf_equal(filter, arg_str, len);
@@ -913,10 +1025,74 @@ filter_char_buf(struct selector_arg_filter *filter, char *args, int value_off)
 	return is_not_operator(filter->op) ? !match : match;
 }
 
+FUNC_LOCAL long
+filter_char_buf(struct selector_arg_filter *filter, char *args, int value_off)
+{
+	// Arg length is 4 bytes before the value data.
+	uint len = *(uint *)&args[value_off - 4];
+
+	return filter_char_buf_value(filter, &args[value_off], len);
+}
+
+// This struct captures the layout documented in store_path().
 struct string_buf {
 	__u32 len;
 	char buf[];
 };
+
+FUNC_LOCAL long
+filter_file_type(struct selector_arg_filter *filter, struct string_buf *args)
+{
+	// see store_path() for memory layout
+	// mode is at the end, so we can access it using the length of the string
+	// plus the size of the flags.
+	__u16 mode = 0;
+	int j = 0;
+
+	if (args->len > MAX_STRING)
+		return 0;
+
+	__u32 mode_off = args->len;
+	char *mode_ptr = (char *)args;
+
+	/* Mask and add in one asm block so nothing can be scheduled between
+	 * them: clang > 20 otherwise spills the masked value and reloads it,
+	 * and pre-5.7 verifiers lose the range across the spill. The constant
+	 * part of the offset stays out of the mask so it cannot wrap it.
+	 */
+	asm volatile("%[mode_off] &= 0xfff;\n"
+		     "%[mode_ptr] += %[mode_off];\n"
+		     : [mode_off] "+r"(mode_off),
+		       [mode_ptr] "+r"(mode_ptr));
+
+	// Offset from args: args->len (path) + 4 (len field) + 4 (flags)
+	memcpy(&mode, mode_ptr + sizeof(args->len) + sizeof(__u32), sizeof(mode));
+
+	/* filter->value contains the target file type constants (e.g. S_IFREG,
+	 * S_IFIFO) written by the userspace agent from the fileTypeTable.
+	 * We compare each against the file type extracted from the inode mode.
+	 */
+	__u32 *v = (__u32 *)&filter->value;
+#pragma unroll
+	for (int i = 0; i < MAX_MATCH_VALUES; i++) {
+		if (v[i] == 0)
+			break;
+
+		/* 0170000 is S_IFMT (from POSIX stat.h): the bitmask for the
+		 * file type field in the inode st_mode. Masking with S_IFMT
+		 * extracts just the file type bits (e.g. regular, directory,
+		 * pipe, socket) and compares against the filter value.
+		 */
+		if ((mode & 0170000) == v[i])
+			return 1;
+
+		j += sizeof(*v);
+		if (j + 8 /* vallen+type */ >= filter->vallen)
+			break;
+	}
+
+	return 0;
+}
 
 /* filter_file_buf: runs a comparison between the file path in args against the
  * filter file path. For 'equal' and 'prefix' operators we compare the file path
@@ -928,13 +1104,25 @@ filter_file_buf(struct selector_arg_filter *filter, struct string_buf *args)
 {
 	long match = 0;
 
-	/* There are cases where file pointer may not contain a path.
-	 * An example is using an unnamed pipe. This is not a match.
+	/* There are cases where file pointer may not contain a path (e.g., unnamed
+	 * pipes or sockets). If we are doing a path-based comparison (equal,
+	 * prefix, postfix), these cases are not a match. For FileType/NotFileType
+	 * operators, we proceed as the mode bits are still available.
 	 */
-	if (args->len == 0)
+	if (args->len == 0 && filter->op != op_filter_file_type && filter->op != op_filter_not_file_type)
 		return 0;
 
 	switch (filter->op) {
+#ifdef __LARGE_BPF_PROG
+	case op_substring_igncase:
+		if (bpf_ksym_exists(bpf_strncasestr))
+			match = filter_char_substring(filter, args->buf, args->len, true);
+		break;
+	case op_substring:
+		if (bpf_ksym_exists(bpf_strnstr))
+			match = filter_char_substring(filter, args->buf, args->len, false);
+		break;
+#endif
 	case op_filter_eq:
 	case op_filter_neq:
 		match = filter_char_buf_equal(filter, args->buf, args->len);
@@ -947,6 +1135,10 @@ filter_file_buf(struct selector_arg_filter *filter, struct string_buf *args)
 	case op_filter_str_notpostfix:
 		match = filter_char_buf_postfix(filter, args->buf, args->len);
 		break;
+	case op_filter_file_type:
+	case op_filter_not_file_type:
+		match = filter_file_type(filter, args);
+		break;
 	}
 
 	return is_not_operator(filter->op) ? !match : match;
@@ -956,6 +1148,20 @@ struct ip_ver {
 	u8 ihl : 4;
 	u8 version : 4;
 };
+
+FUNC_INLINE long
+filter_addr_op_mod(__u32 op, long value)
+{
+	switch (op) {
+	case op_filter_saddr:
+	case op_filter_daddr:
+		return !!value;
+	case op_filter_notsaddr:
+	case op_filter_notdaddr:
+		return !value;
+	}
+	return 0;
+}
 
 // use the selector value to determine a LPM Trie map, and do a lookup to determine whether the argument
 // is in the defined set.
@@ -974,7 +1180,7 @@ filter_addr_map(struct selector_arg_filter *filter, __u64 *addr, __u16 family)
 		map_idx = map_idxs[0];
 		addrmap = map_lookup_elem(&addr4lpm_maps, &map_idx);
 		if (!addrmap)
-			return 0;
+			return filter_addr_op_mod(filter->op, 0);
 		arg4.prefix = 32;
 		arg4.addr = addr[0];
 		arg = &arg4;
@@ -983,7 +1189,7 @@ filter_addr_map(struct selector_arg_filter *filter, __u64 *addr, __u16 family)
 		map_idx = map_idxs[1];
 		addrmap = map_lookup_elem(&addr6lpm_maps, &map_idx);
 		if (!addrmap)
-			return 0;
+			return filter_addr_op_mod(filter->op, 0);
 		arg6.prefix = 128;
 		// write the address in as 4 u32s due to alignment
 		write_ipv6_addr32(arg6.addr, (__u32 *)addr);
@@ -993,17 +1199,9 @@ filter_addr_map(struct selector_arg_filter *filter, __u64 *addr, __u16 family)
 		return 0;
 	}
 
-	__u8 *pass = map_lookup_elem(addrmap, arg);
+	long exists = (long)map_lookup_elem(addrmap, arg);
 
-	switch (filter->op) {
-	case op_filter_saddr:
-	case op_filter_daddr:
-		return !!pass;
-	case op_filter_notsaddr:
-	case op_filter_notdaddr:
-		return !pass;
-	}
-	return 0;
+	return filter_addr_op_mod(filter->op, exists);
 }
 
 /* filter_inet: runs a comparison between the IPv4/6 addresses and ports in
@@ -1012,21 +1210,32 @@ filter_addr_map(struct selector_arg_filter *filter, __u64 *addr, __u16 family)
 FUNC_LOCAL long
 filter_inet(struct selector_arg_filter *filter, char *args)
 {
-	__u64 addr[2] = { 0, 0 };
-	__u32 port = 0;
-	__u32 value = 0;
-	struct sk_type *sk = 0;
-	struct skb_type *skb = 0;
+	struct sockaddr_in_type *address = 0;
 	struct tuple_type *tuple = 0;
+	struct tuple_type t = { 0 };
+	struct skb_type *skb = 0;
+	__u64 addr[2] = { 0, 0 };
+	struct sk_type *sk = 0;
+	__u32 value = 0;
+	__u32 port = 0;
 
 	switch (filter->type) {
 	case sock_type:
+	case socket_type:
 		sk = (struct sk_type *)args;
 		tuple = &sk->tuple;
 		break;
 	case skb_type:
 		skb = (struct skb_type *)args;
 		tuple = &skb->tuple;
+		break;
+	case sockaddr_type:
+		address = (struct sockaddr_in_type *)args;
+		t.family = address->sin_family;
+		t.sport = address->sin_port;
+		t.saddr[0] = address->sin_addr[0];
+		t.saddr[1] = address->sin_addr[1];
+		tuple = &t;
 		break;
 	default:
 		return 0;
@@ -1060,7 +1269,7 @@ filter_inet(struct selector_arg_filter *filter, char *args)
 		value = tuple->family;
 		break;
 	case op_filter_state:
-		if (filter->type == sock_type)
+		if ((filter->type == sock_type || filter->type == socket_type) && sk)
 			value = sk->state;
 		break;
 	default:
@@ -1088,11 +1297,59 @@ filter_inet(struct selector_arg_filter *filter, char *args)
 	case op_filter_family:
 		return filter_32ty_map(filter, (char *)&value);
 	case op_filter_state:
-		if (filter->type == sock_type)
+		if (filter->type == sock_type || filter->type == socket_type)
 			return filter_32ty_map(filter, (char *)&value);
 	}
 	return 0;
 }
+
+#if defined(__V511_BPF_PROG)
+FUNC_LOCAL long
+filter_sockaddr_un(struct selector_arg_filter *filter, char *args)
+{
+	struct sockaddr_un_type *address = (struct sockaddr_un_type *)args;
+	char *path = (char *)&address->sun_path[0];
+	__u8 path_len = address->path_len;
+
+	switch (filter->op) {
+#ifdef __LARGE_BPF_PROG
+	case op_substring_igncase:
+		if (bpf_ksym_exists(bpf_strncasestr))
+			return filter_char_substring(filter, path, path_len, true);
+		break;
+	case op_substring:
+		if (bpf_ksym_exists(bpf_strnstr))
+			return filter_char_substring(filter, path, path_len, false);
+		break;
+#endif
+	case op_filter_str_prefix:
+	case op_filter_str_notprefix: {
+		long match = filter_char_buf_prefix(filter, path, path_len);
+
+		if (is_not_operator(filter->op))
+			return !match;
+		return match;
+	}
+	case op_filter_eq:
+	case op_filter_neq: {
+		long match = filter_char_buf_equal(filter, path, path_len);
+
+		if (is_not_operator(filter->op))
+			return !match;
+		return match;
+	}
+	case op_filter_family: {
+		__u32 value = address->family;
+
+		return filter_32ty_map(filter, (char *)&value);
+	}
+	default:
+		break;
+	}
+
+	return 0;
+}
+#endif
 
 FUNC_INLINE long
 __copy_char_iovec(long off, unsigned long arg, unsigned long cnt,
@@ -1123,11 +1380,12 @@ copy_char_iovec(void *ctx, long off, unsigned long arg, int argm,
 
 	meta = get_arg_meta(argm, e);
 
-	if (hasReturnCopy(argm)) {
+	if (has_return_copy(argm)) {
+		int ret = return_error(s, char_buf_saved_for_retprobe);
 		u64 retid = retprobe_map_get_key(ctx);
 
 		retprobe_map_set_iovec(e->func_id, retid, e->common.ktime, arg, meta);
-		return return_error(s, char_buf_saved_for_retprobe);
+		return ret;
 	}
 	return __copy_char_iovec(off, arg, meta, 0, e);
 }
@@ -1141,6 +1399,19 @@ FUNC_INLINE long copy_bpf_attr(char *args, unsigned long arg)
 	probe_read(&bpf_info->prog_type, sizeof(__u32), _(&ba->prog_type));
 	probe_read(&bpf_info->insn_cnt, sizeof(__u32), _(&ba->insn_cnt));
 	probe_read(&bpf_info->prog_name, BPF_OBJ_NAME_LEN, _(&ba->prog_name));
+
+	return sizeof(struct bpf_info_type);
+}
+
+FUNC_INLINE long copy_bpf_prog(char *args, unsigned long arg)
+{
+	struct bpf_prog *ba = (struct bpf_prog *)arg;
+	struct bpf_info_type *bpf_info = (struct bpf_info_type *)args;
+
+	/* struct values */
+	bpf_info->prog_type = BPF_CORE_READ(ba, type);
+	bpf_info->insn_cnt = BPF_CORE_READ(ba, len);
+	BPF_CORE_READ_STR_INTO(&bpf_info->prog_name, ba, aux, name);
 
 	return sizeof(struct bpf_info_type);
 }
@@ -1185,71 +1456,6 @@ FUNC_INLINE long copy_bpf_map(char *args, unsigned long arg)
 	return sizeof(struct bpf_map_info_type);
 }
 
-#ifdef __LARGE_BPF_PROG
-FUNC_INLINE long
-copy_iov_iter(void *ctx, long off, unsigned long arg, int argm, struct msg_generic_kprobe *e,
-	      struct bpf_map_def *data_heap)
-{
-	long iter_iovec = -1, iter_ubuf __maybe_unused = -1;
-	struct iov_iter *iov_iter = (struct iov_iter *)arg;
-	struct kvec *kvec;
-	const char *buf;
-	size_t count;
-	u8 iter_type;
-	void *tmp;
-	int *s;
-
-	if (!bpf_core_field_exists(iov_iter->iter_type))
-		goto nodata;
-
-	tmp = _(&iov_iter->iter_type);
-	probe_read(&iter_type, sizeof(iter_type), tmp);
-
-	if (bpf_core_enum_value_exists(enum iter_type, ITER_IOVEC))
-		iter_iovec = bpf_core_enum_value(enum iter_type, ITER_IOVEC);
-
-#ifdef __V61_BPF_PROG
-	if (bpf_core_enum_value_exists(enum iter_type, ITER_UBUF))
-		iter_ubuf = bpf_core_enum_value(enum iter_type, ITER_UBUF);
-#endif
-
-	if (iter_type == iter_iovec) {
-		tmp = _(&iov_iter->kvec);
-		probe_read(&kvec, sizeof(kvec), tmp);
-
-		tmp = _(&kvec->iov_base);
-		probe_read(&buf, sizeof(buf), tmp);
-
-		tmp = _(&kvec->iov_len);
-		probe_read(&count, sizeof(count), tmp);
-
-		return __copy_char_buf(ctx, off, (unsigned long)buf, count,
-				       has_max_data(argm), e, data_heap);
-	}
-
-#ifdef __V61_BPF_PROG
-	if (iter_type == iter_ubuf) {
-		tmp = _(&iov_iter->ubuf);
-		probe_read(&buf, sizeof(buf), tmp);
-
-		tmp = _(&iov_iter->count);
-		probe_read(&count, sizeof(count), tmp);
-
-		return __copy_char_buf(ctx, off, (unsigned long)buf, count,
-				       has_max_data(argm), e, data_heap);
-	}
-#endif
-
-nodata:
-	s = (int *)args_off(e, off);
-	s[0] = 0;
-	s[1] = 0;
-	return 8;
-}
-#else
-#define copy_iov_iter(ctx, orig_off, arg, argm, e, data_heap) 0
-#endif /* __LARGE_BPF_PROG */
-
 FUNC_INLINE bool is_signed_type(int type)
 {
 	return type == s32_ty || type == s64_ty || type == int_type;
@@ -1291,15 +1497,13 @@ filter_64ty_selector_val(struct selector_arg_filter *filter, char *args)
 		case op_filter_eq:
 		case op_filter_neq:
 			res = (*(u64 *)args == w);
-
-			if (filter->op == op_filter_eq && res)
-				return 1;
-			if (filter->op == op_filter_neq && !res)
-				return 1;
+			if (res)
+				return filter->op == op_filter_eq ? 1 : 0;
 			break;
 		case op_filter_mask:
 			if (*(u64 *)args & w)
 				return 1;
+			break;
 		default:
 			break;
 		}
@@ -1307,13 +1511,183 @@ filter_64ty_selector_val(struct selector_arg_filter *filter, char *args)
 		if (j + 8 >= filter->vallen)
 			break;
 	}
+	return is_not_operator(filter->op);
+}
+
+// filter on values provided in the selector itself
+FUNC_LOCAL long
+filter_8ty_selector_val(struct selector_arg_filter *filter, char *args)
+{
+	__u32 *v = (__u32 *)&filter->value;
+	int i, j = 0;
+
+#pragma unroll
+	for (i = 0; i < MAX_MATCH_VALUES; i++) {
+		__u32 w = v[i];
+		bool res;
+
+		switch (filter->op) {
+		case op_filter_lt:
+			if (is_signed_type(filter->type)) {
+				if (*(s8 *)args < (s32)w)
+					return 1;
+			} else {
+				if (*(u8 *)args < w)
+					return 1;
+			}
+			break;
+		case op_filter_gt:
+			if (is_signed_type(filter->type)) {
+				if (*(s8 *)args > (s32)w)
+					return 1;
+			} else {
+				if (*(u8 *)args > w)
+					return 1;
+			}
+			break;
+		case op_filter_eq:
+		case op_filter_neq:
+			res = (*(u8 *)args == w);
+			if (res)
+				return filter->op == op_filter_eq ? 1 : 0;
+			break;
+		case op_filter_mask:
+			if (*(u8 *)args & w)
+				return 1;
+			break;
+		default:
+			break;
+		}
+		// placed here to allow llvm unroll this loop
+		j += 4;
+		// + 8 because the the members vallen (uint32) and type (uint32) are included
+		// in the total stored in filter->vallen. see func parseMatchArg()
+		if (j + 8 >= filter->vallen)
+			break;
+	}
+	return is_not_operator(filter->op);
+}
+
+// use the selector value to determine a hash map, and do a lookup to determine whether the argument
+// is in the defined set.
+FUNC_LOCAL long
+filter_8ty_map(struct selector_arg_filter *filter, char *args)
+{
+	void *argmap;
+	__u32 map_idx = filter->value;
+
+	argmap = map_lookup_elem(&argfilter_maps, &map_idx);
+	if (!argmap)
+		return 0;
+
+	__u64 arg = *((__u8 *)args);
+	__u8 *pass = map_lookup_elem(argmap, &arg);
+
+	switch (filter->op) {
+	case op_filter_inmap:
+	case op_filter_sport:
+	case op_filter_dport:
+	case op_filter_protocol:
+	case op_filter_family:
+	case op_filter_state:
+		return !!pass;
+	case op_filter_notinmap:
+	case op_filter_notsport:
+	case op_filter_notdport:
+		return !pass;
+	}
+	return 0;
+}
+
+// filter on values provided in the selector itself
+FUNC_LOCAL long
+filter_16ty_selector_val(struct selector_arg_filter *filter, char *args)
+{
+	__u32 *v = (__u32 *)&filter->value;
+	int i, j = 0;
+
+#pragma unroll
+	for (i = 0; i < MAX_MATCH_VALUES; i++) {
+		__u32 w = v[i];
+		bool res;
+
+		switch (filter->op) {
+		case op_filter_lt:
+			if (is_signed_type(filter->type)) {
+				if (*(s16 *)args < (s32)w)
+					return 1;
+			} else {
+				if (*(u16 *)args < w)
+					return 1;
+			}
+			break;
+		case op_filter_gt:
+			if (is_signed_type(filter->type)) {
+				if (*(s16 *)args > (s32)w)
+					return 1;
+			} else {
+				if (*(u16 *)args > w)
+					return 1;
+			}
+			break;
+		case op_filter_eq:
+		case op_filter_neq:
+			res = (*(u16 *)args == w);
+			if (res)
+				return filter->op == op_filter_eq ? 1 : 0;
+			break;
+		case op_filter_mask:
+			if (*(u16 *)args & w)
+				return 1;
+			break;
+		default:
+			break;
+		}
+		// placed here to allow llvm unroll this loop
+		j += 4;
+		// + 8 because the the members vallen (uint32) and type (uint32) are included
+		// in the total stored in filter->vallen. see func parseMatchArg()
+		if (j + 8 >= filter->vallen)
+			break;
+	}
+	return is_not_operator(filter->op);
+}
+
+// use the selector value to determine a hash map, and do a lookup to determine whether the argument
+// is in the defined set.
+FUNC_LOCAL long
+filter_16ty_map(struct selector_arg_filter *filter, char *args)
+{
+	void *argmap;
+	__u32 map_idx = filter->value;
+
+	argmap = map_lookup_elem(&argfilter_maps, &map_idx);
+	if (!argmap)
+		return 0;
+
+	__u64 arg = *((__u16 *)args);
+	__u8 *pass = map_lookup_elem(argmap, &arg);
+
+	switch (filter->op) {
+	case op_filter_inmap:
+	case op_filter_sport:
+	case op_filter_dport:
+	case op_filter_protocol:
+	case op_filter_family:
+	case op_filter_state:
+		return !!pass;
+	case op_filter_notinmap:
+	case op_filter_notsport:
+	case op_filter_notdport:
+		return !pass;
+	}
 	return 0;
 }
 
 // use the selector value to determine a hash map, and do a lookup to determine whether the argument
 // is in the defined set.
 FUNC_LOCAL long
-filter_64ty_map(struct selector_arg_filter *filter, char *args, bool set32bit)
+filter_64ty_map(struct selector_arg_filter *filter, char *args)
 {
 	void *argmap;
 	__u32 map_idx = filter->value;
@@ -1323,10 +1697,6 @@ filter_64ty_map(struct selector_arg_filter *filter, char *args, bool set32bit)
 		return 0;
 
 	__u64 arg = *((__u64 *)args);
-
-	if (set32bit)
-		arg |= IS_32BIT;
-
 	__u8 *pass = map_lookup_elem(argmap, &arg);
 
 	switch (filter->op) {
@@ -1339,7 +1709,123 @@ filter_64ty_map(struct selector_arg_filter *filter, char *args, bool set32bit)
 }
 
 FUNC_LOCAL long
-filter_64ty(struct selector_arg_filter *filter, char *args, bool set32bit)
+filter_64ty_range(struct selector_arg_filter *filter, char *args)
+{
+	__u64 *v = (__u64 *)&filter->value;
+	int all = 0, i, j = 0;
+
+#pragma unroll
+	for (i = 0; i < MAX_MATCH_VALUES; i++) {
+		__u64 start = v[i * 2], end = v[i * 2 + 1];
+		bool res;
+
+		if (is_signed_type(filter->type))
+			res = ((__s64)start <= *(s64 *)args) && (*(s64 *)args <= (__s64)end);
+		else
+			res = (start <= *(u64 *)args) && (*(u64 *)args <= end);
+
+		if (filter->op == op_in_range && res)
+			return 1;
+		all |= res;
+
+		j += sizeof(*v) * 2;
+		if (j + 8 /* vallen+type */ >= filter->vallen)
+			break;
+	}
+	if (filter->op == op_notin_range && !all)
+		return 1;
+	return 0;
+}
+
+FUNC_LOCAL long
+filter_32ty_range(struct selector_arg_filter *filter, char *args)
+{
+	__u32 *v = (__u32 *)&filter->value;
+	int all = 0, i, j = 0;
+
+#pragma unroll
+	for (i = 0; i < MAX_MATCH_VALUES; i++) {
+		__u32 start = v[i * 2], end = v[i * 2 + 1];
+		bool res;
+
+		if (is_signed_type(filter->type))
+			res = ((__s32)start <= *(s32 *)args) && (*(s32 *)args <= (__s32)end);
+		else
+			res = (start <= *(u32 *)args) && (*(u32 *)args <= end);
+
+		if (filter->op == op_in_range && res)
+			return 1;
+		all |= res;
+
+		j += sizeof(*v) * 2;
+		if (j + 8 /* vallen+type */ >= filter->vallen)
+			break;
+	}
+	if (filter->op == op_notin_range && !all)
+		return 1;
+	return 0;
+}
+
+FUNC_LOCAL long
+filter_16ty_range(struct selector_arg_filter *filter, char *args)
+{
+	__u32 *v = (__u32 *)&filter->value;
+	int all = 0, i, j = 0;
+
+#pragma unroll
+	for (i = 0; i < MAX_MATCH_VALUES; i++) {
+		__u32 start = v[i * 2], end = v[i * 2 + 1];
+		bool res;
+
+		if (is_signed_type(filter->type))
+			res = ((__s32)start <= *(s16 *)args) && (*(s16 *)args <= (__s32)end);
+		else
+			res = (start <= *(u16 *)args) && (*(u16 *)args <= end);
+
+		if (filter->op == op_in_range && res)
+			return 1;
+		all |= res;
+
+		j += sizeof(*v) * 2;
+		if (j + 8 /* vallen+type */ >= filter->vallen)
+			break;
+	}
+	if (filter->op == op_notin_range && !all)
+		return 1;
+	return 0;
+}
+
+FUNC_LOCAL long
+filter_8ty_range(struct selector_arg_filter *filter, char *args)
+{
+	__u32 *v = (__u32 *)&filter->value;
+	int all = 0, i, j = 0;
+
+#pragma unroll
+	for (i = 0; i < MAX_MATCH_VALUES; i++) {
+		__u32 start = v[i * 2], end = v[i * 2 + 1];
+		bool res;
+
+		if (is_signed_type(filter->type))
+			res = ((__s32)start <= *(s8 *)args) && (*(s8 *)args <= (__s32)end);
+		else
+			res = (start <= *(u8 *)args) && (*(u8 *)args <= end);
+
+		if (filter->op == op_in_range && res)
+			return 1;
+		all |= res;
+
+		j += sizeof(*v) * 2;
+		if (j + 8 /* vallen+type */ >= filter->vallen)
+			break;
+	}
+	if (filter->op == op_notin_range && !all)
+		return 1;
+	return 0;
+}
+
+FUNC_LOCAL long
+filter_64ty(struct selector_arg_filter *filter, char *args)
 {
 	switch (filter->op) {
 	case op_filter_lt:
@@ -1350,7 +1836,12 @@ filter_64ty(struct selector_arg_filter *filter, char *args, bool set32bit)
 		return filter_64ty_selector_val(filter, args);
 	case op_filter_inmap:
 	case op_filter_notinmap:
-		return filter_64ty_map(filter, args, set32bit);
+		return filter_64ty_map(filter, args);
+#ifdef __LARGE_BPF_PROG
+	case op_in_range:
+	case op_notin_range:
+		return filter_64ty_range(filter, args);
+#endif
 	}
 
 	return 0;
@@ -1392,14 +1883,13 @@ filter_32ty_selector_val(struct selector_arg_filter *filter, char *args)
 		case op_filter_neq:
 			res = (*(u32 *)args == w);
 
-			if (filter->op == op_filter_eq && res)
-				return 1;
-			if (filter->op == op_filter_neq && !res)
-				return 1;
+			if (res)
+				return filter->op == op_filter_eq ? 1 : 0;
 			break;
 		case op_filter_mask:
 			if (*(u32 *)args & w)
 				return 1;
+			break;
 		default:
 			break;
 		}
@@ -1408,7 +1898,7 @@ filter_32ty_selector_val(struct selector_arg_filter *filter, char *args)
 		if (j + 8 >= filter->vallen)
 			break;
 	}
-	return 0;
+	return is_not_operator(filter->op);
 }
 
 // use the selector value to determine a hash map, and do a lookup to determine whether the argument
@@ -1455,6 +1945,57 @@ filter_32ty(struct selector_arg_filter *filter, char *args)
 	case op_filter_inmap:
 	case op_filter_notinmap:
 		return filter_32ty_map(filter, args);
+#ifdef __LARGE_BPF_PROG
+	case op_in_range:
+	case op_notin_range:
+		return filter_32ty_range(filter, args);
+#endif
+	}
+
+	return 0;
+}
+
+FUNC_LOCAL long
+filter_16ty(struct selector_arg_filter *filter, char *args)
+{
+	switch (filter->op) {
+	case op_filter_lt:
+	case op_filter_gt:
+	case op_filter_eq:
+	case op_filter_neq:
+	case op_filter_mask:
+		return filter_16ty_selector_val(filter, args);
+	case op_filter_inmap:
+	case op_filter_notinmap:
+		return filter_16ty_map(filter, args);
+#ifdef __LARGE_BPF_PROG
+	case op_in_range:
+	case op_notin_range:
+		return filter_16ty_range(filter, args);
+#endif
+	}
+
+	return 0;
+}
+
+FUNC_LOCAL long
+filter_8ty(struct selector_arg_filter *filter, char *args)
+{
+	switch (filter->op) {
+	case op_filter_lt:
+	case op_filter_gt:
+	case op_filter_eq:
+	case op_filter_neq:
+	case op_filter_mask:
+		return filter_8ty_selector_val(filter, args);
+	case op_filter_inmap:
+	case op_filter_notinmap:
+		return filter_8ty_map(filter, args);
+#ifdef __LARGE_BPF_PROG
+	case op_in_range:
+	case op_notin_range:
+		return filter_8ty_range(filter, args);
+#endif
 	}
 
 	return 0;
@@ -1466,16 +2007,28 @@ FUNC_INLINE size_t type_to_min_size(int type, int argm)
 	case fd_ty:
 	case file_ty:
 	case path_ty:
+	case dentry_type:
 	case string_type:
 		return MAX_STRING;
 	case int_type:
 	case s32_ty:
 	case u32_ty:
+	case s16_ty:
+	case u16_ty:
+	case s8_ty:
+	case u8_ty:
 		return 4;
 	case skb_type:
 		return sizeof(struct skb_type);
 	case sock_type:
+	case socket_type:
 		return sizeof(struct sk_type);
+	case sockaddr_type:
+		return sizeof(struct sockaddr_in_type);
+#if defined(__V511_BPF_PROG)
+	case sockaddr_un_type:
+		return sizeof(struct sockaddr_un_type);
+#endif
 	case cred_type:
 		return sizeof(struct msg_cred);
 	case size_type:
@@ -1492,6 +2045,7 @@ FUNC_INLINE size_t type_to_min_size(int type, int argm)
 	case const_buf_type:
 		return argm;
 	case bpf_attr_type:
+	case bpf_prog_type:
 		return sizeof(struct bpf_info_type);
 	case perf_event_type:
 		return sizeof(struct perf_event_info_type);
@@ -1520,22 +2074,25 @@ FUNC_INLINE size_t type_to_min_size(int type, int argm)
 struct match_binaries_sel_opts {
 	__u32 op;
 	__u32 map_id;
+	__u32 mbset_id;
 };
 
-// This map is used by the matchBinaries selectors to retrieve their options
+// We need data for:
+// - matchBinaries, keys [0, MAX_SELECTORS)
+// - matchParentBinaries, keys [MAX_SELECTORS, MAX_SELECTORS * 2)
+#define MB_MAX_ENTRIES (MAX_SELECTORS * 2)
+
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, MAX_SELECTORS);
+	__uint(max_entries, MB_MAX_ENTRIES);
 	__type(key, __u32); /* selector id */
 	__type(value, struct match_binaries_sel_opts);
 } tg_mb_sel_opts SEC(".maps");
 
-#define MATCH_BINARIES_PATH_MAX_LENGTH 256
-
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, MAX_SELECTORS); // only one matchBinaries per selector
-	__uint(key_size, sizeof(__u32));
+	__uint(max_entries, MB_MAX_ENTRIES);
+	__type(key, __u32);
 	__array(
 		values, struct {
 			__uint(type, BPF_MAP_TYPE_HASH);
@@ -1545,34 +2102,35 @@ struct {
 		});
 } tg_mb_paths SEC(".maps");
 
-FUNC_INLINE int match_binaries(__u32 selidx)
+FUNC_INLINE int match_binaries(__u32 key, struct execve_map_value *current, struct binary *bin)
 {
-	struct execve_map_value *current;
-	__u32 ppid;
-	bool walker, match = 0;
+	bool match = 0;
 	void *path_map;
 	__u8 *found_key;
 #ifdef __LARGE_BPF_PROG
-	struct string_prefix_lpm_trie prefix_key;
-	long ret;
+	struct string_prefix_lpm_trie *prefix_key;
+	struct string_postfix_lpm_trie *postfix_key;
+	__u64 postfix_len = STRING_POSTFIX_MAX_MATCH_LENGTH - 1;
+	int zero = 0;
 #endif /* __LARGE_BPF_PROG */
 
 	struct match_binaries_sel_opts *selector_options;
 
 	// retrieve the selector_options for the matchBinaries, if it's NULL it
 	// means there is not matchBinaries in this selector.
-	selector_options = map_lookup_elem(&tg_mb_sel_opts, &selidx);
+	selector_options = map_lookup_elem(&tg_mb_sel_opts, &key);
+
+	// if we failed to get process or its binary (i.e. one of them is NULL),
+	// we have match only if there are no selector options or if selector
+	// operator is none.
+	if (!current || !bin)
+		return !selector_options || selector_options->op == op_filter_none;
+
 	if (selector_options) {
 		if (selector_options->op == op_filter_none)
 			return 1; // matchBinaries selector is empty <=> match
 
-		current = event_find_curr(&ppid, &walker);
-		if (!current) {
-			// this should not happen, it means that the process was missed when
-			// scanning /proc for process that started before and after tetragon
-			return 0;
-		}
-		if (current->bin.path_length < 0) {
+		if (bin->path_length < 0) {
 			// something wrong happened when copying the filename to execve_map
 			return 0;
 		}
@@ -1580,10 +2138,23 @@ FUNC_INLINE int match_binaries(__u32 selidx)
 		switch (selector_options->op) {
 		case op_filter_in:
 		case op_filter_notin:
-			path_map = map_lookup_elem(&tg_mb_paths, &selidx);
+			update_mb_task(current, bin);
+
+			/* Check if we match the selector's bit in ->mb_bitset, which means that the
+			 * process matches a matchBinaries section with a followChidren:true
+			 * attribute either because the binary matches or because the binary of a
+			 * parent matched.
+			 */
+			if (selector_options->mbset_id != MBSET_INVALID_ID &&
+			    (bin->mb_bitset & (1UL << selector_options->mbset_id))) {
+				found_key = (u8 *)0xbadc0ffee;
+				break;
+			}
+
+			path_map = map_lookup_elem(&tg_mb_paths, &key);
 			if (!path_map)
 				return 0;
-			found_key = map_lookup_elem(path_map, current->bin.path);
+			found_key = map_lookup_elem(path_map, bin->path);
 			break;
 #ifdef __LARGE_BPF_PROG
 		case op_filter_str_prefix:
@@ -1591,13 +2162,35 @@ FUNC_INLINE int match_binaries(__u32 selidx)
 			path_map = map_lookup_elem(&string_prefix_maps, &selector_options->map_id);
 			if (!path_map)
 				return 0;
-			// prepare the key on the stack to perform lookup in the LPM_TRIE
-			memset(&prefix_key, 0, sizeof(prefix_key));
-			prefix_key.prefixlen = current->bin.path_length * 8; // prefixlen is in bits
-			ret = probe_read(prefix_key.data, current->bin.path_length & (STRING_PREFIX_MAX_LENGTH - 1), current->bin.path);
-			if (ret < 0)
+			// prepare the key to perform lookup in the LPM_TRIE
+			prefix_key = (struct string_prefix_lpm_trie *)map_lookup_elem(&string_maps_heap, &zero);
+			if (!prefix_key)
 				return 0;
-			found_key = map_lookup_elem(path_map, &prefix_key);
+			__bpf_memset_builtin(prefix_key, 0, sizeof(*prefix_key));
+			prefix_key->prefixlen = bin->path_length * 8; // prefixlen is in bits
+			if (probe_read(prefix_key->data, bin->path_length & (STRING_PREFIX_MAX_LENGTH - 1), bin->path) < 0)
+				return 0;
+			found_key = map_lookup_elem(path_map, prefix_key);
+			break;
+		case op_filter_str_postfix:
+		case op_filter_str_notpostfix:
+			path_map = map_lookup_elem(&string_postfix_maps, &selector_options->map_id);
+			if (!path_map)
+				return 0;
+			if (bin->path_length < STRING_POSTFIX_MAX_MATCH_LENGTH)
+				postfix_len = bin->path_length;
+			postfix_key = (struct string_postfix_lpm_trie *)map_lookup_elem(&string_postfix_maps_heap, &zero);
+			if (!postfix_key)
+				return 0;
+			postfix_key->prefixlen = postfix_len * 8; // prefixlen is in bits
+			if (!bin->reversed) {
+				file_copy_reverse((__u8 *)bin->end_r, postfix_len, (__u8 *)bin->end, bin->path_length - postfix_len);
+				bin->reversed = true;
+			}
+			if (postfix_len < STRING_POSTFIX_MAX_MATCH_LENGTH)
+				if (probe_read(postfix_key->data, postfix_len, bin->end_r) < 0)
+					return 0;
+			found_key = map_lookup_elem(path_map, postfix_key);
 			break;
 #endif /* __LARGE_BPF_PROG */
 		default:
@@ -1609,17 +2202,159 @@ FUNC_INLINE int match_binaries(__u32 selidx)
 		return is_not_operator(selector_options->op) ? !match : match;
 	}
 
-	// no matchBinaries selector <=> match
+	// no selector <=> match
 	return 1;
 }
 
+FUNC_INLINE char *
+get_arg(struct msg_generic_kprobe *e, __u32 index)
+{
+	long argoff;
+
+	asm volatile("%[index] &= %[mask];\n"
+		     : [index] "+r"(index)
+		     : [mask] "i"(MAX_POSSIBLE_ARGS_MASK));
+	argoff = e->argsoff[index];
+	asm volatile("%[argoff] &= 0x7ff;\n" : [argoff] "+r"(argoff));
+	return &e->args[argoff];
+}
+
+FUNC_INLINE bool is_filter_arg_1(long type)
+{
+	switch (type) {
+	case cap_inh_ty:
+	case cap_prm_ty:
+	case cap_eff_ty:
+	case kernel_cap_ty:
+	case syscall64_type:
+	case s64_ty:
+	case u64_ty:
+	case size_type:
+	case int_type:
+	case s32_ty:
+	case u32_ty:
+#ifdef __LARGE_BPF_PROG
+	case s16_ty:
+	case u16_ty:
+	case s8_ty:
+	case u8_ty:
+#endif // __LARGE_BPF_PROG
+		return true;
+	default:
+		return false;
+	}
+}
+
+FUNC_INLINE long
+filter_arg_1(struct msg_generic_kprobe *e, struct selector_arg_filter *filter, char *args)
+{
+	switch (filter->type) {
+	case cap_inh_ty:
+	case cap_prm_ty:
+	case cap_eff_ty:
+	case kernel_cap_ty:
+#ifdef __LARGE_BPF_PROG
+		if (filter->op == op_capabilities_gained) {
+			__u64 cap_old = *(__u64 *)args;
+			__u32 index2 = *((__u32 *)&filter->value);
+
+			if (!is_arg_ok(e, index2))
+				return 0;
+			__u64 cap_new = *(__u64 *)get_arg(e, index2);
+
+			return !!((cap_old ^ cap_new) & cap_new);
+		}
+		fallthrough;
+#endif
+	case syscall64_type:
+	case s64_ty:
+	case u64_ty:
+		return filter_64ty(filter, args);
+	case size_type:
+	case int_type:
+	case s32_ty:
+	case u32_ty:
+		return filter_32ty(filter, args);
+#ifdef __LARGE_BPF_PROG
+	case s16_ty:
+	case u16_ty:
+		return filter_16ty(filter, args);
+	case s8_ty:
+	case u8_ty:
+		return filter_8ty(filter, args);
+#endif // __LARGE_BPF_PROG
+	default:
+		return 1;
+	}
+}
+
+FUNC_INLINE long
+filter_arg_2(struct msg_generic_kprobe *e, struct selector_arg_filter *filter, char *args)
+{
+	switch (filter->type) {
+	case fd_ty:
+	case file_ty:
+	case path_ty:
+	case dentry_type:
+#ifdef __LARGE_BPF_PROG
+	case linux_binprm_type:
+#endif
+		return filter_file_buf(filter, (struct string_buf *)args);
+	case string_type:
+	case net_dev_ty:
+	case data_loc_type:
+		/* for strings, we just encode the length */
+		return filter_char_buf(filter, args, 4);
+	case char_buf:
+		/* for buffers, we just encode the expected length and the
+		 * length that was actually read (see: __copy_char_buf)
+		 */
+		return filter_char_buf(filter, args, 8);
+	case skb_type:
+	case sock_type:
+	case socket_type:
+	case sockaddr_type:
+		return filter_inet(filter, args);
+#if defined(__V511_BPF_PROG)
+	case sockaddr_un_type:
+		return filter_sockaddr_un(filter, args);
+#endif
+	default:
+		return 1;
+	}
+}
+
+FUNC_INLINE long
+filter_arg(struct msg_generic_kprobe *e, struct selector_arg_filter *filter, char *args, int arg)
+{
+	/*
+	 * Separate argument filtering based on the process const
+	 * for 4.19 kernels..
+	 */
+	if (arg == __FILTER_ARG_1)
+		return filter_arg_1(e, filter, args);
+	if (arg == __FILTER_ARG_2)
+		return filter_arg_2(e, filter, args);
+
+	/* .. and the rest of the world (i.e., process == __FILTER_ARG_ALL) */
+	if (is_filter_arg_1(filter->type))
+		return filter_arg_1(e, filter, args);
+	else
+		return filter_arg_2(e, filter, args);
+}
+
+/* selector_arg_offset returns
+ * - the offset immediately after the argument filters, or
+ * - 0 if an argument does not match.
+ */
 FUNC_INLINE int
-selector_arg_offset(__u8 *f, struct msg_generic_kprobe *e, __u32 selidx,
-		    bool is_entry)
+selector_arg_offset(void *ctx, struct bpf_map_def *tailcalls,
+		    __u8 *f, struct msg_generic_kprobe *e, __u32 selidx,
+		    bool is_entry, int arg)
 {
 	struct selector_arg_filters *filters;
 	struct selector_arg_filter *filter;
-	long seloff, argoff, argsoff, pass = 1, margsoff;
+	long seloff, argsoff, margsoff;
 	__u32 i = 0, index;
 	char *args;
 
@@ -1646,88 +2381,88 @@ selector_arg_offset(__u8 *f, struct msg_generic_kprobe *e, __u32 selidx,
 		seloff += *(__u32 *)((__u64)f + (seloff & INDEX_MASK));
 	}
 
+#ifdef __LARGE_BPF_PROG
+	/* skip the matchCmdArgs section */
+	seloff += *(__u32 *)((__u64)f + (seloff & INDEX_MASK));
+#endif
+
+	if (is_entry) {
+		/* skip the matchCaller section by reading its length */
+		seloff += *(__u32 *)((__u64)f + (seloff & INDEX_MASK));
+	}
+
 	/* Making binary selectors fixes size helps on some kernels */
 	seloff &= INDEX_MASK;
 	filters = (struct selector_arg_filters *)&f[seloff];
 
 	if (filters->arglen <= sizeof(struct selector_arg_filters)) // no filters
-		return seloff;
+		return seloff + filters->arglen;
 
 #ifdef __LARGE_BPF_PROG
+#ifdef __V61_BPF_PROG
+#pragma unroll
+#endif
 	for (i = 0; i < 5; i++)
 #endif
 	{
-		bool set32bit = false;
-
 		argsoff = filters->argoff[i];
-		asm volatile("%[argsoff] &= 0x3ff;\n" ::[argsoff] "+r"(argsoff)
-			     :);
+		asm volatile("%[argsoff] &= 0x3ff;\n"
+			     : [argsoff] "+r"(argsoff));
 
 		if (argsoff <= 0)
-			return pass ? seloff : 0;
+			return seloff + filters->arglen;
 
 		margsoff = (seloff + argsoff) & INDEX_MASK;
 		filter = (struct selector_arg_filter *)&f[margsoff];
 
+#ifndef __LARGE_BPF_PROG
+		// if, in the future, 4.19 supports multiple filters, we
+		// will need to adjust this to cope with resuming this loop
+		// on the iteration where we left off prior to tail call
+		if (!is_filter_arg_1(filter->type) && arg == __FILTER_ARG_1)
+			tail_call(ctx, tailcalls, TAIL_CALL_ARGS_2);
+#endif
+
+#ifdef __LARGE_BPF_PROG
+		/* CEL expressions do not depend on the argument types (as the other operators) so
+		 * check for them before checking for the argument type. Also filter->index points
+		 * to a cel expression identifier (rather than an argument)
+		 */
+		if (filter->op == op_cel_expr) {
+			/* if the cel expression references an arg that could not be read,
+			 * the selector does not match
+			 */
+			__u32 *v = (__u32 *)&filter->value;
+
+			for (int k = 0, j = 0; k < MAX_POSSIBLE_ARGS; k++) {
+				__u32 w = v[k];
+
+				if (!is_arg_ok(e, w))
+					return 0;
+				// placed here to allow llvm unroll this loop
+				j += 4;
+				if (j + 8 >= filter->vallen)
+					break;
+			}
+
+			if (!cel_expr(filter->index, e->argsoff, e->args))
+				return 0;
+			continue;
+		}
+#endif
+
 		index = filter->index;
-		if (index > 5)
+		if (index >= MAX_POSSIBLE_ARGS)
 			return 0;
 
-		asm volatile("%[index] &= 0x7;\n" ::[index] "+r"(index)
-			     :);
-		argoff = e->argsoff[index];
-		asm volatile("%[argoff] &= 0x7ff;\n" ::[argoff] "+r"(argoff)
-			     :);
-		args = &e->args[argoff];
+		if (!is_arg_ok(e, index))
+			return 0;
 
-		switch (filter->type) {
-		case fd_ty:
-			/* Advance args past fd */
-			args += 4;
-		case file_ty:
-		case path_ty:
-#ifdef __LARGE_BPF_PROG
-		case linux_binprm_type:
-#endif
-			pass &= filter_file_buf(filter, (struct string_buf *)args);
-			break;
-		case string_type:
-		case net_dev_ty:
-		case data_loc_type:
-			/* for strings, we just encode the length */
-			pass &= filter_char_buf(filter, args, 4);
-			break;
-		case char_buf:
-			/* for buffers, we just encode the expected length and the
-			 * length that was actually read (see: __copy_char_buf)
-			 */
-			pass &= filter_char_buf(filter, args, 8);
-			break;
-		case syscall64_type:
-			set32bit = e->sel.is32BitSyscall;
-		case s64_ty:
-		case u64_ty:
-		case kernel_cap_ty:
-		case cap_inh_ty:
-		case cap_prm_ty:
-		case cap_eff_ty:
-			pass &= filter_64ty(filter, args, set32bit);
-			break;
-		case size_type:
-		case int_type:
-		case s32_ty:
-		case u32_ty:
-			pass &= filter_32ty(filter, args);
-			break;
-		case skb_type:
-		case sock_type:
-			pass &= filter_inet(filter, args);
-			break;
-		default:
-			break;
-		}
+		args = get_arg(e, index);
+		if (!filter_arg(e, filter, args, arg))
+			return 0;
 	}
-	return pass ? seloff : 0;
+	return seloff + filters->arglen;
 }
 
 FUNC_INLINE int filter_args_reject(u64 id)
@@ -1737,146 +2472,22 @@ FUNC_INLINE int filter_args_reject(u64 id)
 	return 0;
 }
 
-FUNC_INLINE int
-filter_args(struct msg_generic_kprobe *e, int selidx, void *filter_map,
-	    bool is_entry)
+FUNC_INLINE __u64
+msg_generic_arg_value_u64(struct msg_generic_kprobe *e, unsigned int arg_id, __u64 err_val)
 {
-	__u8 *f;
+	__u32 argoff;
+	__u64 *ret;
 
-	/* No filters and no selectors so just accepts */
-	f = map_lookup_elem(filter_map, &e->idx);
-	if (!f) {
-		return 1;
-	}
+	if (arg_id >= MAX_POSSIBLE_ARGS)
+		return err_val;
 
-	/* No selectors, accept by default */
-	if (!e->sel.active[SELECTORS_ACTIVE])
-		return 1;
+	if (!is_arg_ok(e, arg_id))
+		return err_val;
 
-	/* We ran process filters early as a prefilter to drop unrelated
-	 * events early. Now we need to ensure that active pid sselectors
-	 * have their arg filters run.
-	 */
-	if (selidx > SELECTORS_ACTIVE)
-		return filter_args_reject(e->func_id);
-
-	if (e->sel.active[selidx]) {
-		int pass = selector_arg_offset(f, e, selidx, is_entry);
-		if (pass)
-			return pass;
-	}
-	return 0;
-}
-
-struct fdinstall_key {
-	__u64 tid;
-	__u32 fd;
-	__u32 pad;
-};
-
-struct fdinstall_value {
-	char file[264]; // 256B paths + 4B length + 4B flags
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 1); // will be resized by agent when needed
-	__type(key, struct fdinstall_key);
-	__type(value, struct fdinstall_value);
-} fdinstall_map SEC(".maps");
-
-FUNC_INLINE int
-installfd(struct msg_generic_kprobe *e, int fd, int name, bool follow)
-{
-	struct fdinstall_value val = { 0 };
-	struct fdinstall_key key = { 0 };
-	long fdoff, nameoff;
-	int err = 0;
-
-	/* Satisfies verifier but is a bit ugly, ideally we
-	 * can just '&' and drop the '>' case.
-	 */
-	asm volatile("%[fd] &= 0xf;\n"
-		     : [fd] "+r"(fd)
-		     :);
-	if (fd > 5) {
-		return 0;
-	}
-	fdoff = e->argsoff[fd];
-	asm volatile("%[fdoff] &= 0x7ff;\n"
-		     : [fdoff] "+r"(fdoff)
-		     :);
-	key.pad = 0;
-	key.fd = *(__u32 *)&e->args[fdoff];
-	key.tid = get_current_pid_tgid() >> 32;
-
-	if (follow) {
-		__u32 size;
-
-		asm volatile("%[name] &= 0xf;\n"
-			     : [name] "+r"(name)
-			     :);
-		if (name > 5)
-			return 0;
-		nameoff = e->argsoff[name];
-		asm volatile("%[nameoff] &= 0x7ff;\n"
-			     : [nameoff] "+r"(nameoff)
-			     :);
-
-		size = *(__u32 *)&e->args[nameoff];
-		asm volatile("%[size] &= 0xff;\n"
-			     : [size] "+r"(size)
-			     :);
-
-		probe_read(&val.file[0], size + 4 /* size */ + 4 /* flags */,
-			   &e->args[nameoff]);
-		map_update_elem(&fdinstall_map, &key, &val, BPF_ANY);
-	} else {
-		err = map_delete_elem(&fdinstall_map, &key);
-	}
-	return err;
-}
-
-FUNC_INLINE int
-copyfd(struct msg_generic_kprobe *e, int oldfd, int newfd)
-{
-	struct fdinstall_key key = { 0 };
-	struct fdinstall_value *val;
-	int oldfdoff, newfdoff;
-	int err = 0;
-
-	asm volatile("%[oldfd] &= 0xf;\n"
-		     : [oldfd] "+r"(oldfd)
-		     :);
-	if (oldfd > 5)
-		return 0;
-	oldfdoff = e->argsoff[oldfd];
-	asm volatile("%[oldfdoff] &= 0x7ff;\n"
-		     : [oldfdoff] "+r"(oldfdoff)
-		     :);
-	key.pad = 0;
-	key.fd = *(__u32 *)&e->args[oldfdoff];
-	key.tid = get_current_pid_tgid() >> 32;
-
-	val = map_lookup_elem(&fdinstall_map, &key);
-	if (val) {
-		asm volatile("%[newfd] &= 0xf;\n"
-			     : [newfd] "+r"(newfd)
-			     :);
-		if (newfd > 5)
-			return 0;
-		newfdoff = e->argsoff[newfd];
-		asm volatile("%[newfdoff] &= 0x7ff;\n"
-			     : [newfdoff] "+r"(newfdoff)
-			     :);
-		key.pad = 0;
-		key.fd = *(__u32 *)&e->args[newfdoff];
-		key.tid = get_current_pid_tgid() >> 32;
-
-		map_update_elem(&fdinstall_map, &key, val, BPF_ANY);
-	}
-
-	return err;
+	argoff = e->argsoff[arg_id];
+	argoff &= GENERIC_MSG_ARGS_MASK;
+	ret = (__u64 *)&e->args[argoff];
+	return *ret;
 }
 
 #ifdef __LARGE_BPF_PROG
@@ -1888,58 +2499,11 @@ FUNC_INLINE void do_action_signal(int signal)
 #define do_action_signal(signal)
 #endif /* __LARGE_BPF_PROG */
 
-/* The number of bytes per argument to include in the key
- * that we use to check for repeating data.
- * 40 is good for IPv6 data.
- */
-#define KEY_BYTES_PER_ARG 40
-
 #ifdef __LARGE_BPF_PROG
-/* Rate limit scope. */
-#define ACTION_RATE_LIMIT_SCOPE_THREAD	0
-#define ACTION_RATE_LIMIT_SCOPE_PROCESS 1
-#define ACTION_RATE_LIMIT_SCOPE_GLOBAL	2
-
-struct ratelimit_key {
-	__u64 func_id;
-	__u64 action;
-	__u64 tid;
-	__u8 data[MAX_POSSIBLE_ARGS * KEY_BYTES_PER_ARG];
-};
-
-struct ratelimit_value {
-	__u64 ktime;
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 1); // Agent is resizing this if the feature is needed during kprobe load
-	__type(key, struct ratelimit_key);
-	__type(value, struct ratelimit_value);
-} ratelimit_map SEC(".maps");
-
-// The value has extra headroom to allow copying argument data without upsetting the verifier.
-// This is not hashed when the key is used in the ratelimit_map.
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, __u8[sizeof(struct ratelimit_key) + 128]);
-} ratelimit_heap SEC(".maps");
-
-// This is zeroed memory that we NEVER write to, and use to copy over reusable heap in order
-// to zero it.
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, __u8[sizeof(struct ratelimit_key) + 128]);
-} ratelimit_ro_heap SEC(".maps");
-
 FUNC_INLINE bool
 rate_limit(__u64 ratelimit_interval, __u64 ratelimit_scope, struct msg_generic_kprobe *e)
 {
-	__u64 curr_time = ktime_get_ns();
+	__u64 curr_time = tg_get_ktime();
 	__u64 *last_repeat_entry;
 	struct ratelimit_key *key;
 	void *ro_heap;
@@ -1956,7 +2520,7 @@ rate_limit(__u64 ratelimit_interval, __u64 ratelimit_scope, struct msg_generic_k
 	key = map_lookup_elem(&ratelimit_heap, &zero);
 	if (!key)
 		return false;
-	ro_heap = map_lookup_elem(&ratelimit_ro_heap, &zero);
+	ro_heap = map_lookup_elem(&heap_ro_zero, &zero);
 
 	key->func_id = e->func_id;
 	key->action = e->action;
@@ -1979,14 +2543,16 @@ rate_limit(__u64 ratelimit_interval, __u64 ratelimit_scope, struct msg_generic_k
 	dst = key->data;
 
 	for (i = 0; i < MAX_POSSIBLE_ARGS; i++) {
+		if (arg_idx(i) == -1)
+			break;
 		if (e->argsoff[i] >= e->common.size)
 			break;
-		if (i < MAX_POSSIBLE_ARGS - 1)
+		if (i < MAX_POSSIBLE_ARGS - 1 && arg_idx(i + 1) != -1)
 			arg_size = e->argsoff[i + 1] - e->argsoff[i];
 		else
-			arg_size = e->common.size - e->argsoff[i];
+			arg_size = e->common.size - e->argsoff[i] + sizeof(arg_status_t);
 		if (arg_size > 0) {
-			key_index = e->argsoff[i] & 16383;
+			key_index = (e->argsoff[i] - sizeof(arg_status_t)) & 16383;
 			if (arg_size > KEY_BYTES_PER_ARG)
 				arg_size = KEY_BYTES_PER_ARG;
 			asm volatile("%[arg_size] &= 0x3f;\n" // ensure this mask is greater than KEY_BYTES_PER_ARG
@@ -2024,7 +2590,7 @@ struct socket_owner {
 // socktrack_map maintains a mapping of sock to pid_tgid
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 32000);
+	__uint(max_entries, 1); // will be resized by agent when needed
 	__type(key, __u64);
 	__type(value, struct socket_owner);
 } socktrack_map SEC(".maps");
@@ -2043,10 +2609,13 @@ tracksock(struct msg_generic_kprobe *e, int socki, bool track)
 	/* Satisfies verifier but is a bit ugly, ideally we
 	 * can just '&' and drop the '>' case.
 	 */
-	asm volatile("%[socki] &= 0xf;\n"
+	asm volatile("%[socki] &= %[mask];\n"
 		     : [socki] "+r"(socki)
-		     :);
-	if (socki > 5)
+		     : [mask] "i"(MAX_POSSIBLE_ARGS_MASK));
+	if (socki >= MAX_POSSIBLE_ARGS)
+		return 0;
+
+	if (!is_arg_ok(e, socki))
 		return 0;
 
 	sockoff = e->argsoff[socki];
@@ -2107,493 +2676,132 @@ update_pid_tid_from_sock(struct msg_generic_kprobe *e, __u64 sockaddr)
 struct {
 	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
 	__uint(max_entries, 1); // Agent is resizing this if the feature is needed during kprobe load
-	__uint(key_size, sizeof(__u32));
+	__type(key, __u32);
 	__uint(value_size, sizeof(__u64) * PERF_MAX_STACK_DEPTH);
 } stack_trace_map SEC(".maps");
 
 #if defined GENERIC_TRACEPOINT || defined GENERIC_KPROBE
-FUNC_INLINE void do_action_notify_enforcer(int error, int signal)
+FUNC_INLINE void do_action_notify_enforcer(struct msg_generic_kprobe *e,
+					   int error, int signal, int info_arg_id)
 {
-	do_enforcer_action(error, signal);
+	__u64 argv = msg_generic_arg_value_u64(e, info_arg_id, 0);
+	struct enforcer_act_info info = {
+		.func_id = e->func_id,
+		.arg = argv,
+	};
+	do_enforcer_action(error, signal, info);
 }
 #else
-#define do_action_notify_enforcer(error, signal)
+#define do_action_notify_enforcer(e, error, signal, info_arg_id)
 #endif
 
-FUNC_LOCAL __u32
-do_action(void *ctx, __u32 i, struct selector_action *actions,
-	  struct generic_maps *maps, bool *post)
+FUNC_INLINE void path_from_dentry(struct dentry *dentry, struct path *path_buf)
 {
-	struct bpf_map_def *override_tasks = maps->override;
-	int signal __maybe_unused = FGS_SIGKILL;
-	int action = actions->act[i];
-	struct msg_generic_kprobe *e;
-	__s32 error, *error_p;
-	int fdi, namei;
-	int newfdi, oldfdi;
-	int socki;
-	int err = 0;
-	int zero = 0;
-	__u64 id;
-
-	e = map_lookup_elem(maps->heap, &zero);
-	if (!e)
-		return 0;
-
-	switch (action) {
-	case ACTION_NOPOST:
-		*post = false;
-		break;
-	case ACTION_POST: {
-		__u64 ratelimit_interval __maybe_unused = actions->act[++i];
-		__u64 ratelimit_scope __maybe_unused = actions->act[++i];
-#ifdef __LARGE_BPF_PROG
-		if (rate_limit(ratelimit_interval, ratelimit_scope, e))
-			*post = false;
-#endif /* __LARGE_BPF_PROG */
-		__u32 kernel_stack_trace = actions->act[++i];
-
-		if (kernel_stack_trace) {
-			// Stack id 0 is valid so we need a flag.
-			e->common.flags |= MSG_COMMON_FLAG_KERNEL_STACKTRACE;
-			// We could use BPF_F_REUSE_STACKID to override old with new stack if
-			// same stack id. It means that if we have a collision and user space
-			// reads the old one too late, we are reading the wrong stack (the new,
-			// old one was overwritten).
-			//
-			// Here we just signal that there was a collision returning -EEXIST.
-			e->kernel_stack_id = get_stackid(ctx, &stack_trace_map, 0);
-		}
-
-		__u32 user_stack_trace = actions->act[++i];
-
-		if (user_stack_trace) {
-			e->common.flags |= MSG_COMMON_FLAG_USER_STACKTRACE;
-			e->user_stack_id = get_stackid(ctx, &stack_trace_map, BPF_F_USER_STACK);
-		}
-		break;
-	}
-
-	case ACTION_UNFOLLOWFD:
-	case ACTION_FOLLOWFD:
-		fdi = actions->act[++i];
-		namei = actions->act[++i];
-		err = installfd(e, fdi, namei, action == ACTION_FOLLOWFD);
-		break;
-	case ACTION_COPYFD:
-		oldfdi = actions->act[++i];
-		newfdi = actions->act[++i];
-		err = copyfd(e, oldfdi, newfdi);
-		break;
-	case ACTION_SIGNAL:
-		signal = actions->act[++i];
-	case ACTION_SIGKILL:
-		do_action_signal(signal);
-		break;
-	case ACTION_OVERRIDE:
-		error = actions->act[++i];
-		id = get_current_pid_tgid();
-
-		if (!override_tasks)
-			break;
-		/*
-		 * TODO: this should not happen, it means that the override
-		 * program was not executed for some reason, we should do
-		 * warning in here
-		 */
-		error_p = map_lookup_elem(override_tasks, &id);
-		if (error_p)
-			*error_p = error;
-		else
-			map_update_elem(override_tasks, &id, &error, BPF_ANY);
-		break;
-	case ACTION_GETURL:
-	case ACTION_DNSLOOKUP:
-		/* Set the URL or DNS action */
-		e->action_arg_id = actions->act[++i];
-		break;
-	case ACTION_TRACKSOCK:
-	case ACTION_UNTRACKSOCK:
-		socki = actions->act[++i];
-		err = tracksock(e, socki, action == ACTION_TRACKSOCK);
-		break;
-	case ACTION_NOTIFY_KILLER:
-		error = actions->act[++i];
-		signal = actions->act[++i];
-		do_action_notify_enforcer(error, signal);
-		break;
-	default:
-		break;
-	}
-	if (!err) {
-		e->action = action;
-		return ++i;
-	}
-	return 0;
+	/*
+	 * The dentry type path extraction does not pass through mount
+	 * points, setting mnt to NULL to stop d_path_local at first one.
+	 */
+	path_buf->mnt = NULL;
+	path_buf->dentry = dentry;
 }
 
-FUNC_INLINE bool
-has_action(struct selector_action *actions, __u32 idx)
+FUNC_INLINE const struct path *path_from_fd(unsigned long fd)
 {
-	__u32 offset = idx * sizeof(__u32) + sizeof(*actions);
+	struct task_struct *task = (struct task_struct *)get_current_task();
+	struct files_struct *files = NULL;
+	struct fdtable *fdt = NULL;
+	struct file **fd_array = NULL;
+	struct file *file = NULL;
+	__u32 fd_idx;
+	__u32 max_fds;
 
-	return offset < actions->actionlen;
+	if (fd > 0xffffffff)
+		return NULL;
+	fd_idx = (__u32)fd;
+
+	if (BPF_CORE_READ_INTO(&files, task, files) != 0 || !files)
+		return NULL;
+	if (BPF_CORE_READ_INTO(&fdt, files, fdt) != 0 || !fdt)
+		return NULL;
+	if (BPF_CORE_READ_INTO(&max_fds, fdt, max_fds) != 0)
+		return NULL;
+	if (fd_idx >= max_fds)
+		return NULL;
+	if (BPF_CORE_READ_INTO(&fd_array, fdt, fd) != 0 || !fd_array)
+		return NULL;
+
+	probe_read(&file, sizeof(file), &fd_array[fd_idx]);
+	if (!file)
+		return NULL;
+
+	return _(&file->f_path);
 }
 
-/* Currently supporting 2 actions for selector. */
-FUNC_INLINE bool
-do_actions(void *ctx, struct selector_action *actions, struct generic_maps *maps)
+FUNC_INLINE const struct path *get_path(long type, unsigned long arg, struct path *path_buf)
 {
-	bool post = true;
-	__u32 l, i = 0;
-
-#ifndef __LARGE_BPF_PROG
-#pragma unroll
-#endif
-	for (l = 0; l < MAX_ACTIONS; l++) {
-		if (!has_action(actions, i))
-			break;
-		i = do_action(ctx, i, actions, maps, &post);
-	}
-
-	return post;
-}
-
-FUNC_INLINE long
-filter_read_arg(void *ctx, struct bpf_map_def *heap,
-		struct bpf_map_def *filter, struct bpf_map_def *tailcalls,
-		struct bpf_map_def *config_map, bool is_entry)
-{
-	struct msg_generic_kprobe *e;
-	int selidx, pass, zero = 0;
-
-	e = map_lookup_elem(heap, &zero);
-	if (!e)
-		return 0;
-	selidx = e->tailcall_index_selector;
-	pass = filter_args(e, selidx & MAX_SELECTORS_MASK, filter, is_entry);
-	if (!pass) {
-		selidx++;
-		if (selidx <= MAX_SELECTORS && e->sel.active[selidx & MAX_SELECTORS_MASK]) {
-			e->tailcall_index_selector = selidx;
-			tail_call(ctx, tailcalls, TAIL_CALL_ARGS);
-		}
-		// reject if we did not attempt to tailcall, or if tailcall failed.
-		return filter_args_reject(e->func_id);
-	}
-
-	// If pass >1 then we need to consult the selector actions
-	// otherwise pass==1 indicates using default action.
-	if (pass > 1) {
-		e->pass = pass;
-		tail_call(ctx, tailcalls, TAIL_CALL_ACTIONS);
-	}
-
-	tail_call(ctx, tailcalls, TAIL_CALL_SEND);
-	return 0;
-}
-
-FUNC_INLINE long
-generic_actions(void *ctx, struct generic_maps *maps)
-{
-	struct selector_arg_filters *arg;
-	struct selector_action *actions;
-	struct msg_generic_kprobe *e;
-	int actoff, pass, zero = 0;
-	bool postit;
-	__u8 *f;
-
-	e = map_lookup_elem(maps->heap, &zero);
-	if (!e)
-		return 0;
-
-	pass = e->pass;
-	if (pass <= 1)
-		return 0;
-
-	f = map_lookup_elem(maps->filter, &e->idx);
-	if (!f)
-		return 0;
-
-	asm volatile("%[pass] &= 0x7ff;\n"
-		     : [pass] "+r"(pass)
-		     :);
-	arg = (struct selector_arg_filters *)&f[pass];
-
-	actoff = pass + arg->arglen;
-	asm volatile("%[actoff] &= 0x7ff;\n"
-		     : [actoff] "+r"(actoff)
-		     :);
-	actions = (struct selector_action *)&f[actoff];
-
-	postit = do_actions(ctx, actions, maps);
-	if (postit)
-		tail_call(ctx, maps->calls, TAIL_CALL_SEND);
-	return 0;
-}
-
-FUNC_INLINE long
-generic_output(void *ctx, struct bpf_map_def *heap, u8 op)
-{
-	struct msg_generic_kprobe *e;
-	int zero = 0;
-	size_t total;
-
-	e = map_lookup_elem(heap, &zero);
-	if (!e)
-		return 0;
-
-/* We don't need this data in return kprobe event */
-#ifndef GENERIC_KRETPROBE
-#ifdef __NS_CHANGES_FILTER
-	/* update the namespaces if we matched a change on that */
-	if (e->sel.match_ns) {
-		__u32 pid = (get_current_pid_tgid() >> 32);
-		struct task_struct *task =
-			(struct task_struct *)get_current_task();
-		struct execve_map_value *enter = execve_map_get_noinit(
-			pid); // we don't want to init that if it does not exist
-		if (enter)
-			get_namespaces(&(enter->ns), task);
-	}
-#endif
-#ifdef __CAP_CHANGES_FILTER
-	/* update the capabilities if we matched a change on that */
-	if (e->sel.match_cap) {
-		__u32 pid = (get_current_pid_tgid() >> 32);
-		struct task_struct *task =
-			(struct task_struct *)get_current_task();
-		struct execve_map_value *enter = execve_map_get_noinit(
-			pid); // we don't want to init that if it does not exist
-		if (enter)
-			get_current_subj_caps(&enter->caps, task);
-	}
-#endif
-#endif // !GENERIC_KRETPROBE
-
-	total = e->common.size + generic_kprobe_common_size();
-	/* Code movement from clang forces us to inline bounds checks here */
-	asm volatile("%[total] &= 0x7fff;\n"
-		     "if %[total] < 9000 goto +1\n;"
-		     "%[total] = 9000;\n"
-		     :
-		     : [total] "+r"(total)
-		     :);
-	perf_event_output_metric(ctx, op, &tcpmon_map, BPF_F_CURRENT_CPU, e, total);
-	return 0;
-}
-
-/**
- * Read a generic argument
- *
- * @args: destination buffer for the generic argument
- * @type: type of the argument
- * @off: offset of the argument within @args
- * @arg: argument location (generally, address of the argument)
- * @argm: argument metadata. The meaning of this depends on the @type. Some
- *        types use a -1 to designate saving @arg into the retprobe map
- * @filter_map:
- *
- * Returns the size of data appended to @args.
- */
-FUNC_INLINE long
-read_call_arg(void *ctx, struct msg_generic_kprobe *e, int index, int type,
-	      long orig_off, unsigned long arg, int argm,
-	      struct bpf_map_def *data_heap)
-{
-	size_t min_size = type_to_min_size(type, argm);
-	char *args = e->args;
-	long size = -1;
 	const struct path *path_arg = 0;
-
-	if (orig_off >= 16383 - min_size) {
-		return 0;
-	}
-	orig_off &= 16383;
-	args = args_off(e, orig_off);
-
-	/* Cache args offset for filter use later */
-	e->argsoff[index & MAX_SELECTORS_MASK] = orig_off;
+	struct kiocb *kiocb;
+	struct file *file;
 
 	switch (type) {
-	case iov_iter_type:
-		size = copy_iov_iter(ctx, orig_off, arg, argm, e, data_heap);
-		break;
-	case kiocb_type: {
-		struct kiocb *kiocb = (struct kiocb *)arg;
-		struct file *file;
-
+	case kiocb_type:
+		kiocb = (struct kiocb *)arg;
 		arg = (unsigned long)_(&kiocb->ki_filp);
 		probe_read(&file, sizeof(file), (const void *)arg);
 		arg = (unsigned long)file;
-	}
-		// fallthrough to file_ty
-	case file_ty: {
-		struct file *file;
+		fallthrough;
+	case file_ty:
 		probe_read(&file, sizeof(file), &arg);
 		path_arg = _(&file->f_path);
-		goto do_copy_path;
-	}
-	case path_ty: {
+		break;
+	case path_ty:
 		probe_read(&path_arg, sizeof(path_arg), &arg);
-		goto do_copy_path;
-	}
-	case fd_ty: {
-		struct fdinstall_key key = { 0 };
-		struct fdinstall_value *val;
-		__u32 fd;
-
-		key.tid = get_current_pid_tgid() >> 32;
-		probe_read(&fd, sizeof(__u32), &arg);
-		key.fd = fd;
-
-		val = map_lookup_elem(&fdinstall_map, &key);
-		if (val) {
-			__u32 bytes = (__u32)val->file[0];
-
-			probe_read(&args[0], sizeof(__u32), &fd);
-			asm volatile("%[bytes] &= 0xff;\n"
-				     : [bytes] "+r"(bytes)
-				     :);
-			probe_read(&args[4], bytes + 4, (char *)&val->file[0]);
-			size = bytes + 4 + 4;
-
-			// flags
-			probe_read(&args[size], 4,
-				   (char *)&val->file[size - 4]);
-			size += 4;
-		} else {
-			/* If filter specification is fd type then we
-			 * expect the fd has been previously followed
-			 * otherwise drop the event.
-			 */
-			return -1;
-		}
-	} break;
+		break;
+	case dentry_type:
+		path_from_dentry((struct dentry *)arg, path_buf);
+		path_arg = path_buf;
+		break;
+	case fd_ty:
+		path_arg = path_from_fd(arg);
+		break;
 #ifdef __LARGE_BPF_PROG
 	case linux_binprm_type: {
 		struct linux_binprm *bprm = (struct linux_binprm *)arg;
-		struct file *file;
 
 		arg = (unsigned long)_(&bprm->file);
-		probe_read(&file, sizeof(file), (const void *)arg);
+		with_errmetrics(probe_read, &file, sizeof(file), (const void *)arg);
 		path_arg = _(&file->f_path);
-		goto do_copy_path;
-	} break;
+		break;
+	};
 #endif
-	case filename_ty: {
-		struct filename *file;
-		probe_read(&file, sizeof(file), &arg);
-		probe_read(&arg, sizeof(arg), &file->name);
 	}
-		// fallthrough to copy_string
-	case string_type:
-		size = copy_strings(args, (char *)arg, MAX_STRING);
-		break;
-	case net_dev_ty: {
-		struct net_device *dev = (struct net_device *)arg;
+	return path_arg;
+}
 
-		size = copy_strings(args, dev->name, IFNAMSIZ);
-	} break;
-	case data_loc_type: {
-		// data_loc: lower 16 bits is offset from ctx; upper 16 bits is length
-		long dl_len = (arg >> 16) & 0xfff; // masked to 4095 chars
-		char *dl_loc = ctx + (arg & 0xffff);
+#define __STR(x) #x
 
-		size = copy_strings(args, dl_loc, dl_len);
-	} break;
-	case syscall64_type:
-	case size_type:
-	case s64_ty:
-	case u64_ty:
-		probe_read(args, sizeof(__u64), &arg);
-		size = sizeof(__u64);
-		break;
-	/* Consolidate all the types to save instructions */
-	case int_type:
-	case s32_ty:
-	case u32_ty:
-		probe_read(args, sizeof(__u32), &arg);
-		size = sizeof(__u32);
-		break;
-	case s16_ty:
-	case u16_ty:
-		/* read 2 bytes, but send 4 to keep alignment */
-		probe_read(args, sizeof(__u16), &arg);
-		size = sizeof(__u32);
-		break;
-	case s8_ty:
-	case u8_ty:
-		/* read 1 byte, but send 4 to keep alignment */
-		probe_read(args, sizeof(__u8), &arg);
-		size = sizeof(__u32);
-		break;
-	case skb_type:
-		size = copy_skb(args, arg);
-		break;
-	case sock_type:
-		size = copy_sock(args, arg);
-		// Look up socket in our sock->pid_tgid map
-		update_pid_tid_from_sock(e, arg);
-		break;
-	case cred_type:
-		size = copy_cred(args, arg);
-		break;
-	case char_buf:
-		size = copy_char_buf(ctx, orig_off, arg, argm, e, data_heap);
-		break;
-	case char_iovec:
-		size = copy_char_iovec(ctx, orig_off, arg, argm, e);
-		break;
-	case const_buf_type: {
-		// bound size to 1023 to help the verifier out
-		size = argm & 0x03ff;
-		probe_read(args, size, (char *)arg);
-		break;
-	}
-	case bpf_attr_type: {
-		size = copy_bpf_attr(args, arg);
-		break;
-	}
-	case perf_event_type: {
-		size = copy_perf_event(args, arg);
-		break;
-	}
-	case bpf_map_type: {
-		size = copy_bpf_map(args, arg);
-		break;
-	}
-	case user_namespace_type: {
-		size = copy_user_ns(args, arg);
-		break;
-	}
-	case capability_type: {
-		size = copy_capability(args, arg);
-		break;
-	}
-	case load_module_type: {
-		size = copy_load_module(args, arg);
-		break;
-	}
-	case kernel_module_type: {
-		size = copy_kernel_module(args, arg);
-		break;
-	}
-	case kernel_cap_ty:
-	case cap_inh_ty:
-	case cap_prm_ty:
-	case cap_eff_ty:
-		probe_read(args, sizeof(__u64), (char *)arg);
-		size = sizeof(__u64);
-		break;
-	default:
-		size = 0;
-		break;
-	}
-	return size;
+#define set_if_not_errno_or_zero(x, y)                  \
+	({                                              \
+		asm volatile("if %0 s< -4095 goto +1\n" \
+			     "if %0 s<= 0 goto +1\n"    \
+			     "%0 = " __STR(y) "\n"      \
+			     : "+r"(x));                \
+	})
 
-do_copy_path:
-	return copy_path(args, path_arg);
+FUNC_INLINE int try_override(void *ctx, struct bpf_map_def *override_tasks)
+{
+	__u64 id = get_current_pid_tgid();
+	__s32 *error, ret;
+
+	error = map_lookup_elem(override_tasks, &id);
+	if (!error)
+		return 0;
+
+	map_delete_elem(override_tasks, &id);
+	ret = *error;
+	/* Let's make verifier happy and 'force' proper bounds. */
+	set_if_not_errno_or_zero(ret, -1);
+	return ret;
 }
 
 #endif /* __BASIC_H__ */

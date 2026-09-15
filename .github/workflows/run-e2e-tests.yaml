@@ -15,21 +15,20 @@ concurrency:
 
 env:
   clusterName: tetragon-ci
-  ciliumCliVersion: v0.15.0
 
 jobs:
   prepare:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       packages: ${{ steps.set-packages.outputs.packages }}
       agentImage: ${{ steps.vars.outputs.agentImage }}
       operatorImage: ${{ steps.vars.outputs.operatorImage }}
     steps:
     - name: Checkout Code
-      uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
     - name: Install Go
-      uses: actions/setup-go@cdcb36043654635271a94b9a6d1392de5bb323a7 # v5.0.1
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version-file: go.mod
 
@@ -55,7 +54,7 @@ jobs:
         echo "operatorImage=quay.io/cilium/tetragon-operator-ci:${SHA}" >> $GITHUB_OUTPUT
 
     - name: Wait Tetragon Images
-      uses: nick-fields/retry@7152eba30c6575329ac0576536151aca5a72780e # v3.0.0
+      uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
       with:
         timeout_minutes: 2
         max_attempts: 30
@@ -75,31 +74,41 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-22.04, actuated-arm64-4cpu-16gb ]
+        os: [ ubuntu-22.04, ubuntu-22.04-arm64 ]
         package: ${{fromJson(needs.prepare.outputs.packages)}}
     steps:
     - name: Checkout Code
-      uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         path: go/src/github.com/cilium/tetragon/
 
     - name: Install Go
-      uses: actions/setup-go@cdcb36043654635271a94b9a6d1392de5bb323a7 # v5.0.1
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         # renovate: datasource=golang-version depName=go
-        go-version: '1.22.5'
+        go-version: '1.27.1'
 
-    - name: Install kubectl, kind and cilium CLI
-      uses: alexellis/arkade-get@master
+    - name: Install kubectl
+      uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
       with:
-        kubectl: latest
-        helm: v3.12.1
-        kind: v0.20.0
-        cilium: ${{ env.ciliumCliVersion }}
-        print-summary: false
+        # renovate: datasource=github-releases depName=kubernetes/kubernetes
+        version: v1.37.0
+
+    - name: Install Helm
+      uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
+      with:
+        # renovate: datasource=github-releases depName=helm/helm
+        version: v4.2.4
+
+    - name: Install Kind
+      uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+      with:
+        install_only: true
+        # renovate: datasource=github-releases depName=kubernetes-sigs/kind
+        version: v0.33.0
 
     - name: Pull Tetragon Images
-      uses: nick-fields/retry@7152eba30c6575329ac0576536151aca5a72780e # v3.0.0
+      uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
       with:
         timeout_minutes: 2
         max_attempts: 30
@@ -113,12 +122,11 @@ jobs:
     - name: Run e2e Tests
       run: |
         cd go/src/github.com/cilium/tetragon
-
         make e2e-test E2E_TESTS=${{matrix.package.f}} E2E_BUILD_IMAGES=0 E2E_AGENT=${{ needs.prepare.outputs.agentImage }} E2E_OPERATOR=${{ needs.prepare.outputs.operatorImage }} EXTRA_TESTFLAGS="-cluster-name=${{ env.clusterName }} -args -v=4"
 
     - name: Upload Tetragon Logs
       if: failure() || cancelled()
-      uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: tetragon-logs-${{ matrix.os }}-${{ matrix.package.s }}
         path: /tmp/tetragon.e2e.*

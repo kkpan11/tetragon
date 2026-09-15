@@ -1,123 +1,94 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package tracing
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
-	"github.com/cilium/ebpf"
-	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
-	"github.com/cilium/tetragon/pkg/jsonchecker"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/yaml"
+
+	"github.com/cilium/tetragon/pkg/bpf"
+	"github.com/cilium/tetragon/pkg/defaults"
 	"github.com/cilium/tetragon/pkg/kernels"
+	bc "github.com/cilium/tetragon/pkg/matchers/bytesmatcher"
+	"github.com/cilium/tetragon/pkg/selectors"
+	"github.com/cilium/tetragon/pkg/sensors"
+	"github.com/cilium/tetragon/pkg/sensors/program"
+
+	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
+	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
+
+	"github.com/cilium/tetragon/pkg/elf"
+	"github.com/cilium/tetragon/pkg/jsonchecker"
 	"github.com/cilium/tetragon/pkg/logger"
 	lc "github.com/cilium/tetragon/pkg/matchers/listmatcher"
 	sm "github.com/cilium/tetragon/pkg/matchers/stringmatcher"
+	"github.com/cilium/tetragon/pkg/observer"
 	"github.com/cilium/tetragon/pkg/observer/observertesthelper"
-	"github.com/cilium/tetragon/pkg/sensors"
+	"github.com/cilium/tetragon/pkg/option"
 	"github.com/cilium/tetragon/pkg/testutils"
+	"github.com/cilium/tetragon/pkg/testutils/policytest"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
-	"github.com/sirupsen/logrus"
-	"github.com/stretchr/testify/assert"
+	"github.com/cilium/tetragon/pkg/tracingpolicy"
+	_ "github.com/cilium/tetragon/tests/policytests"
 )
 
-func TestLoadUprobeSensor(t *testing.T) {
-	var sensorProgs = []tus.SensorProg{
-		// uprobe
-		0: tus.SensorProg{Name: "generic_uprobe_event", Type: ebpf.Kprobe},
-		1: tus.SensorProg{Name: "generic_uprobe_setup_event", Type: ebpf.Kprobe},
-		2: tus.SensorProg{Name: "generic_uprobe_process_event", Type: ebpf.Kprobe},
-		3: tus.SensorProg{Name: "generic_uprobe_filter_arg", Type: ebpf.Kprobe},
-		4: tus.SensorProg{Name: "generic_uprobe_process_filter", Type: ebpf.Kprobe},
-		5: tus.SensorProg{Name: "generic_uprobe_actions", Type: ebpf.Kprobe},
-		6: tus.SensorProg{Name: "generic_uprobe_output", Type: ebpf.Kprobe},
-	}
-
-	var sensorMaps = []tus.SensorMap{
-		// all uprobe programs
-		tus.SensorMap{Name: "process_call_heap", Progs: []uint{0, 1, 2, 3, 4, 5, 6}},
-
-		// all but generic_uprobe_output
-		tus.SensorMap{Name: "uprobe_calls", Progs: []uint{0, 1, 2, 3, 4, 5}},
-
-		// generic_uprobe_process_filter,generic_uprobe_filter_arg*,generic_uprobe_actions
-		tus.SensorMap{Name: "filter_map", Progs: []uint{3, 4, 5}},
-
-		// generic_uprobe_output
-		tus.SensorMap{Name: "tcpmon_map", Progs: []uint{6}},
-	}
-
-	if kernels.EnableLargeProgs() {
-		// shared with base sensor
-		sensorMaps = append(sensorMaps, tus.SensorMap{Name: "execve_map", Progs: []uint{4, 5, 6}})
-	} else {
-		// shared with base sensor
-		sensorMaps = append(sensorMaps, tus.SensorMap{Name: "execve_map", Progs: []uint{4}})
-	}
-
-	nopHook := `
-apiVersion: cilium.io/v1alpha1
-kind: TracingPolicy
-metadata:
-  name: "uprobe"
-spec:
-  uprobes:
-  - path: "/bin/bash"
-    symbols:
-    - "main"
-`
-
-	var sens []*sensors.Sensor
-	var err error
-
-	nopConfigHook := []byte(nopHook)
-	err = os.WriteFile(testConfigFile, nopConfigHook, 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
-	}
-	sens, err = observertesthelper.GetDefaultSensorsWithFile(t, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
-	if err != nil {
-		t.Fatalf("GetDefaultObserverWithFile error: %s", err)
-	}
-
-	tus.CheckSensorLoad(sens, sensorMaps, sensorProgs, t)
-
-	sensi := make([]sensors.SensorIface, 0, len(sens))
-	for _, s := range sens {
-		sensi = append(sensi, s)
-	}
-	sensors.UnloadSensors(sensi)
+func TestUprobeGeneric(t *testing.T) {
+	policytest.AllPolicyTests.DoObserverTest(t, "uprobe-generic", nil)
 }
 
-func TestUprobeGeneric(t *testing.T) {
-	testNop := testutils.RepoRootPath("contrib/tester-progs/nop")
-	nopHook := `
+func TestUprobePclntab(t *testing.T) {
+	policytest.AllPolicyTests.DoObserverTest(t, "uprobe-pclntab", nil)
+}
+
+func TestUprobeMultipleTargets(t *testing.T) {
+	policytest.AllPolicyTests.DoObserverTest(t, "uprobe-multiple-targets", nil)
+}
+
+func TestUretprobeGeneric(t *testing.T) {
+	testUretprobe := testutils.RepoRootPath("contrib/tester-progs/uretprobe")
+	uretprobeHook := `
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
-  name: "uprobe"
+  name: uretprobe
 spec:
   uprobes:
-  - path: "` + testNop + `"
+  - path: "` + testUretprobe + `"
     symbols:
-    - "main"
+    - "return_string"
+    return: true
+    returnArg:
+      index: 0
+      type: "string"
 `
 
-	nopConfigHook := []byte(nopHook)
-	err := os.WriteFile(testConfigFile, nopConfigHook, 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
-	}
+	createCrdFile(t, uretprobeHook)
 
-	upChecker := ec.NewProcessUprobeChecker("UPROBE_GENERIC").
+	upChecker := ec.NewProcessUprobeChecker("URETPROBE_GENERIC").
 		WithProcess(ec.NewProcessChecker().
-			WithBinary(sm.Full(testNop))).
-		WithSymbol(sm.Full("main"))
+			WithBinary(sm.Full(testUretprobe))).
+		WithSymbol(sm.Full("return_string")).
+		WithArgs(ec.NewKprobeArgumentListMatcher().
+			WithOperator(lc.Ordered).
+			WithValues(
+				ec.NewKprobeArgumentChecker().WithStringArg(sm.Full("ret input")),
+			))
 	checker := ec.NewUnorderedEventChecker(upChecker)
 
 	var doneWG, readyWG sync.WaitGroup
@@ -133,17 +104,148 @@ spec:
 	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
 	readyWG.Wait()
 
-	if err := exec.Command(testNop).Run(); err != nil {
-		t.Fatalf("Failed to execute test binary: %s\n", err)
-	}
+	err = exec.Command(testUretprobe).Run()
+	require.NoError(t, err)
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
+}
+
+// The purpose of the GetUrl and DnsLookup tests is to check that Tetragon does
+// not crash, and instead returns an error, if a GetUrl or DnsLookup action is
+// specified in a uprobe policy.
+func TestUprobeCheckGetUrlAction(t *testing.T) {
+	uprobeGetUrlHook := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: check-geturl-action
+spec:
+  uprobes:
+  - path: "/bin/ls"
+    symbols: ["__libc_start_main"]
+    selectors:
+    - matchActions:
+      - action: GetUrl
+        argUrl: "http://127.0.0.1/x"
+`
+
+	noConfig := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "noconfig"
+spec: {}
+`
+
+	createCrdFile(t, noConfig)
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	_, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
+	require.NoError(t, err)
+
+	tp, err := tracingpolicy.FromYAML(uprobeGetUrlHook)
+	require.NoError(t, err)
+	err = observer.GetSensorManager().AddTracingPolicy(ctx, tp)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "GetUrl and DnsLookup actions not supported")
+}
+
+func TestUprobeCheckDnsLookupAction(t *testing.T) {
+	uprobeDnsLookupHook := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: check-dnslookup-action
+spec:
+  uprobes:
+  - path: "/bin/ls"
+    symbols: ["__libc_start_main"]
+    selectors:
+    - matchActions:
+      - action: DnsLookup
+        argFqdn: "ebpf.io"
+`
+
+	noConfig := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "noconfig"
+spec: {}
+`
+
+	createCrdFile(t, noConfig)
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	_, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
+	require.NoError(t, err)
+
+	tp, err := tracingpolicy.FromYAML(uprobeDnsLookupHook)
+	require.NoError(t, err)
+	err = observer.GetSensorManager().AddTracingPolicy(ctx, tp)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "GetUrl and DnsLookup actions not supported")
+}
+
+func TestUretprobeRetCopy(t *testing.T) {
+	testUretprobe := testutils.RepoRootPath("contrib/tester-progs/uretprobe")
+	uretprobeHook := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: uretprobe
+spec:
+  uprobes:
+  - path: "` + testUretprobe + `"
+    symbols:
+    - "fill_string"
+    args:
+    - index: 0
+      type: "char_buf"
+      returnCopy: true
+`
+
+	createCrdFile(t, uretprobeHook)
+
+	upChecker := ec.NewProcessUprobeChecker("URETPROBE_RETCOPY").
+		WithProcess(ec.NewProcessChecker().
+			WithBinary(sm.Full(testUretprobe))).
+		WithSymbol(sm.Full("fill_string")).
+		WithArgs(ec.NewKprobeArgumentListMatcher().
+			WithOperator(lc.Ordered).
+			WithValues(
+				ec.NewKprobeArgumentChecker().WithBytesArg(bc.Full([]byte("filled\000"))),
+			))
+	checker := ec.NewUnorderedEventChecker(upChecker)
+
+	var doneWG, readyWG sync.WaitGroup
+	defer doneWG.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
+	if err != nil {
+		t.Fatalf("GetDefaultObserverWithFile error: %s", err)
+	}
+	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
+	readyWG.Wait()
+
+	err = exec.Command(testUretprobe).Run()
+	require.NoError(t, err)
+
+	err = jsonchecker.JsonTestCheck(t, checker)
+	require.NoError(t, err)
 }
 
 func uprobePidMatch(t *testing.T, pid uint32) error {
 	path, err := os.Executable()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	pidStr := strconv.Itoa(int(pid))
 
@@ -165,11 +267,7 @@ spec:
         - ` + pidStr + `
 `
 
-	pathConfigHook := []byte(pathHook)
-	err = os.WriteFile(testConfigFile, pathConfigHook, 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
-	}
+	createCrdFile(t, pathHook)
 
 	upChecker := ec.NewProcessUprobeChecker("UPROBE_PID_MATCH").
 		WithProcess(ec.NewProcessChecker().
@@ -197,12 +295,12 @@ spec:
 
 func TestUprobePidMatch(t *testing.T) {
 	err := uprobePidMatch(t, observertesthelper.GetMyPid())
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestUprobePidMatchNot(t *testing.T) {
 	err := uprobePidMatch(t, observertesthelper.GetMyPid()+1)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func uprobeBinariesMatch(t *testing.T, execBinary string) error {
@@ -226,11 +324,7 @@ spec:
         - "` + uprobeTest1 + `"
 `
 
-	pathConfigHook := []byte(pathHook)
-	err := os.WriteFile(testConfigFile, pathConfigHook, 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
-	}
+	createCrdFile(t, pathHook)
 
 	upChecker := ec.NewProcessUprobeChecker("UPROBE_BINARIES_MATCH").
 		WithProcess(ec.NewProcessChecker().
@@ -261,17 +355,17 @@ spec:
 func TestUprobeBinariesMatch(t *testing.T) {
 	uprobeTest1 := testutils.RepoRootPath("contrib/tester-progs/uprobe-test-1")
 	err := uprobeBinariesMatch(t, uprobeTest1)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestUprobeBinariesMatchNot(t *testing.T) {
 	uprobeTest2 := testutils.RepoRootPath("contrib/tester-progs/uprobe-test-2")
 	err := uprobeBinariesMatch(t, uprobeTest2)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestUprobeCloneThreads(t *testing.T) {
-	testutils.CaptureLog(t, logger.GetLogger().(*logrus.Logger))
+	testutils.CaptureLog(t, logger.GetLogger())
 	var doneWG, readyWG sync.WaitGroup
 	defer doneWG.Wait()
 
@@ -299,11 +393,7 @@ spec:
         - "` + testBin + `"
 `
 
-	uprobeConfigHook := []byte(uprobeHook)
-	err := os.WriteFile(testConfigFile, uprobeConfigHook, 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
-	}
+	createCrdFile(t, uprobeHook)
 
 	testCmd := exec.CommandContext(ctx, testBin, "--sensor", "uprobe")
 	testPipes, err := testutils.NewCmdBufferedPipes(testCmd)
@@ -368,117 +458,155 @@ spec:
 	checker := ec.NewUnorderedEventChecker(execCheck, child1UpChecker, thread1UpChecker, exitCheck)
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
-func TestUprobeArgs(t *testing.T) {
-	execBinary := testutils.RepoRootPath("contrib/tester-progs/uprobe-test-1")
-	libUprobe := testutils.RepoRootPath("contrib/tester-progs/libuprobe.so")
-
-	pathHook := `
-apiVersion: cilium.io/v1alpha1
-kind: TracingPolicy
-metadata:
-  name: "uprobe"
-spec:
-  uprobes:
-  - path: "` + libUprobe + `"
-    symbols:
-    - "uprobe_test_lib_arg1"
-    args:
-    - index: 0
-      type: "int"
-    selectors:
-    - matchBinaries:
-      - operator: "In"
-        values:
-        - "` + execBinary + `"
-  - path: "` + libUprobe + `"
-    symbols:
-    - "uprobe_test_lib_arg2"
-    args:
-    - index: 0
-      type: "int8"
-    - index: 1
-      type: "int"
-    selectors:
-    - matchBinaries:
-      - operator: "In"
-        values:
-        - "` + execBinary + `"
-  - path: "` + libUprobe + `"
-    symbols:
-    - "uprobe_test_lib_arg3"
-    args:
-    - index: 0
-      type: "uint64"
-    - index: 1
-      type: "uint32"
-    - index: 2
-      type: "uint64"
-    selectors:
-    - matchBinaries:
-      - operator: "In"
-        values:
-        - "` + execBinary + `"
-  - path: "` + libUprobe + `"
-    symbols:
-    - "uprobe_test_lib_arg4"
-    args:
-    - index: 0
-      type: "int64"
-    - index: 1
-      type: "int"
-    - index: 2
-      type: "int8"
-    - index: 3
-      type: "uint64"
-    selectors:
-    - matchBinaries:
-      - operator: "In"
-        values:
-        - "` + execBinary + `"
-  - path: "` + libUprobe + `"
-    symbols:
-    - "uprobe_test_lib_arg5"
-    args:
-    - index: 0
-      type: "int"
-    - index: 1
-      type: "int8"
-    - index: 2
-      type: "uint64"
-    - index: 3
-      type: "int16"
-    - index: 4
-      type: "uint64"
-    selectors:
-    - matchBinaries:
-      - operator: "In"
-        values:
-        - "` + execBinary + `"
-`
-
-	pathConfigHook := []byte(pathHook)
-	err := os.WriteFile(testConfigFile, pathConfigHook, 0644)
-	if err != nil {
-		t.Fatalf("writeFile(%s): err %s", testConfigFile, err)
+var (
+	uprobeArgsBinary  = testutils.RepoRootPath("contrib/tester-progs/uprobe-test-1")
+	uprobeArgsLib     = testutils.RepoRootPath("contrib/tester-progs/libuprobe.so")
+	uprobeArgsSymbols = []string{
+		"uprobe_test_lib_arg1",
+		"uprobe_test_lib_arg2",
+		"uprobe_test_lib_arg3",
+		"uprobe_test_lib_arg4",
+		"uprobe_test_lib_arg5",
 	}
+)
 
-	check1 := ec.NewProcessUprobeChecker("UPROBE_ARG1").
+func getUprobeArgsPolicy() tracingpolicy.GenericTracingPolicy {
+	sel := []v1alpha1.KProbeSelector{
+		{
+			MatchBinaries: []v1alpha1.BinarySelector{
+				{
+					Operator: "In",
+					Values:   []string{uprobeArgsBinary},
+				},
+			},
+		},
+	}
+	return tracingpolicy.GenericTracingPolicy{
+		Metadata: v1.ObjectMeta{
+			Name: "uprobe",
+		},
+		Kind:       "TracingPolicy",
+		APIVersion: "cilium.io/v1alpha1",
+		Spec: v1alpha1.TracingPolicySpec{
+			UProbes: []v1alpha1.UProbeSpec{
+				{
+					// uprobe_test_lib_arg1
+					Path: uprobeArgsLib,
+					Args: []v1alpha1.KProbeArg{
+						{
+							Index: 0,
+							Type:  "int",
+						},
+					},
+					Selectors: sel,
+				},
+				{
+					// uprobe_test_lib_arg2
+					Path: uprobeArgsLib,
+					Args: []v1alpha1.KProbeArg{
+						{
+							Index: 0,
+							Type:  "int8",
+						},
+						{
+							Index: 1,
+							Type:  "int",
+						},
+					},
+					Selectors: sel,
+				},
+				{
+					// uprobe_test_lib_arg3
+					Path: uprobeArgsLib,
+					Args: []v1alpha1.KProbeArg{
+						{
+							Index: 0,
+							Type:  "uint64",
+						},
+						{
+							Index: 1,
+							Type:  "uint32",
+						},
+						{
+							Index: 2,
+							Type:  "uint64",
+						},
+					},
+					Selectors: sel,
+				},
+				{
+					// uprobe_test_lib_arg4
+					Path: uprobeArgsLib,
+					Args: []v1alpha1.KProbeArg{
+						{
+							Index: 0,
+							Type:  "int64",
+						},
+						{
+							Index: 1,
+							Type:  "int",
+						},
+						{
+							Index: 2,
+							Type:  "int8",
+						},
+						{
+							Index: 3,
+							Type:  "uint64",
+						},
+					},
+					Selectors: sel,
+				},
+				{
+					// uprobe_test_lib_arg5
+					Path: uprobeArgsLib,
+					Args: []v1alpha1.KProbeArg{
+						{
+							Index: 0,
+							Type:  "int",
+						},
+						{
+							Index: 1,
+							Type:  "int8",
+						},
+						{
+							Index: 2,
+							Type:  "uint64",
+						},
+						{
+							Index: 3,
+							Type:  "int16",
+						},
+						{
+							Index: 4,
+							Type:  "uint64",
+						},
+					},
+					Selectors: sel,
+				},
+			},
+		},
+	}
+}
+
+func getUprobeArgsCheckers() [5]*ec.ProcessUprobeChecker {
+	checkers := [5]*ec.ProcessUprobeChecker{}
+
+	checkers[0] = ec.NewProcessUprobeChecker("UPROBE_ARG1").
 		WithProcess(ec.NewProcessChecker().
-			WithBinary(sm.Full(execBinary))).
-		WithSymbol(sm.Full("uprobe_test_lib_arg1")).
+			WithBinary(sm.Full(uprobeArgsBinary))).
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
 				ec.NewKprobeArgumentChecker().WithIntArg(123),
 			))
 
-	check2 := ec.NewProcessUprobeChecker("UPROBE_ARG2").
+	checkers[1] = ec.NewProcessUprobeChecker("UPROBE_ARG2").
 		WithProcess(ec.NewProcessChecker().
-			WithBinary(sm.Full(execBinary))).
-		WithSymbol(sm.Full("uprobe_test_lib_arg2")).
+			WithBinary(sm.Full(uprobeArgsBinary))).
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
@@ -486,10 +614,9 @@ spec:
 				ec.NewKprobeArgumentChecker().WithIntArg(4321),
 			))
 
-	check3 := ec.NewProcessUprobeChecker("UPROBE_ARG3").
+	checkers[2] = ec.NewProcessUprobeChecker("UPROBE_ARG3").
 		WithProcess(ec.NewProcessChecker().
-			WithBinary(sm.Full(execBinary))).
-		WithSymbol(sm.Full("uprobe_test_lib_arg3")).
+			WithBinary(sm.Full(uprobeArgsBinary))).
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
@@ -498,10 +625,9 @@ spec:
 				ec.NewKprobeArgumentChecker().WithSizeArg(0),
 			))
 
-	check4 := ec.NewProcessUprobeChecker("UPROBE_ARG4").
+	checkers[3] = ec.NewProcessUprobeChecker("UPROBE_ARG4").
 		WithProcess(ec.NewProcessChecker().
-			WithBinary(sm.Full(execBinary))).
-		WithSymbol(sm.Full("uprobe_test_lib_arg4")).
+			WithBinary(sm.Full(uprobeArgsBinary))).
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
@@ -511,10 +637,9 @@ spec:
 				ec.NewKprobeArgumentChecker().WithSizeArg(1),
 			))
 
-	check5 := ec.NewProcessUprobeChecker("UPROBE_ARG5").
+	checkers[4] = ec.NewProcessUprobeChecker("UPROBE_ARG5").
 		WithProcess(ec.NewProcessChecker().
-			WithBinary(sm.Full(execBinary))).
-		WithSymbol(sm.Full("uprobe_test_lib_arg5")).
+			WithBinary(sm.Full(uprobeArgsBinary))).
 		WithArgs(ec.NewKprobeArgumentListMatcher().
 			WithOperator(lc.Ordered).
 			WithValues(
@@ -525,7 +650,18 @@ spec:
 				ec.NewKprobeArgumentChecker().WithSizeArg(2),
 			))
 
-	checker := ec.NewUnorderedEventChecker(check1, check2, check3, check4, check5)
+	return checkers
+}
+
+func testUprobeArgs(t *testing.T, checkers [5]*ec.ProcessUprobeChecker, tp tracingpolicy.GenericTracingPolicy) {
+	checker := ec.NewUnorderedEventChecker(checkers[0], checkers[1], checkers[2], checkers[3], checkers[4])
+
+	pathConfigHook, err := yaml.Marshal(tp)
+	if err != nil {
+		t.Fatalf("marshal failed with %v", err)
+	}
+
+	createCrdFile(t, string(pathConfigHook[:]))
 
 	var doneWG, readyWG sync.WaitGroup
 	defer doneWG.Wait()
@@ -541,10 +677,772 @@ spec:
 	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
 	readyWG.Wait()
 
-	if err := exec.Command(execBinary).Run(); err != nil {
+	if err := exec.Command(uprobeArgsBinary).Run(); err != nil {
 		t.Fatalf("Failed to execute test binary: %s\n", err)
 	}
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
+}
+
+func TestUprobeArgsWithOffset(t *testing.T) {
+	f, err := elf.OpenSafeELFFile(uprobeArgsLib)
+	if err != nil {
+		t.Fatalf("telf.OpenSafeELFFile failed with %v", err)
+	}
+	defer f.Close()
+
+	offsets := [5]uint64{}
+	for idx, s := range uprobeArgsSymbols {
+		offset, err := f.Offset(s)
+		if err != nil {
+			t.Fatalf("f.Offset failed with %v", err)
+		}
+		offsets[idx] = offset
+	}
+
+	checkers := getUprobeArgsCheckers()
+	tp := getUprobeArgsPolicy()
+
+	for idx := range tp.Spec.UProbes {
+		tp.Spec.UProbes[idx].Offsets = []uint64{offsets[idx]}
+		checkers[idx] = checkers[idx].WithOffset(offsets[idx])
+	}
+
+	testUprobeArgs(t, checkers, tp)
+}
+
+func TestUprobeArgsWithSymbol(t *testing.T) {
+	checkers := getUprobeArgsCheckers()
+	tp := getUprobeArgsPolicy()
+
+	for idx := range tp.Spec.UProbes {
+		tp.Spec.UProbes[idx].Symbols = []string{uprobeArgsSymbols[idx]}
+		checkers[idx] = checkers[idx].WithSymbol(sm.Full(uprobeArgsSymbols[idx]))
+	}
+
+	testUprobeArgs(t, checkers, tp)
+}
+
+func TestUprobeArgsWithAddress(t *testing.T) {
+	f, err := elf.OpenSafeELFFile(uprobeArgsLib)
+	if err != nil {
+		t.Fatalf("telf.OpenSafeELFFile failed with %v", err)
+	}
+	defer f.Close()
+
+	addresses := [5]uint64{}
+	for idx, s := range uprobeArgsSymbols {
+		address, err := f.Address(s)
+		if err != nil {
+			t.Fatalf("f.Offset failed with %v", err)
+		}
+		addresses[idx] = address
+	}
+
+	checkers := getUprobeArgsCheckers()
+	tp := getUprobeArgsPolicy()
+
+	for idx := range tp.Spec.UProbes {
+		tp.Spec.UProbes[idx].Offsets = []uint64{addresses[idx]}
+		checkers[idx] = checkers[idx].WithOffset(addresses[idx])
+	}
+
+	testUprobeArgs(t, checkers, tp)
+}
+
+func uprobePreloadArgs(t *testing.T, arg_idx int, arg_value string) {
+	if !bpf.HasKfunc("bpf_copy_from_user_str") {
+		t.Skip("this test requires bpf_copy_from_user_str kfunc support")
+	}
+
+	symbol := "uprobe_test_lib_string_arg" + strconv.Itoa(arg_idx)
+
+	uprobeTest1 := testutils.RepoRootPath("contrib/tester-progs/uprobe-test-1")
+	libUprobe := testutils.RepoRootPath("contrib/tester-progs/libuprobe.so")
+
+	var pathHook strings.Builder
+	pathHook.WriteString(`
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "uprobe"
+spec:
+  uprobes:
+  - path: "` + libUprobe + `"
+    symbols:
+    - "` + symbol + `"
+    args:`)
+
+	for i := range 5 {
+		arg_type := "int"
+		if i == arg_idx {
+			arg_type = "string"
+		}
+		pathHook.WriteString(`
+    - index: ` + strconv.Itoa(i) + `
+      type: "` + arg_type + `"`)
+	}
+
+	createCrdFile(t, pathHook.String())
+
+	values := []*ec.KprobeArgumentChecker{ec.NewKprobeArgumentChecker().WithIntArg(1),
+		ec.NewKprobeArgumentChecker().WithIntArg(2),
+		ec.NewKprobeArgumentChecker().WithIntArg(3),
+		ec.NewKprobeArgumentChecker().WithIntArg(4),
+		ec.NewKprobeArgumentChecker().WithIntArg(5),
+	}
+
+	values[arg_idx] = ec.NewKprobeArgumentChecker().WithStringArg(sm.Full(arg_value))
+
+	upChecker := ec.NewProcessUprobeChecker("UPROBE_PRELOAD_ARGS").
+		WithProcess(ec.NewProcessChecker().
+			WithBinary(sm.Full(uprobeTest1))).
+		WithSymbol(sm.Full(symbol)).WithArgs(ec.NewKprobeArgumentListMatcher().
+		WithOperator(lc.Ordered).
+		WithValues(values...))
+
+	checker := ec.NewUnorderedEventChecker(upChecker)
+
+	var doneWG, readyWG sync.WaitGroup
+	defer doneWG.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
+	if err != nil {
+		t.Fatalf("GetDefaultObserverWithFile error: %s", err)
+	}
+	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
+	readyWG.Wait()
+
+	if err := exec.Command(uprobeTest1).Run(); err != nil {
+		t.Fatalf("Failed to execute test binary: %s\n", err)
+	}
+
+	err = jsonchecker.JsonTestCheck(t, checker)
+	require.NoError(t, err)
+}
+
+func TestUprobePreloadArg0(t *testing.T) {
+	uprobePreloadArgs(t, 0, "one")
+}
+func TestUprobePreloadArg1(t *testing.T) {
+	uprobePreloadArgs(t, 1, "two")
+}
+func TestUprobePreloadArg2(t *testing.T) {
+	uprobePreloadArgs(t, 2, "three")
+}
+func TestUprobePreloadArg3(t *testing.T) {
+	uprobePreloadArgs(t, 3, "four")
+}
+func TestUprobePreloadArg4(t *testing.T) {
+	uprobePreloadArgs(t, 4, "five")
+}
+
+func uprobeArgsMatch(t *testing.T, symbol string, arg_type string, op string, values []string, expectCheckerFailure bool) error {
+	uprobeTest1 := testutils.RepoRootPath("contrib/tester-progs/uprobe-test-1")
+	libUprobe := testutils.RepoRootPath("contrib/tester-progs/libuprobe.so")
+
+	pathHook := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "uprobe"
+spec:
+  uprobes:
+  - path: "` + libUprobe + `"
+    symbols:
+    - "` + symbol + `"
+    args:
+    - index: 0
+      type: "` + arg_type + `"
+    selectors:
+    - matchArgs:
+      - args: [0]
+        operator: "` + op + `"
+        values:`
+
+	var b strings.Builder
+	for _, str := range values {
+		b.WriteString("\n        - \"")
+		b.WriteString(str)
+		b.WriteString("\"")
+	}
+	pathHook += b.String()
+
+	if kernels.MinKernelVersion("5.4") {
+		pathHook += `
+    data:
+    - index: 0
+      type: "string"
+      source: "current_task"
+      resolve: "mm.owner.comm"
+`
+	}
+
+	createCrdFile(t, pathHook)
+
+	upChecker := ec.NewProcessUprobeChecker("UPROBE_BINARIES_MATCH").
+		WithProcess(ec.NewProcessChecker().
+			WithBinary(sm.Full(uprobeTest1))).
+		WithSymbol(sm.Full(symbol))
+
+	if kernels.MinKernelVersion("5.4") {
+		upChecker = upChecker.
+			WithData(ec.NewKprobeArgumentListMatcher().
+				WithOperator(lc.Ordered).
+				WithValues(
+					ec.NewKprobeArgumentChecker().WithStringArg(sm.Full("uprobe-test-1")),
+				))
+	}
+
+	checker := ec.NewUnorderedEventChecker(upChecker)
+
+	var doneWG, readyWG sync.WaitGroup
+	defer doneWG.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
+	if err != nil {
+		t.Fatalf("GetDefaultObserverWithFile error: %s", err)
+	}
+	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
+	readyWG.Wait()
+
+	if err := exec.Command(uprobeTest1).Run(); err != nil {
+		t.Fatalf("Failed to execute test binary: %s\n", err)
+	}
+
+	return jsonchecker.JsonTestCheckExpect(t, checker, expectCheckerFailure)
+}
+
+func TestUprobeIntArgMatch(t *testing.T) {
+	err := uprobeArgsMatch(t, "uprobe_test_lib_arg1", "int", "Equal", []string{"123"}, false)
+	require.NoError(t, err)
+}
+
+func TestUprobeIntArgMatchNot(t *testing.T) {
+	err := uprobeArgsMatch(t, "uprobe_test_lib_arg1", "int", "Equal", []string{"124"}, true)
+	require.NoError(t, err)
+}
+
+func TestUprobeStringArgMatch(t *testing.T) {
+	if !bpf.HasKfunc("bpf_copy_from_user_str") {
+		t.Skip("this test requires bpf_copy_from_user_str kfunc support")
+	}
+	err := uprobeArgsMatch(t, "uprobe_test_lib_string_arg", "string", "Equal", []string{"hello world!"}, false)
+	require.NoError(t, err)
+}
+
+func TestUprobeStringArgMatchNot(t *testing.T) {
+	if !bpf.HasKfunc("bpf_copy_from_user_str") {
+		t.Skip("this test requires bpf_copy_from_user_str kfunc support")
+	}
+	err := uprobeArgsMatch(t, "uprobe_test_lib_string_arg", "string", "Equal", []string{"hi world!"}, true)
+	require.NoError(t, err)
+}
+
+func TestUprobeStringArgEmptyEqualMatch(t *testing.T) {
+	if !bpf.HasKfunc("bpf_copy_from_user_str") {
+		t.Skip("this test requires bpf_copy_from_user_str kfunc support")
+	}
+	err := uprobeArgsMatch(t, "uprobe_test_lib_string_arg_empty", "string", "Equal", []string{"", "other"}, false)
+	require.NoError(t, err)
+}
+
+func TestUprobeStringArgEmptyNotEqualMatch(t *testing.T) {
+	if !bpf.HasKfunc("bpf_copy_from_user_str") {
+		t.Skip("this test requires bpf_copy_from_user_str kfunc support")
+	}
+	err := uprobeArgsMatch(t, "uprobe_test_lib_string_arg_empty", "string", "NotEqual", []string{"val1", "val2"}, false)
+	require.NoError(t, err)
+}
+
+func TestUprobeStringArgEmptyEqualNotMatch(t *testing.T) {
+	if !bpf.HasKfunc("bpf_copy_from_user_str") {
+		t.Skip("this test requires bpf_copy_from_user_str kfunc support")
+	}
+	err := uprobeArgsMatch(t, "uprobe_test_lib_string_arg_empty", "string", "Equal", []string{"val1", "val2"}, true)
+	require.NoError(t, err)
+}
+
+func TestUprobeStringArgEmptyNotEqualNotMatch(t *testing.T) {
+	if !bpf.HasKfunc("bpf_copy_from_user_str") {
+		t.Skip("this test requires bpf_copy_from_user_str kfunc support")
+	}
+	err := uprobeArgsMatch(t, "uprobe_test_lib_string_arg_empty", "string", "NotEqual", []string{"", "other"}, true)
+	require.NoError(t, err)
+}
+
+func TestUprobeStringArgSubstringMax(t *testing.T) {
+	if !bpf.HasKfunc("bpf_copy_from_user_str") {
+		t.Skip("this test requires bpf_copy_from_user_str kfunc support")
+	}
+	if !bpf.HasKfunc("bpf_strnstr") {
+		t.Skip("skipping, no bpf_strnstr kfunc in kernel")
+	}
+
+	// Prepare 100 values with 'test' as the last one and
+	// make sure we match it properly.
+
+	values := []string{}
+	for i := range selectors.SubstringMapEntries - 1 {
+		values = append(values, fmt.Sprintf("a%d", i))
+	}
+	values = append(values, "test")
+
+	err := uprobeArgsMatch(t, "uprobe_test_lib_string_arg_substring", "string", "SubString", values, false)
+	require.NoError(t, err)
+}
+
+func TestUprobeResolveCurrent(t *testing.T) {
+	if !kernels.MinKernelVersion("5.4") {
+		t.Skip("Test requires kernel 5.4+")
+	}
+
+	testBinary := testutils.RepoRootPath("contrib/tester-progs/uprobe-test-1")
+
+	var doneWG, readyWG sync.WaitGroup
+	defer doneWG.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	hook := `apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "uprobe"
+spec:
+  uprobes:
+  - path: "` + testBinary + `"
+    symbols:
+    - "main"
+    data:
+    - index: 0
+      type: "string"
+      source: "current_task"
+      resolve: "mm.owner.comm"
+    selectors:
+    - matchData:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "uprobe-test-1"
+`
+
+	createCrdFile(t, hook)
+
+	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib)
+	if err != nil {
+		t.Fatalf("GetDefaultObserverWithFile error: %s", err)
+	}
+	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
+	readyWG.Wait()
+
+	cmd := exec.Command(testBinary)
+	require.NoError(t, cmd.Run())
+
+	upChecker := ec.NewProcessUprobeChecker("UPROBE").
+		WithProcess(ec.NewProcessChecker().
+			WithBinary(sm.Full(testBinary))).
+		WithSymbol(sm.Full("main")).
+		WithData(ec.NewKprobeArgumentListMatcher().
+			WithOperator(lc.Ordered).
+			WithValues(
+				ec.NewKprobeArgumentChecker().WithStringArg(sm.Full("uprobe-test-1")),
+			))
+	checker := ec.NewUnorderedEventChecker(upChecker)
+
+	err = jsonchecker.JsonTestCheck(t, checker)
+	require.NoError(t, err)
+}
+
+func TestUprobeSelectorMatch(t *testing.T) {
+	testutils.CaptureLog(t, logger.GetLogger())
+	uprobeTest1 := testutils.RepoRootPath("contrib/tester-progs/uprobe-test-1")
+	libUprobe := testutils.RepoRootPath("contrib/tester-progs/libuprobe.so")
+
+	uprobeHook := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "uprobe-selector"
+spec:
+  uprobes:
+  - path: "` + libUprobe + `"
+    symbols:
+    - "uprobe_test_lib_arg1"
+    args:
+    - index: 0
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "` + uprobeTest1 + `"
+      matchArgs:
+      - args: [0]
+        operator: "Equal"
+        values:
+        - "123"
+`
+
+	createCrdFile(t, uprobeHook)
+
+	upChecker := ec.NewProcessUprobeChecker("UPROBE_SELECTOR_MATCH").
+		WithProcess(ec.NewProcessChecker().
+			WithBinary(sm.Full(uprobeTest1))).
+		WithSymbol(sm.Full("uprobe_test_lib_arg1")).
+		WithArgs(ec.NewKprobeArgumentListMatcher().
+			WithValues(
+				ec.NewKprobeArgumentChecker().WithIntArg(123),
+			))
+	checker := ec.NewUnorderedEventChecker(upChecker)
+
+	var doneWG, readyWG sync.WaitGroup
+	defer doneWG.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
+	require.NoError(t, err)
+	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
+	readyWG.Wait()
+
+	if err := exec.Command(uprobeTest1).Run(); err != nil {
+		t.Fatalf("Failed to execute test binary: %s\n", err)
+	}
+
+	err = jsonchecker.JsonTestCheck(t, checker)
+	require.NoError(t, err)
+}
+
+func TestUprobeReturnSelectorMatch(t *testing.T) {
+	testutils.CaptureLog(t, logger.GetLogger())
+	uprobeTest1 := testutils.RepoRootPath("contrib/tester-progs/uprobe-test-1")
+	libUprobe := testutils.RepoRootPath("contrib/tester-progs/libuprobe.so")
+
+	uprobeHook := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "uprobe-return-selector"
+spec:
+  uprobes:
+  - path: "` + libUprobe + `"
+    symbols:
+    - "uprobe_test_lib_arg1"
+    return: true
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchReturnArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "0"
+`
+
+	createCrdFile(t, uprobeHook)
+
+	upChecker := ec.NewProcessUprobeChecker("UPROBE_RETURN_SELECTOR_MATCH").
+		WithProcess(ec.NewProcessChecker().
+			WithBinary(sm.Full(uprobeTest1))).
+		WithSymbol(sm.Full("uprobe_test_lib_arg1")).
+		WithArgs(ec.NewKprobeArgumentListMatcher().
+			WithValues(
+				ec.NewKprobeArgumentChecker().WithIntArg(0),
+			))
+	checker := ec.NewUnorderedEventChecker(upChecker)
+
+	var doneWG, readyWG sync.WaitGroup
+	defer doneWG.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
+	require.NoError(t, err)
+	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
+	readyWG.Wait()
+
+	if err := exec.Command(uprobeTest1).Run(); err != nil {
+		t.Fatalf("Failed to execute test binary: %s\n", err)
+	}
+
+	err = jsonchecker.JsonTestCheck(t, checker)
+	require.NoError(t, err)
+}
+
+func TestUprobeNULLStringAndReturnArg(t *testing.T) {
+	if !bpf.HasKfunc("bpf_copy_from_user_str") {
+		t.Skip("this test requires bpf_copy_from_user_str kfunc support")
+	}
+
+	testutils.CaptureLog(t, logger.GetLogger())
+	uprobeTest1 := testutils.RepoRootPath("contrib/tester-progs/uprobe-test-1")
+	libUprobe := testutils.RepoRootPath("contrib/tester-progs/libuprobe.so")
+
+	uprobeHook := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "null-string-arg-uprobe"
+spec:
+  uprobes:
+  - path: "` + libUprobe + `"
+    symbols:
+    - "uprobe_test_lib_string_arg_null"
+    args:
+    - index: 0
+      type: "string"
+    return: true
+    returnArg:
+      index: 0
+      type: "int"
+`
+
+	createCrdFile(t, uprobeHook)
+
+	upChecker := ec.NewProcessUprobeChecker("null-string-arg-uprobe").
+		WithProcess(ec.NewProcessChecker().
+			WithBinary(sm.Full(uprobeTest1))).WithSymbol(sm.Full("uprobe_test_lib_string_arg_null")).WithArgs(ec.NewKprobeArgumentListMatcher().
+		WithOperator(lc.Ordered).
+		WithValues(
+			ec.NewKprobeArgumentChecker().WithErrorArg(ec.NewKprobeErrorChecker().WithMessage(sm.Full("Bad address for basic type"))),
+			ec.NewKprobeArgumentChecker().WithIntArg(0)),
+	)
+	checker := ec.NewUnorderedEventChecker(upChecker)
+
+	var doneWG, readyWG sync.WaitGroup
+	defer doneWG.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
+	require.NoError(t, err)
+	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
+	readyWG.Wait()
+
+	if err := exec.Command(uprobeTest1).Run(); err != nil {
+		t.Fatalf("Failed to execute test binary: %s\n", err)
+	}
+
+	err = jsonchecker.JsonTestCheck(t, checker)
+	require.NoError(t, err)
+}
+
+func TestUprobeSleepablePreloadMapConfig(t *testing.T) {
+	testUprobeSleepableMapsConfig(t, "sleepable_preload", false)
+}
+
+func TestUprobeSleepableOffloadMapConfig(t *testing.T) {
+	testUprobeSleepableMapsConfig(t, "sleepable_offload", false)
+}
+
+func TestUprobeSleepablePreloadMapConfigWithMax(t *testing.T) {
+	testUprobeSleepableMapsConfig(t, "sleepable_preload", true)
+}
+
+func TestUprobeSleepableOffloadMapConfigWithMax(t *testing.T) {
+	testUprobeSleepableMapsConfig(t, "sleepable_offload", true)
+}
+
+func testUprobeSleepableMapsConfig(t *testing.T, mapName string, withMax bool) {
+	if !bpf.HasKfunc("bpf_copy_from_user_str") {
+		t.Skip("skipping, no string preload support")
+	}
+	if runtime.GOARCH == "arm64" {
+		t.Skip("skipping, x86_64 only test")
+	}
+	if mapName == "sleepable_offload" && !bpf.HasUprobeRegsChange() {
+		t.Skip("skipping, no regs change support in kernel")
+	}
+
+	testBinary := testutils.RepoRootPath("contrib/tester-progs/regs-override")
+
+	selectors := ""
+
+	if mapName == "sleepable_offload" {
+		selectors = `
+    selectors:
+    - matchActions:
+      - action: Override
+        argRegs:
+        - "rip=7%rip"
+`
+	}
+
+	// uprobe policy with a preload data argument; opts is the options block (may be empty)
+	policy := func(opts string) string {
+		return `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "sleepable"
+spec:` + opts + `
+  uprobes:
+  - path: "` + testBinary + `"
+    symbols:
+    - "test_3+12"
+    data:
+    - index: 0
+      type: "string"
+      source: "pt_regs"
+      resolve: "rdi"` + selectors
+	}
+
+	loadSensors := func(t *testing.T, config string) []*sensors.Sensor {
+		createCrdFile(t, config)
+		sens, err := observertesthelper.GetDefaultSensorsWithFile(t, testConfigFile,
+			tus.Conf().TetragonLib, observertesthelper.WithKeepCollection())
+		require.NoError(t, err)
+		return sens
+	}
+
+	unloadSensors := func(sens []*sensors.Sensor) {
+		sensi := make([]sensors.SensorIface, 0, len(sens))
+		for _, s := range sens {
+			sensi = append(sensi, s)
+		}
+		sensors.UnloadSensors(sensi)
+	}
+
+	findSleepableMap := func(sens []*sensors.Sensor) *program.Map {
+		for _, s := range sens {
+			for _, m := range s.Maps {
+				if m.Name == mapName {
+					return m
+				}
+			}
+		}
+		return nil
+	}
+
+	getMaxEntries := func(m *program.Map) uint32 {
+		path := filepath.Join(bpf.MapPrefixPath(), m.PinPath)
+		val, err := program.GetMaxEntriesPinnedMap(path)
+		require.NoError(t, err)
+		return val
+	}
+
+	if withMax {
+		if mapName == "sleepable_preload" {
+			originalSize := option.Config.SleepablePreloadSize
+			option.Config.SleepablePreloadSize = 2048
+			t.Cleanup(func() { option.Config.SleepablePreloadSize = originalSize })
+		} else {
+			originalSize := option.Config.SleepableOffloadSize
+			option.Config.SleepableOffloadSize = 2048
+			t.Cleanup(func() { option.Config.SleepableOffloadSize = originalSize })
+		}
+	}
+
+	// sleepable_preload/offload as MapShared at global scope (/sys/fs/bpf/tetragon/sleepable_[preload|offload])
+	t.Run("shared", func(t *testing.T) {
+		sens := loadSensors(t, policy(""))
+		defer unloadSensors(sens)
+
+		m := findSleepableMap(sens)
+		logger.GetLogger().Info("Sensor list")
+		require.NotNil(t, m, mapName+" map not found in sensor")
+
+		assert.Equal(t, mapName, m.PinPath)
+		if withMax {
+			assert.Equal(t, uint32(2048), getMaxEntries(m))
+		} else {
+			if mapName == "sleepable_preload" {
+				assert.Equal(t, uint32(defaults.DefaultSleepablePreloadSize), getMaxEntries(m))
+			} else {
+				assert.Equal(t, uint32(defaults.DefaultSleepableOffloadSize), getMaxEntries(m))
+			}
+		}
+	})
+
+	// sleepable_preload/offload as MapBuilderProgram at program scope (.../policy/sensor/prog/sleepable_[preload|offload])
+	t.Run("program", func(t *testing.T) {
+		var sens []*sensors.Sensor
+		if mapName == "sleepable_preload" {
+			sens = loadSensors(t, policy(`
+  options:
+  - name: "sleepable-preload-size"
+    value: "1024"`))
+		} else {
+			sens = loadSensors(t, policy(`
+  options:
+  - name: "sleepable-offload-size"
+    value: "1024"`))
+		}
+		defer unloadSensors(sens)
+
+		m := findSleepableMap(sens)
+		require.NotNil(t, m, mapName+"map not found in sensor")
+
+		assert.NotEqual(t, mapName, m.PinPath)
+		assert.Equal(t, mapName, filepath.Base(m.PinPath))
+		assert.Equal(t, uint32(1024), getMaxEntries(m))
+	})
+}
+
+// Some uprobes configurations (ie digest verification) disallow disable/re-enable of a policy.
+// This test ensures that we can disable and re-enable a policy when
+// policy configuration allows it.
+func TestDisableEnablePolicyUprobe(t *testing.T) {
+	const (
+		uprobeNoopPolicyName      = "uprobe-noop"
+		uprobeNoopPolicyNamespace = ""
+		uprobeNoopPolicyPath      = "/bin/bash"
+	)
+
+	uprobeNoopPolicy := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "` + uprobeNoopPolicyName + `"
+spec:
+  uprobes:
+  - path: "` + uprobeNoopPolicyPath + `"
+    symbols:
+    - "main"
+`
+	tp, err := tracingpolicy.FromYAML(uprobeNoopPolicy)
+	require.NoError(t, err)
+	createCrdFile(t, uprobeNoopPolicy)
+
+	upChecker := ec.NewProcessUprobeChecker("UPROBE").
+		WithProcess(ec.NewProcessChecker().
+			WithBinary(sm.Full(uprobeNoopPolicyPath))).
+		WithSymbol(sm.Full("main"))
+	checker := ec.NewUnorderedEventChecker(upChecker)
+
+	var doneWG, readyWG sync.WaitGroup
+	defer doneWG.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
+	defer cancel()
+
+	obs, err := observertesthelper.GetDefaultObserverWithFile(t, ctx, testConfigFile, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
+	require.NoError(t, err)
+	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
+	readyWG.Wait()
+
+	err = observer.GetSensorManager().DisableTracingPolicy(ctx, uprobeNoopPolicyName, uprobeNoopPolicyNamespace, tp.TpDomain())
+	require.NoError(t, err)
+	err = observer.GetSensorManager().EnableTracingPolicy(ctx, uprobeNoopPolicyName, uprobeNoopPolicyNamespace, tp.TpDomain())
+	require.NoError(t, err)
+
+	if err := exec.Command(uprobeNoopPolicyPath).Run(); err != nil {
+		t.Fatalf("Failed to execute test binary: %s\n", err)
+	}
+
+	err = jsonchecker.JsonTestCheck(t, checker)
+	require.NoError(t, err)
+
 }

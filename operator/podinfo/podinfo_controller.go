@@ -1,21 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !nok8s
+
 package podinfo
 
 import (
 	"context"
 	"maps"
 	"reflect"
+	"time"
 
-	ciliumiov1alpha1 "github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
-	"github.com/cilium/tetragon/pkg/process"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+
+	ciliumiov1alpha1 "github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
+	"github.com/cilium/tetragon/pkg/podhelpers"
 )
 
 // Reconciler reconciles a PodInfo object
@@ -48,11 +54,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	// Wait until the necessary pod fields are available.
-	if !hasAllRequiredFields(pod) {
-		return ctrl.Result{Requeue: true}, nil
-	}
-
 	podInfo := &ciliumiov1alpha1.PodInfo{}
 	if err := r.Get(ctx, req.NamespacedName, podInfo); err != nil {
 		if !errors.IsNotFound(err) {
@@ -66,7 +67,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			// previous call to Get returned "NotFound" because of a timing issue.
 			// Requeue without returning the error when this happens, otherwise
 			// the controller logs an error.
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
@@ -90,17 +91,15 @@ func equal(pod *corev1.Pod, podInfo *ciliumiov1alpha1.PodInfo) bool {
 	}
 
 	// check if ownerReference is changed.
-	controller := true
-	blockOwnerDeletion := true
 	expectedOwnerReference := metav1.OwnerReference{
 		APIVersion:         "v1",
 		Kind:               "Pod",
 		Name:               pod.Name,
 		UID:                pod.UID,
-		Controller:         &controller,
-		BlockOwnerDeletion: &blockOwnerDeletion,
+		Controller:         new(true),
+		BlockOwnerDeletion: new(true),
 	}
-	workloadObject, workloadType := process.GetWorkloadMetaFromPod(pod)
+	workloadObject, workloadType := podhelpers.GetWorkloadMetaFromPod(pod)
 	return pod.Name == podInfo.Name &&
 		pod.Namespace == podInfo.Namespace &&
 		pod.Status.PodIP == podInfo.Status.PodIP &&
@@ -110,7 +109,8 @@ func equal(pod *corev1.Pod, podInfo *ciliumiov1alpha1.PodInfo) bool {
 		reflect.DeepEqual(podInfo.OwnerReferences[0], expectedOwnerReference) &&
 		reflect.DeepEqual(podInfo.WorkloadObject, workloadObject) &&
 		reflect.DeepEqual(podInfo.WorkloadType, workloadType) &&
-		pod.Spec.HostNetwork == podInfo.Spec.HostNetwork
+		pod.Spec.HostNetwork == podInfo.Spec.HostNetwork &&
+		pod.Spec.NodeName == podInfo.Spec.NodeName
 }
 
 // hasAllRequiredFields checks if the necessary pod fields are available.
@@ -119,7 +119,8 @@ func hasAllRequiredFields(pod *corev1.Pod) bool {
 		pod.Name != "" &&
 		pod.Namespace != "" &&
 		pod.Status.PodIP != "" &&
-		len(pod.Status.PodIPs) > 0
+		len(pod.Status.PodIPs) > 0 &&
+		pod.Spec.NodeName != ""
 }
 
 // generatePodInfo creates a PodInfo from a Pod
@@ -129,29 +130,26 @@ func generatePodInfo(pod *corev1.Pod) *ciliumiov1alpha1.PodInfo {
 	for _, podIP := range pod.Status.PodIPs {
 		podIPs = append(podIPs, ciliumiov1alpha1.PodIP{IP: podIP.IP})
 	}
-	workloadObject, workloadType := process.GetWorkloadMetaFromPod(pod)
-	controller := true
-	blockOwnerDeletion := true
+	workloadObject, workloadType := podhelpers.GetWorkloadMetaFromPod(pod)
 	return &ciliumiov1alpha1.PodInfo{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        pod.Name,
-			Namespace:   pod.Namespace,
-			Labels:      pod.Labels,
-			Annotations: pod.Annotations,
-			// setting up owner reference to the pod will ensure that the PodInfo resource is deleted when the pod is deleted.
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion:         pod.APIVersion,
-					Kind:               pod.Kind,
-					Name:               pod.Name,
-					UID:                pod.UID,
-					Controller:         &controller,
-					BlockOwnerDeletion: &blockOwnerDeletion,
-				},
+		Name:        pod.Name,
+		Namespace:   pod.Namespace,
+		Labels:      pod.Labels,
+		Annotations: pod.Annotations,
+		// setting up owner reference to the pod will ensure that the PodInfo resource is deleted when the pod is deleted.
+		OwnerReferences: []metav1.OwnerReference{
+			{
+				APIVersion:         pod.APIVersion,
+				Kind:               pod.Kind,
+				Name:               pod.Name,
+				UID:                pod.UID,
+				Controller:         new(true),
+				BlockOwnerDeletion: new(true),
 			},
 		},
 		Spec: ciliumiov1alpha1.PodInfoSpec{
 			HostNetwork: pod.Spec.HostNetwork,
+			NodeName:    pod.Spec.NodeName,
 		},
 		Status: ciliumiov1alpha1.PodInfoStatus{
 			PodIP:  pod.Status.PodIP,
@@ -165,7 +163,12 @@ func generatePodInfo(pod *corev1.Pod) *ciliumiov1alpha1.PodInfo {
 // SetupWithManager sets up the controller with the Manager.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&corev1.Pod{}).
+		For(&corev1.Pod{}, builder.WithPredicates(
+			predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				pod := obj.(*corev1.Pod)
+				return hasAllRequiredFields(pod)
+			}),
+		)).
 		Owns(&ciliumiov1alpha1.PodInfo{}).
 		Complete(r)
 }

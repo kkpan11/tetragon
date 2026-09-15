@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package btf
 
 import (
@@ -11,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf/btf"
+
 	"github.com/cilium/tetragon/pkg/arch"
 	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
 	"github.com/cilium/tetragon/pkg/ksyms"
@@ -18,25 +21,33 @@ import (
 	"github.com/cilium/tetragon/pkg/syscallinfo"
 )
 
-// ValidationWarn is used to mark that validation was not successful but it's not
+// ValidationWarnError is used to mark that validation was not successful but it's not
 // clear that the spec is problematic. Callers may use this error to issue a
 // warning instead of aborting
-type ValidationWarn struct {
-	s string
+type ValidationWarnError struct {
+	e error
 }
 
-func (e *ValidationWarn) Error() string {
-	return e.s
+func (err *ValidationWarnError) Unwrap() error {
+	return err.e
 }
 
-// ValidationFailed is used to mark that validation was not successful and that
+func (err *ValidationWarnError) Error() string {
+	return "validation warning: " + err.e.Error()
+}
+
+// ValidationFailedError is used to mark that validation was not successful and that
 // the we should not continue with loading this spec.
-type ValidationFailed struct {
-	s string
+type ValidationFailedError struct {
+	e error
 }
 
-func (e *ValidationFailed) Error() string {
-	return e.s
+func (err *ValidationFailedError) Unwrap() error {
+	return err.e
+}
+
+func (err *ValidationFailedError) Error() string {
+	return "validation error: " + err.e.Error()
 }
 
 // ValidateKprobeSpec validates a kprobe spec based on BTF information
@@ -44,16 +55,10 @@ func (e *ValidationFailed) Error() string {
 // NB: turns out we need more than BTF information for the validation (see
 // syscalls). We still keep this code in the btf package for now, and we can
 // move it once we found a better home for it.
-func ValidateKprobeSpec(bspec *btf.Spec, call string, kspec *v1alpha1.KProbeSpec) error {
+func ValidateKprobeSpec(bspec *btf.Spec, call string, kspec *v1alpha1.KProbeSpec, ks *ksyms.Ksyms) error {
 	var fn *btf.Func
 
-	// get kernel symbols
-	ks, err := ksyms.KernelSymbols()
-	if err != nil {
-		return fmt.Errorf("validateKprobeSpec: ksyms.KernelSymbols: %w", err)
-	}
-
-	// check if this functio name is part of a kernel module
+	// check if this function name is part of a kernel module
 	if kmod, err := ks.GetKmod(call); err == nil {
 		// get the spec from the kernel module and continue the validation with that
 		kmodSpec, err := btf.LoadKernelModuleSpec(kmod)
@@ -64,7 +69,7 @@ func ValidateKprobeSpec(bspec *btf.Spec, call string, kspec *v1alpha1.KProbeSpec
 	}
 
 	origCall := call
-	err = bspec.TypeByName(call, &fn)
+	err := bspec.TypeByName(call, &fn)
 	if err != nil && kspec.Syscall {
 		// Try with system call prefix
 		call, err = arch.AddSyscallPrefix(call)
@@ -86,7 +91,7 @@ func ValidateKprobeSpec(bspec *btf.Spec, call string, kspec *v1alpha1.KProbeSpec
 			}
 			// TypeByName() above ensures btf.Func type, but Check again so semantically we are correct
 			if len(fnTypes) > 0 {
-				logger.GetLogger().Infof("BTF metadata includes '%d' matched candidates on call %q, using first one", len(fnTypes), call)
+				logger.GetLogger().Info(fmt.Sprintf("BTF metadata includes '%d' matched candidates on call %q, using first one", len(fnTypes), call))
 				// take first one.
 				reflect.ValueOf(&fn).Elem().Set(reflect.ValueOf(fnTypes[0]))
 			}
@@ -95,11 +100,11 @@ func ValidateKprobeSpec(bspec *btf.Spec, call string, kspec *v1alpha1.KProbeSpec
 
 	if err != nil {
 		if kspec.Syscall {
-			return &ValidationFailed{
-				s: fmt.Sprintf("syscall %q (or %q) %v", origCall, call, err),
+			return &ValidationFailedError{
+				e: fmt.Errorf("syscall %q (or %q) %w", origCall, call, err),
 			}
 		}
-		return &ValidationFailed{s: fmt.Sprintf("call %q %v", call, err)}
+		return &ValidationFailedError{e: fmt.Errorf("call %q: %w", call, err)}
 	}
 
 	proto, ok := fn.Type.(*btf.FuncProto)
@@ -115,43 +120,38 @@ func ValidateKprobeSpec(bspec *btf.Spec, call string, kspec *v1alpha1.KProbeSpec
 	if kspec.Syscall {
 		ret, ok := proto.Return.(*btf.Int)
 		if !ok {
-			return fmt.Errorf("kprobe spec validation failed: syscall return type is not Int")
+			return errors.New("kprobe spec validation failed: syscall return type is not Int")
 		}
-		if ret.Name != "long int" {
-			return fmt.Errorf("kprobe spec validation failed: syscall return type is not long int")
+		if canonicalKernelType(ret.Name) != "long" {
+			return fmt.Errorf("kprobe spec validation failed: syscall return type is not long, but %q", ret.Name)
 		}
 
 		if len(proto.Params) != 1 {
-			return fmt.Errorf("kprobe spec validation failed: syscall with more than one arg")
+			return errors.New("kprobe spec validation failed: syscall with more than one arg")
 		}
 
 		ptr, ok := proto.Params[0].Type.(*btf.Pointer)
 		if !ok {
-			return fmt.Errorf("kprobe spec validation failed: syscall arg is not pointer")
+			return errors.New("kprobe spec validation failed: syscall arg is not pointer")
 		}
 
 		cnst, ok := ptr.Target.(*btf.Const)
 		if !ok {
-			return fmt.Errorf("kprobe spec validation failed: syscall arg is not const pointer")
+			return errors.New("kprobe spec validation failed: syscall arg is not const pointer")
 		}
 
 		arg, ok := cnst.Type.(*btf.Struct)
 		if !ok {
-			return fmt.Errorf("kprobe spec validation failed: syscall arg is not const pointer to struct")
+			return errors.New("kprobe spec validation failed: syscall arg is not const pointer to struct")
 		}
 
 		if arg.Name != "pt_regs" {
-			return fmt.Errorf("kprobe spec validation failed: syscall arg is not const pointer to struct pt_regs")
+			return errors.New("kprobe spec validation failed: syscall arg is not const pointer to struct pt_regs")
 		}
 
 		// next try to deduce the syscall name.
-		// NB: this might change in different kernels so if we fail we treat it as a warning
-		prefix := "__x64_sys_"
-		if !strings.HasPrefix(call, prefix) {
-			return &ValidationWarn{s: fmt.Sprintf("could not get the function prototype for %s: arguments will not be verified", call)}
-		}
-		syscall := strings.TrimPrefix(call, prefix)
-		return validateSycall(kspec, syscall)
+		_, syscall := arch.CutSyscallPrefix(call)
+		return validateSycall(kspec, strings.TrimPrefix(syscall, "sys_"))
 	}
 
 	fnNArgs := uint32(len(proto.Params))
@@ -160,24 +160,51 @@ func ValidateKprobeSpec(bspec *btf.Spec, call string, kspec *v1alpha1.KProbeSpec
 		if specArg.Index >= fnNArgs {
 			return fmt.Errorf("kprobe arg %d has an invalid index: %d based on prototype: %s", i, specArg.Index, proto)
 		}
+
+		// If there is a resolve path defined by the user, we need to traverse it to match
+		// the types. This will happen later (e.g., see resolveBTFArg) so skip the check
+		// here.
+		if specArg.Resolve != "" {
+			continue
+		}
 		arg := proto.Params[int(specArg.Index)]
 		paramTyStr := getKernelType(arg.Type)
 		if !typesCompatible(specArg.Type, paramTyStr) {
-			return &ValidationWarn{s: fmt.Sprintf("type (%s) of argument %d does not match spec type (%s)\n", paramTyStr, specArg.Index, specArg.Type)}
+			return &ValidationWarnError{e: fmt.Errorf("type (%s) of argument %d does not match spec type (%s)", paramTyStr, specArg.Index, specArg.Type)}
 		}
 	}
 
 	if kspec.Return {
 		retTyStr := getKernelType(proto.Return)
 		if kspec.ReturnArg == nil {
-			return &ValidationWarn{s: "return is set to true, but there is no return arg specified"}
+			return &ValidationWarnError{e: errors.New("return is set to true, but there is no return arg specified")}
 		}
 		if !typesCompatible(kspec.ReturnArg.Type, retTyStr) {
-			return &ValidationWarn{s: fmt.Sprintf("return type (%s) does not match spec return type (%s)\n", retTyStr, kspec.ReturnArg.Type)}
+			return &ValidationWarnError{e: fmt.Errorf("return type (%s) does not match spec return type (%s)", retTyStr, kspec.ReturnArg.Type)}
 		}
 	}
 
 	return nil
+}
+
+// gcc and clang spell these six integer types differently in DWARF, and hence
+// in BTF. Kernels built with LLVM=1 use the clang spellings.
+var gccToCanonicalInt = map[string]string{
+	"long int":               "long",
+	"long unsigned int":      "unsigned long",
+	"long long int":          "long long",
+	"long long unsigned int": "unsigned long long",
+	"short int":              "short",
+	"short unsigned int":     "unsigned short",
+}
+
+// canonicalKernelType normalizes a kernel type name to its C source spelling,
+// which is what pkg/syscallinfo's tables use. Other names pass through.
+func canonicalKernelType(name string) string {
+	if canonical, ok := gccToCanonicalInt[name]; ok {
+		return canonical
+	}
+	return name
 }
 
 func getKernelType(arg btf.Type) string {
@@ -241,20 +268,30 @@ func getKernelType(arg btf.Type) string {
 }
 
 func typesCompatible(specTy string, kernelTy string) bool {
+	// kernelTy may come from BTF, whose spelling depends on the compiler.
+	kernelTy = canonicalKernelType(kernelTy)
+
 	switch specTy {
 	case "nop":
 		return true
 
 	case "uint64":
 		switch kernelTy {
-		case "u64", "void *", "long unsigned int":
+		case "u64", "void *", "unsigned long":
 			return true
 		}
 	case "int64":
 		switch kernelTy {
-		case "s64":
+		case "s64", "long":
 			return true
 		}
+
+	case "uint32":
+		switch kernelTy {
+		case "unsigned int", "u32":
+			return true
+		}
+
 	case "int32":
 		switch kernelTy {
 		case "s32", "int":
@@ -262,12 +299,12 @@ func typesCompatible(specTy string, kernelTy string) bool {
 		}
 	case "int16":
 		switch kernelTy {
-		case "s16", "short int":
+		case "s16", "short":
 			return true
 		}
 	case "uint16":
 		switch kernelTy {
-		case "u16", "short unsigned int":
+		case "u16", "unsigned short", "umode_t":
 			return true
 		}
 	case "uint8":
@@ -280,11 +317,18 @@ func typesCompatible(specTy string, kernelTy string) bool {
 		case "size_t":
 			return true
 		}
-	case "char_buf", "string", "int8":
+	case "string", "int8":
 		switch kernelTy {
 		case "const char *", "char *", "char":
 			return true
 		}
+
+	case "char_buf":
+		switch kernelTy {
+		case "const char *", "char *", "void *":
+			return true
+		}
+
 	case "char_iovec":
 		switch kernelTy {
 		case "const struct iovec *", "struct iovec *":
@@ -320,6 +364,11 @@ func typesCompatible(specTy string, kernelTy string) bool {
 		case "union bpf_attr *":
 			return true
 		}
+	case "bpf_prog":
+		switch kernelTy {
+		case "struct bpf_prog *":
+			return true
+		}
 	case "perf_event":
 		switch kernelTy {
 		case "struct perf_event *":
@@ -335,7 +384,7 @@ func typesCompatible(specTy string, kernelTy string) bool {
 		case "struct user_namespace *":
 			return true
 		}
-	case "capability":
+	case "capability", "bpf_cmd":
 		switch kernelTy {
 		case "int":
 			return true
@@ -370,6 +419,21 @@ func typesCompatible(specTy string, kernelTy string) bool {
 		case "struct sk_buff *":
 			return true
 		}
+	case "sockaddr":
+		switch kernelTy {
+		case "struct sockaddr *":
+			return true
+		}
+	case "socket":
+		switch kernelTy {
+		case "struct socket *":
+			return true
+		}
+	case "sockaddr_un":
+		switch kernelTy {
+		case "struct sockaddr_un *", "struct sockaddr *":
+			return true
+		}
 	case "net_device":
 		switch kernelTy {
 		case "struct net_device *":
@@ -377,7 +441,12 @@ func typesCompatible(specTy string, kernelTy string) bool {
 		}
 	case "kernel_cap_t", "cap_inheritable", "cap_permitted", "cap_effective":
 		switch kernelTy {
-		case "struct kernel_cap_t *":
+		case "kernel_cap_t *":
+			return true
+		}
+	case "dentry":
+		switch kernelTy {
+		case "struct dentry *":
 			return true
 		}
 	}
@@ -397,7 +466,7 @@ func validateSycall(kspec *v1alpha1.KProbeSpec, name string) error {
 
 	argsInfo, ok := syscallinfo.GetSyscallArgs(name)
 	if !ok {
-		return &ValidationWarn{s: fmt.Sprintf("missing information for syscall %s: arguments will not be verified", name)}
+		return &ValidationWarnError{e: fmt.Errorf("missing information for syscall %s: arguments will not be verified", name)}
 	}
 
 	for i := range kspec.Args {
@@ -408,7 +477,7 @@ func validateSycall(kspec *v1alpha1.KProbeSpec, name string) error {
 
 		argTy := argsInfo[specArg.Index].Type
 		if !typesCompatible(specArg.Type, argTy) {
-			return &ValidationWarn{s: fmt.Sprintf("type (%s) of syscall argument %d does not match spec type (%s)\n", argTy, specArg.Index, specArg.Type)}
+			return &ValidationWarnError{e: fmt.Errorf("type (%s) of syscall argument %d does not match spec type (%s)", argTy, specArg.Index, specArg.Type)}
 		}
 	}
 
@@ -421,22 +490,30 @@ func validateSycall(kspec *v1alpha1.KProbeSpec, name string) error {
 func AvailableSyscalls() ([]string, error) {
 	// NB(kkourt): we should have a single function for this (see observerFindBTF)
 	btfFile := "/sys/kernel/btf/vmlinux"
-	tetragonBtfEnv := os.Getenv("TETRAGON_BTF")
-	if tetragonBtfEnv != "" {
-		if _, err := os.Stat(tetragonBtfEnv); err != nil {
-			return nil, fmt.Errorf("Failed to find BTF: %s", tetragonBtfEnv)
+	tetragonBTFEnv := os.Getenv("TETRAGON_BTF")
+	if tetragonBTFEnv != "" {
+		if _, err := os.Stat(tetragonBTFEnv); err != nil {
+			return nil, fmt.Errorf("failed to find BTF: %s", tetragonBTFEnv)
 		}
-		btfFile = tetragonBtfEnv
+		btfFile = tetragonBTFEnv
 	}
 	bspec, err := btf.LoadSpec(btfFile)
 	if err != nil {
-		return nil, fmt.Errorf("BTF load failed: %v", err)
+		return nil, fmt.Errorf("BTF load failed: %w", err)
 	}
 
 	ret := []string{}
-	for key, value := range syscallinfo.SyscallsNames() {
+	abi, err := syscallinfo.DefaultABI()
+	if err != nil {
+		return nil, err
+	}
+	names, err := syscallinfo.SyscallsNames(abi)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range names {
 		if value == "" {
-			return nil, fmt.Errorf("syscall name for %q is empty", key)
+			return nil, fmt.Errorf("syscall name for %d is empty", key)
 		}
 
 		sym, err := arch.AddSyscallPrefix(value)
@@ -458,29 +535,32 @@ func AvailableSyscalls() ([]string, error) {
 func GetSyscallsList() ([]string, error) {
 	btfFile := "/sys/kernel/btf/vmlinux"
 
-	tetragonBtfEnv := os.Getenv("TETRAGON_BTF")
-	if tetragonBtfEnv != "" {
-		if _, err := os.Stat(tetragonBtfEnv); err != nil {
-			return []string{}, fmt.Errorf("Failed to find BTF: %s", tetragonBtfEnv)
+	tetragonBTFEnv := os.Getenv("TETRAGON_BTF")
+	if tetragonBTFEnv != "" {
+		if _, err := os.Stat(tetragonBTFEnv); err != nil {
+			return []string{}, fmt.Errorf("failed to find BTF: %s", tetragonBTFEnv)
 		}
-		btfFile = tetragonBtfEnv
+		btfFile = tetragonBTFEnv
 	}
 
 	bspec, err := btf.LoadSpec(btfFile)
 	if err != nil {
-		return []string{}, fmt.Errorf("BTF load failed: %v", err)
+		return []string{}, fmt.Errorf("BTF load failed: %w", err)
 	}
 
 	var list []string
 
-	for key, value := range syscallinfo.SyscallsNames() {
+	abi, err := syscallinfo.DefaultABI()
+	if err != nil {
+		return nil, err
+	}
+	names, err := syscallinfo.SyscallsNames(abi)
+	if err != nil {
+		return nil, err
+	}
+	for _, value := range names {
 		var fn *btf.Func
-
-		if value == "" {
-			return nil, fmt.Errorf("syscall name for %q is empty", key)
-		}
-
-		sym, err := arch.AddSyscallPrefix(value)
+		sym, err := arch.AddSyscallPrefix(fmt.Sprint("sys_", value))
 		if err != nil {
 			return []string{}, err
 		}

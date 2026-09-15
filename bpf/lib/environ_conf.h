@@ -21,16 +21,21 @@ struct tetragon_conf {
 	__u32 pid; /* Tetragon pid for debugging purpose */
 	__u32 nspid; /* Tetragon pid in namespace for debugging purpose */
 	__u32 tg_cgrp_hierarchy; /* Tetragon tracked hierarchy ID */
-	__u32 tg_cgrp_subsys_idx; /* Tetragon tracked cgroup subsystem state index at compile time */
+	__u32 tg_cgrpv1_subsys_idx; /* Tetragon tracked cgroupv1 subsystem state index at compile time */
 	__u32 tg_cgrp_level; /* Tetragon cgroup level */
 	__u64 tg_cgrpid; /* Tetragon current cgroup ID to avoid filtering blocking itself */
 	__u64 cgrp_fs_magic; /* Cgroupv1 or Cgroupv2 */
+	__u8 pad[8];
 }; // All fields aligned so no 'packed' attribute.
 
+/* Tetragon runtime configuration storage.
+ * Set from userspace during startup and environment discovery
+ * only, bpf part is read-only.
+ */
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
-	__type(key, __s32);
+	__type(key, __u32);
 	__type(value, struct tetragon_conf);
 } tg_conf_map SEC(".maps");
 

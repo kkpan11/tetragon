@@ -1,15 +1,22 @@
-{{- if .Values.tetragon.prometheus.enabled -}}
+{{- if and .Values.tetragon.enabled .Values.tetragon.prometheus.enabled -}}
 ---
 apiVersion: v1
 kind: Service
 metadata:
+  {{- with .Values.serviceAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   labels:
     {{- with .Values.serviceLabelsOverride}}
     {{- toYaml . | nindent 4 }}
     {{- else }}
     {{- include "tetragon.labels" . | nindent 4 }}
     {{- end }}
-  name: {{ .Release.Name }}
+    {{- with .Values.serviceLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  name: {{ include "tetragon.name" . }}
   namespace: {{ .Release.Namespace }}
 spec:
   ports:

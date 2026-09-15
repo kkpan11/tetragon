@@ -4,7 +4,7 @@
 package readyapi
 
 import (
-	"fmt"
+	"errors"
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/process"
@@ -18,17 +18,17 @@ func (msg *MsgTetragonReady) Notify() bool {
 }
 
 func (msg *MsgTetragonReady) RetryInternal(_ notify.Event, _ uint64) (*process.ProcessInternal, error) {
-	return nil, fmt.Errorf("Unsupported cache event MsgTetragonReady")
+	return nil, errors.New("unsupported cache event MsgTetragonReady")
 }
 
 func (msg *MsgTetragonReady) Retry(_ *process.ProcessInternal, _ notify.Event) error {
-	return fmt.Errorf("Unsupported cache retry event MsgTetragonReady")
+	return errors.New("unsupported cache retry event MsgTetragonReady")
 }
 
 func (msg *MsgTetragonReady) HandleMessage() *tetragon.GetEventsResponse {
 	return nil
 }
 
-func (msg *MsgTetragonReady) Cast(_ interface{}) notify.Message {
+func (msg *MsgTetragonReady) Cast(_ any) notify.Message {
 	return &MsgTetragonReady{}
 }

@@ -4,8 +4,13 @@
 package watchermetrics
 
 import (
-	"github.com/cilium/tetragon/pkg/metrics/consts"
+	"maps"
+	"slices"
+
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/cilium/tetragon/pkg/metrics"
+	"github.com/cilium/tetragon/pkg/metrics/consts"
 )
 
 type Watcher int
@@ -31,30 +36,52 @@ const (
 )
 
 var (
-	WatcherErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace:   consts.MetricsNamespace,
-		Name:        "watcher_errors_total",
-		Help:        "The total number of errors for a given watcher type.",
-		ConstLabels: nil,
-	}, []string{"watcher", "error"})
-	WatcherEvents = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace:   consts.MetricsNamespace,
-		Name:        "watcher_events_total",
-		Help:        "The total number of events for a given watcher type.",
-		ConstLabels: nil,
-	}, []string{"watcher"})
+	WatcherErrors = metrics.MustNewCounter(
+		metrics.NewOpts(
+			consts.MetricsNamespace, "", "watcher_errors_total",
+			"The total number of errors for a given watcher type.",
+			nil, []metrics.ConstrainedLabel{
+				{Name: "watcher", Values: slices.Collect(maps.Values(watcherTypeLabelValues))},
+				{Name: "error", Values: []string{string(FailedToGetPodError)}},
+			}, nil,
+		),
+		nil,
+	)
+	WatcherEvents = metrics.MustNewCounter(
+		metrics.NewOpts(
+			consts.MetricsNamespace, "", "watcher_events_total",
+			"The total number of events for a given watcher type.",
+			nil, []metrics.ConstrainedLabel{{Name: "watcher", Values: slices.Collect(maps.Values(watcherTypeLabelValues))}}, nil,
+		),
+		nil,
+	)
+
+	WatcherDeletedPodCacheHits = metrics.MustNewCounter(metrics.NewOpts(
+		consts.MetricsNamespace, "", "watcher_delete_pod_cache_hits",
+		"The total hits for pod information in the deleted pod cache.",
+		nil, nil, nil,
+	), nil)
+
+	WatcherDeletedPodCacheEvictions = metrics.MustNewCounter(metrics.NewOpts(
+		consts.MetricsNamespace, "", "watcher_delete_pod_cache_evictions",
+		"The total evictions from the deleted pod cache.",
+		nil, nil, nil,
+	), nil)
 )
 
-func InitMetrics(registry *prometheus.Registry) {
-	registry.MustRegister(WatcherErrors)
-	registry.MustRegister(WatcherEvents)
+func RegisterMetrics(group metrics.Group) {
+	group.MustRegister(WatcherErrors)
+	group.MustRegister(WatcherEvents)
+	group.MustRegister(WatcherDeletedPodCacheHits)
+	group.MustRegister(WatcherDeletedPodCacheEvictions)
+}
 
+func InitMetrics() {
 	// Initialize metrics with labels
 	GetWatcherEvents(K8sWatcher).Add(0)
 	GetWatcherErrors(K8sWatcher, FailedToGetPodError).Add(0)
-
-	// NOTES:
-	// * error, error_type, type - standardize on a label
+	GetWatcherDeletedPodCacheHits().Add(0)
+	GetWatcherDeletedPodCacheEvictions().Add(0)
 }
 
 // Get a new handle on an WatcherEvents metric for a watcher type
@@ -65,4 +92,12 @@ func GetWatcherEvents(watcherType Watcher) prometheus.Counter {
 // Get a new handle on an WatcherEvents metric for a watcher type
 func GetWatcherErrors(watcherType Watcher, watcherError ErrorType) prometheus.Counter {
 	return WatcherErrors.WithLabelValues(watcherType.String(), string(watcherError))
+}
+
+func GetWatcherDeletedPodCacheHits() prometheus.Counter {
+	return WatcherDeletedPodCacheHits.WithLabelValues()
+}
+
+func GetWatcherDeletedPodCacheEvictions() prometheus.Counter {
+	return WatcherDeletedPodCacheEvictions.WithLabelValues()
 }

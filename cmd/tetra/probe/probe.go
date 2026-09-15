@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package probe
 
 import (
@@ -9,8 +11,9 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/cilium/tetragon/pkg/bpf"
 	"github.com/spf13/cobra"
+
+	"github.com/cilium/tetragon/pkg/bpf"
 )
 
 func checkCapSysAdmin() (bool, error) {
@@ -39,5 +42,7 @@ func New() *cobra.Command {
 			cmd.Println(strings.ReplaceAll(bpf.LogFeatures(), ", ", "\n"))
 		},
 	}
+
+	cmd.AddCommand(NewConfigCmd())
 	return &cmd
 }

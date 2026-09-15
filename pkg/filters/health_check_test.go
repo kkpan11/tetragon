@@ -7,10 +7,12 @@ import (
 	"context"
 	"testing"
 
-	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
-	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/event"
 )
 
 func Test_canBeHealthCheck(t *testing.T) {
@@ -62,13 +64,13 @@ func Test_healthCheckFilter(t *testing.T) {
 	maybeHealthCheck, err := BuildFilterList(context.Background(),
 		[]*tetragon.Filter{{HealthCheck: &wrapperspb.BoolValue{Value: true}}},
 		[]OnBuildFilter{&HealthCheckFilter{}})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	notHealthCheck, err := BuildFilterList(context.Background(),
 		[]*tetragon.Filter{{HealthCheck: &wrapperspb.BoolValue{Value: false}}},
 		[]OnBuildFilter{&HealthCheckFilter{}})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	process := v1.Event{
+	process := event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Pod: &tetragon.Pod{Container: &tetragon.Container{
@@ -77,7 +79,7 @@ func Test_healthCheckFilter(t *testing.T) {
 			},
 		},
 	}
-	parent := v1.Event{
+	parent := event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{Parent: &tetragon.Process{Pod: &tetragon.Pod{Container: &tetragon.Container{
@@ -86,7 +88,7 @@ func Test_healthCheckFilter(t *testing.T) {
 			},
 		},
 	}
-	neither := v1.Event{
+	neither := event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Pod: &tetragon.Pod{Container: &tetragon.Container{}}}},

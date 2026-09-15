@@ -8,6 +8,7 @@
 #include "bpf_helpers.h"
 #include "bpf_event.h"
 #include "bpf_task.h"
+#include "bpf_ktime.h"
 
 struct msg_loader {
 	struct msg_common common;
@@ -121,16 +122,18 @@ loader_kprobe(struct pt_regs *ctx)
 
 	path = BPF_CORE_READ(mmap_event, file_name);
 	len = probe_read_str(&msg->path, sizeof(msg->path), path);
+	if (len <= 0)
+		return 0;
 	msg->path_size = (__u32)len;
 
 	msg->pid = tgid;
 
 	total = offsetof(struct msg_loader, pe);
 	msg->common.size = total;
-	msg->common.ktime = ktime_get_ns();
+	msg->common.ktime = tg_get_ktime();
 	msg->common.op = MSG_OP_LOADER;
 	msg->common.flags = 0;
 
-	perf_event_output_metric(ctx, MSG_OP_LOADER, &tcpmon_map, BPF_F_CURRENT_CPU, msg, total);
+	event_output_metric(ctx, MSG_OP_LOADER, msg, total);
 	return 0;
 }

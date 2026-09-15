@@ -48,7 +48,7 @@ You can then make modifications to the Tetragon configuration using `helm
 upgrade`, see the following example.
 
 ```shell
-helm upgrade tetragon cilium/tetragon -n kube-system --set tetragon.grpc.address=localhost:1337
+helm upgrade tetragon cilium/tetragon -n kube-system --set tetragon.grpc.address=unix:///var/run/tetragon/custom-tetragon.sock
 ```
 
 You can also edit the `tetragon-config` ConfigMap directly and restart the
@@ -58,6 +58,17 @@ Tetragon daemonset with:
 kubectl edit cm tetragon-config -n kube-system
 kubectl rollout restart ds/tetragon -n kube-system
 ```
+
+<details><summary>Requirements for Talos Linux (v1.12.0+)</summary>
+
+The following Helm values configuration is required to install Tetragon on Talos Linux:
+
+```yaml
+extraHostPathMounts:
+  - name: sys-kernel-tracing
+    mountPath: /sys/kernel/tracing
+```
+</details>
 
 ## Upgrade
 

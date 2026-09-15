@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package bench
 
 import (
@@ -61,14 +63,10 @@ func (src traceBenchOpen) Run(ctx context.Context, _ *Arguments, _ *Summary) err
 
 	fmt.Printf("threads %v, loops %v, sleep %v(us)\n", *openThreads, *openLoops, *openSleep)
 
-	var i uint
-
-	for i = 0; i < *openThreads; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range uint(*openThreads) {
+		wg.Go(func() {
 			src.benchWorker(ctx)
-		}()
+		})
 	}
 
 	return nil
@@ -99,7 +97,7 @@ spec:
 	}
 	defer f.Close()
 
-	f.Write([]byte(tmpl))
+	f.WriteString(tmpl)
 	return f.Name()
 }
 

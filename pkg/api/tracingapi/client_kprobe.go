@@ -12,19 +12,21 @@ const (
 )
 
 const (
-	ActionPost         = 0
-	ActionFollowFd     = 1
-	ActionSigKill      = 2
-	ActionUnfollowFd   = 3
-	ActionOverride     = 4
-	ActionCopyFd       = 5
-	ActionGetUrl       = 6
-	ActionLookupDns    = 7
-	ActionNoPost       = 8
-	ActionSignal       = 9
-	ActionTrackSock    = 10
-	ActionUntrackSock  = 11
-	ActionNotifyKiller = 12
+	ActionPost = 0
+	// ActionFollowFd                    = 1 deprecated
+	ActionSigKill = 2
+	// ActionUnfollowFd                  = 3 deprecated
+	ActionOverride = 4
+	// ActionCopyFd                      = 5 deprecated
+	ActionGetUrl                      = 6
+	ActionLookupDns                   = 7
+	ActionNoPost                      = 8
+	ActionSignal                      = 9
+	ActionTrackSock                   = 10
+	ActionUntrackSock                 = 11
+	ActionNotifyEnforcer              = 12
+	ActionCleanupEnforcerNotification = 13
+	ActionSet                         = 14
 )
 
 const (
@@ -56,6 +58,14 @@ type MsgGenericKprobe struct {
 	Tid           uint32 // The recorded TID that triggered the event
 	KernelStackID int64
 	UserStackID   int64
+}
+
+func (m MsgGenericKprobe) HasKernelStack() bool {
+	return m.Common.Flags&processapi.MSG_COMMON_FLAG_KERNEL_STACKTRACE != 0
+}
+
+func (m MsgGenericKprobe) HasUserStack() bool {
+	return m.Common.Flags&processapi.MSG_COMMON_FLAG_USER_STACKTRACE != 0
 }
 
 type MsgGenericKprobeArgPath struct {
@@ -120,9 +130,10 @@ func (m MsgGenericKprobeArgBytes) IsReturnArg() bool {
 }
 
 type MsgGenericKprobeArgInt struct {
-	Index uint64
-	Value int32
-	Label string
+	Index         uint64
+	Value         int32
+	UserSpaceType int32
+	Label         string
 }
 
 func (m MsgGenericKprobeArgInt) GetIndex() uint64 {
@@ -144,6 +155,20 @@ func (m MsgGenericKprobeArgUInt) GetIndex() uint64 {
 }
 
 func (m MsgGenericKprobeArgUInt) IsReturnArg() bool {
+	return m.Index == ReturnArgIndex
+}
+
+type MsgGenericKprobeArgError struct {
+	Index   uint64
+	Message string
+	Label   string
+}
+
+func (m MsgGenericKprobeArgError) GetIndex() uint64 {
+	return m.Index
+}
+
+func (m MsgGenericKprobeArgError) IsReturnArg() bool {
 	return m.Index == ReturnArgIndex
 }
 
@@ -251,6 +276,56 @@ func (m MsgGenericKprobeArgSkb) GetIndex() uint64 {
 
 func (m MsgGenericKprobeArgSkb) IsReturnArg() bool {
 	return m.Index == ReturnArgIndex
+}
+
+type MsgGenericKprobeSockaddr struct {
+	SinFamily uint16
+	SinPort   uint16
+	Pad       uint32
+	SinAddr   [2]uint64
+}
+
+type MsgGenericKprobeSockaddrUn struct {
+	Family     uint16
+	IsAbstract bool
+	PathLen    uint8
+	Path       [108]byte
+}
+
+type MsgGenericKprobeArgSockaddr struct {
+	Index     uint64
+	SinFamily uint16
+	SinPort   uint32
+	SinAddr   string
+	Label     string
+}
+
+func (m MsgGenericKprobeArgSockaddr) GetIndex() uint64 {
+	return m.Index
+}
+
+func (m MsgGenericKprobeArgSockaddr) IsReturnArg() bool {
+	return m.Index == ReturnArgIndex
+}
+
+type MsgGenericKprobeArgSockaddrUn struct {
+	Index  uint64
+	Family uint16
+	Path   string
+	Label  string
+}
+
+func (m MsgGenericKprobeArgSockaddrUn) GetIndex() uint64 {
+	return m.Index
+}
+
+func (m MsgGenericKprobeArgSockaddrUn) IsReturnArg() bool {
+	return m.Index == ReturnArgIndex
+}
+
+type MsgGenericSyscallID struct {
+	ID  uint32
+	ABI string
 }
 
 type MsgGenericKprobeNetDev struct {
@@ -493,11 +568,34 @@ func (m MsgGenericKprobeArgBpfAttr) IsReturnArg() bool {
 	return m.Index == ReturnArgIndex
 }
 
+type MsgGenericKprobeBpfProg struct {
+	ProgType uint32
+	InsnCnt  uint32
+	ProgName [BPF_OBJ_NAME_LEN]byte
+}
+
+type MsgGenericKprobeArgBpfProg struct {
+	Index    uint64
+	ProgType uint32
+	InsnCnt  uint32
+	ProgName string
+	Label    string
+}
+
+func (m MsgGenericKprobeArgBpfProg) GetIndex() uint64 {
+	return m.Index
+}
+
+func (m MsgGenericKprobeArgBpfProg) IsReturnArg() bool {
+	return m.Index == ReturnArgIndex
+}
+
 type MsgGenericKprobePerfEvent struct {
 	KprobeFunc  [KSYM_NAME_LEN]byte
-	Type        uint32
 	Config      uint64
 	ProbeOffset uint64
+	Type        uint32
+	Pad         uint32
 }
 
 type MsgGenericKprobeArgPerfEvent struct {
@@ -559,25 +657,51 @@ type MsgGenericKprobeUnix struct {
 	Args         []MsgGenericKprobeArg
 }
 
-type KprobeArgs struct {
-	Args0 []byte
-	Args1 []byte
-	Args2 []byte
-	Args3 []byte
-	Args4 []byte
+type ConfigBTFArg struct {
+	Offset        uint32 `align:"offset"`
+	IsPointer     uint16 `align:"is_pointer"`
+	IsInitialized uint16 `align:"is_initialized"`
 }
 
-const EventConfigMaxArgs = 5
+type ConfigUsdtArg struct {
+	ValOff    uint64 `align:"val_off"`
+	RegOff    uint32 `align:"reg_off"`
+	RegIdxOff uint32 `align:"reg_idx_off"`
+	Shift     uint8  `align:"shift"`
+	Type      uint8  `align:"type"`
+	Signed    uint8  `align:"sig"`
+	Scale     uint8  `align:"scale"`
+	Pad1      uint32 `align:"pad1"`
+}
+
+type ConfigRegArg struct {
+	Offset uint16 `align:"offset"`
+	Size   uint8  `align:"size"`
+	Pad    uint8  `align:"pad"`
+}
+
+const (
+	EventConfigMaxArgs     = 5
+	EventConfigMaxUsdtArgs = 8
+	EventConfigMaxRegArgs  = 8
+	MaxBTFArgDepth         = 10 // Artificial value for compilation, may be extended
+	MaxAccessibleArgs      = 5  // Maximum reachable arg index in function signature. Should match MAX_ACCESSIBLE_ARGS in bpf code.
+)
 
 type EventConfig struct {
-	FuncId          uint32                     `align:"func_id"`
-	Arg             [EventConfigMaxArgs]int32  `align:"arg0"`
-	ArgM            [EventConfigMaxArgs]uint32 `align:"arg0m"`
-	ArgTpCtxOff     [EventConfigMaxArgs]uint32 `align:"t_arg0_ctx_off"`
-	Syscall         uint32                     `align:"syscall"`
-	ArgReturnCopy   int32                      `align:"argreturncopy"`
-	ArgReturn       int32                      `align:"argreturn"`
-	ArgReturnAction int32                      `align:"argreturnaction"`
-	PolicyID        uint32                     `align:"policy_id"`
-	Flags           uint32                     `align:"flags"`
+	FuncId          uint32                                           `align:"func_id"`
+	ArgType         [EventConfigMaxArgs]int32                        `align:"arg"`
+	ArgMeta         [EventConfigMaxArgs]uint32                       `align:"arm"`
+	ArgTpCtxOff     [EventConfigMaxArgs]uint32                       `align:"off"`
+	ArgIndex        [EventConfigMaxArgs]int32                        `align:"idx"`
+	Syscall         uint32                                           `align:"syscall"`
+	ArgReturnCopy   int32                                            `align:"argreturncopy"`
+	ArgReturn       int32                                            `align:"argreturn"`
+	ArgReturnAction int32                                            `align:"argreturnaction"`
+	PolicyID        uint32                                           `align:"policy_id"`
+	Flags           uint32                                           `align:"flags"`
+	SelStatsBase    uint32                                           `align:"selector_stats_base"`
+	BTFArg          [EventConfigMaxArgs][MaxBTFArgDepth]ConfigBTFArg `align:"btf_arg"`
+	UsdtArg         [EventConfigMaxUsdtArgs]ConfigUsdtArg            `align:"usdt_arg"`
+	RegArg          [EventConfigMaxRegArgs]ConfigRegArg              `align:"reg_arg"`
 }

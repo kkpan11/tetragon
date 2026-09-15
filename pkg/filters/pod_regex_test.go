@@ -7,16 +7,18 @@ import (
 	"context"
 	"testing"
 
-	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
-	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/event"
 )
 
 func TestPodRegexFilterBasic(t *testing.T) {
 	f := []*tetragon.Filter{{PodRegex: []string{"client", "server"}}}
 	fl, err := BuildFilterList(context.Background(), f, []OnBuildFilter{&PodRegexFilter{}})
-	assert.NoError(t, err)
-	ev := v1.Event{
+	require.NoError(t, err)
+	ev := event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{
@@ -30,7 +32,7 @@ func TestPodRegexFilterBasic(t *testing.T) {
 		},
 	}
 	assert.True(t, fl.MatchOne(&ev))
-	ev = v1.Event{
+	ev = event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{
@@ -44,7 +46,7 @@ func TestPodRegexFilterBasic(t *testing.T) {
 		},
 	}
 	assert.True(t, fl.MatchOne(&ev))
-	ev = v1.Event{
+	ev = event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{
@@ -58,7 +60,7 @@ func TestPodRegexFilterBasic(t *testing.T) {
 		},
 	}
 	assert.True(t, fl.MatchOne(&ev))
-	ev = v1.Event{
+	ev = event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{
@@ -72,7 +74,7 @@ func TestPodRegexFilterBasic(t *testing.T) {
 		},
 	}
 	assert.True(t, fl.MatchOne(&ev))
-	ev = v1.Event{
+	ev = event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessKprobe{
 				ProcessKprobe: &tetragon.ProcessKprobe{
@@ -91,8 +93,8 @@ func TestPodRegexFilterBasic(t *testing.T) {
 func TestPodRegexFilterAdvanced(t *testing.T) {
 	f := []*tetragon.Filter{{PodRegex: []string{"client.*", "^server$"}}}
 	fl, err := BuildFilterList(context.Background(), f, []OnBuildFilter{&PodRegexFilter{}})
-	assert.NoError(t, err)
-	ev := v1.Event{
+	require.NoError(t, err)
+	ev := event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{
@@ -106,7 +108,7 @@ func TestPodRegexFilterAdvanced(t *testing.T) {
 		},
 	}
 	assert.True(t, fl.MatchOne(&ev))
-	ev = v1.Event{
+	ev = event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{
@@ -120,7 +122,7 @@ func TestPodRegexFilterAdvanced(t *testing.T) {
 		},
 	}
 	assert.True(t, fl.MatchOne(&ev))
-	ev = v1.Event{
+	ev = event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{
@@ -134,7 +136,7 @@ func TestPodRegexFilterAdvanced(t *testing.T) {
 		},
 	}
 	assert.True(t, fl.MatchOne(&ev))
-	ev = v1.Event{
+	ev = event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessExec{
 				ProcessExec: &tetragon.ProcessExec{
@@ -148,7 +150,7 @@ func TestPodRegexFilterAdvanced(t *testing.T) {
 		},
 	}
 	assert.False(t, fl.MatchOne(&ev))
-	ev = v1.Event{
+	ev = event.Event{
 		Event: &tetragon.GetEventsResponse{
 			Event: &tetragon.GetEventsResponse_ProcessKprobe{
 				ProcessKprobe: &tetragon.ProcessKprobe{
@@ -167,24 +169,24 @@ func TestPodRegexFilterAdvanced(t *testing.T) {
 func TestPodRegexFilterInvalidRegex(t *testing.T) {
 	f := []*tetragon.Filter{{PodRegex: []string{"*"}}}
 	_, err := BuildFilterList(context.Background(), f, []OnBuildFilter{&PodRegexFilter{}})
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestPodRegexFilterInvalidEvent(t *testing.T) {
 	f := []*tetragon.Filter{{PodRegex: []string{".*"}}}
 	fl, err := BuildFilterList(context.Background(), f, []OnBuildFilter{&PodRegexFilter{}})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.False(t, fl.MatchOne(nil))
-	assert.False(t, fl.MatchOne(&v1.Event{Event: nil}))
-	assert.False(t, fl.MatchOne(&v1.Event{Event: struct{}{}}))
-	assert.False(t, fl.MatchOne(&v1.Event{Event: &tetragon.GetEventsResponse{Event: nil}}))
-	assert.False(t, fl.MatchOne(&v1.Event{Event: &tetragon.GetEventsResponse{
+	assert.False(t, fl.MatchOne(&event.Event{Event: nil}))
+	assert.False(t, fl.MatchOne(&event.Event{Event: struct{}{}}))
+	assert.False(t, fl.MatchOne(&event.Event{Event: &tetragon.GetEventsResponse{Event: nil}}))
+	assert.False(t, fl.MatchOne(&event.Event{Event: &tetragon.GetEventsResponse{
 		Event: &tetragon.GetEventsResponse_ProcessExec{ProcessExec: &tetragon.ProcessExec{Process: nil}},
 	}}))
-	assert.False(t, fl.MatchOne(&v1.Event{Event: &tetragon.GetEventsResponse{
+	assert.False(t, fl.MatchOne(&event.Event{Event: &tetragon.GetEventsResponse{
 		Event: &tetragon.GetEventsResponse_ProcessExec{ProcessExec: &tetragon.ProcessExec{Process: nil}},
 	}}))
-	assert.False(t, fl.MatchOne(&v1.Event{Event: &tetragon.GetEventsResponse{
+	assert.False(t, fl.MatchOne(&event.Event{Event: &tetragon.GetEventsResponse{
 		Event: &tetragon.GetEventsResponse_ProcessKprobe{ProcessKprobe: &tetragon.ProcessKprobe{Process: nil}},
 	}}))
 }

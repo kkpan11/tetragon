@@ -5,35 +5,35 @@ package ksyms
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/cilium/tetragon/pkg/logger"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
 	"github.com/cilium/tetragon/pkg/option"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 )
 
-var (
-	kernelSymbols    *Ksyms
-	setKernelSymbols sync.Once
+// https://docs.kernel.org/admin-guide/sysctl/kernel.html#kptr-restrict
+const (
+	kptrRestrictUnknown   = -1
+	kptrRestrictNone      = 0
+	kptrRestrictCapSyslog = 1
+	kptrRestrictStrict    = 2
 )
 
 func KernelSymbols() (*Ksyms, error) {
-	var err error
-	setKernelSymbols.Do(func() {
-		kernelSymbols, err = NewKsyms(option.Config.ProcFS)
-	})
-	return kernelSymbols, err
+	return NewKsyms(option.Config.ProcFS)
 }
 
 type ksym struct {
-	addr uint64
+	addr uint64 // Can be 0 on systems with kptr_restrict set to 2
 	name string
 	ty   string
 	kmod string
@@ -41,8 +41,9 @@ type ksym struct {
 
 // Ksyms is a structure for kernel symbols
 type Ksyms struct {
-	table   []ksym
-	fnCache *lru.Cache[uint64, fnOffsetVal]
+	table        []ksym
+	fnCache      *lru.Cache[uint64, fnOffsetVal]
+	fnAddrDenied bool
 }
 
 // FnOffset is a function location (function name + offset)
@@ -67,12 +68,24 @@ func (ksym *ksym) isFunction() bool {
 	return tyLow == "w" || tyLow == "t"
 }
 
+func getKptrRestrict(procfs string) int {
+	p := procfs + "/sys/kernel/kptr_restrict"
+	b, err := os.ReadFile(p)
+	if err == nil {
+		b = bytes.Trim(b, "\n")
+		if val, err := strconv.Atoi(string(b)); err == nil {
+			return val
+		}
+	}
+	return kptrRestrictUnknown
+}
+
 // NewKsyms creates a new Ksyms structure (by reading procfs/kallsyms)
 func NewKsyms(procfs string) (*Ksyms, error) {
-	kallsymsFname := fmt.Sprintf("%s/kallsyms", procfs)
+	kallsymsFname := procfs + "/kallsyms"
 	file, err := os.Open(kallsymsFname)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open %q file: %w", kallsymsFname, err)
 	}
 	defer file.Close()
 
@@ -80,6 +93,8 @@ func NewKsyms(procfs string) (*Ksyms, error) {
 	var ksyms Ksyms
 	s := bufio.NewScanner(file)
 	needsSort := false
+	fnAddr0Warned := false
+	kptrRestrict := getKptrRestrict(procfs)
 
 	for s.Scan() {
 		txt := s.Text()
@@ -87,21 +102,29 @@ func NewKsyms(procfs string) (*Ksyms, error) {
 		var sym ksym
 
 		if len(fields) < 3 {
-			fmt.Fprintf(os.Stderr, "Failed to parse: '%s'\n", txt)
+			logger.GetLogger().Warn("failed to parse kallsyms line", "line", txt)
 			continue
 		}
 
 		if sym.addr, err = strconv.ParseUint(fields[0], 16, 64); err != nil {
-			err = fmt.Errorf("failed to parse address: %v", err)
+			err = fmt.Errorf("failed to parse address %q: %w", fields[0], err)
 			break
 		}
 		sym.ty = fields[1]
 		sym.name = fields[2]
 
-		//fmt.Printf("%s => %d %s\n", txt, sym.addr, sym.name)
-		if sym.isFunction() && sym.addr == 0 {
-			err = fmt.Errorf("function %s reported at address 0. Insuffcient permissions?", sym.name)
-			break
+		if sym.isFunction() && sym.addr == 0 && !fnAddr0Warned {
+			fnAddr0Warned = true
+			// If we either failed to read kptr_restrict value,
+			// or we read 2, try to proceed anyway.
+			if kptrRestrict == kptrRestrictUnknown || kptrRestrict == kptrRestrictStrict {
+				ksyms.fnAddrDenied = true
+				logger.GetLogger().Warn(fmt.Sprintf("function %s reported at address 0", sym.name), "kptr_restrict", kptrRestrict)
+			} else {
+				// If address is 0 and kptr_restrict is either 0 or 1, error out.
+				err = fmt.Errorf("function %s reported at address 0, insufficient permissions? kptr_restrict: %d", sym.name, kptrRestrict)
+				break
+			}
 		}
 
 		// check if this symbol is part of a kmod
@@ -123,12 +146,11 @@ func NewKsyms(procfs string) (*Ksyms, error) {
 		err = s.Err()
 	}
 
-	if err != nil && len(ksyms.table) == 0 {
-		err = errors.New("no symbols found")
-	}
-
 	if err != nil {
-		return nil, err
+		if len(ksyms.table) == 0 {
+			return nil, fmt.Errorf("no kernel symbols found: %w", err)
+		}
+		return nil, fmt.Errorf("error while parsing kallsyms: %w", err)
 	}
 
 	if needsSort {
@@ -139,8 +161,7 @@ func NewKsyms(procfs string) (*Ksyms, error) {
 	if err == nil {
 		ksyms.fnCache = fc
 	} else {
-
-		logger.GetLogger().Infof("failed to initialize cache: %s", err)
+		logger.GetLogger().Warn("failed to initialize kallsyms cache", logfields.Error, err)
 	}
 
 	return &ksyms, nil
@@ -171,6 +192,10 @@ func (k *Ksyms) GetFnOffset(addr uint64) (*FnOffset, error) {
 
 // GetFnOffset -- retruns the FnOffset for a given address
 func (k *Ksyms) getFnOffset(addr uint64) (*FnOffset, error) {
+	if k.fnAddrDenied {
+		return nil, errors.New("kernel symbols addresses are not available")
+	}
+
 	// address is before first symbol
 	if k.table[0].addr > addr {
 		return nil, fmt.Errorf("address %d is before first symbol %s@%d", addr, k.table[0].name, k.table[0].addr)
@@ -191,7 +216,7 @@ func (k *Ksyms) getFnOffset(addr uint64) (*FnOffset, error) {
 
 	sym := k.table[l]
 	if !sym.isFunction() {
-		return nil, fmt.Errorf("Unable to find function for addr 0x%x", addr)
+		return nil, fmt.Errorf("unable to find function for addr 0x%x", addr)
 	}
 
 	return &FnOffset{

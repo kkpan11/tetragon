@@ -7,6 +7,13 @@
 #include "bpf_event.h"
 #include "bpf_helpers.h"
 #include "bpf_cred.h"
+#include "bpf_d_path.h"
+#include "../process/string_maps.h"
+#include "api.h"
+#include "policy_stats.h"
+#include "errmetrics.h"
+#include "environ_conf.h"
+#include "config.h"
 
 /* Applying 'packed' attribute to structs causes clang to write to the
  * members byte-by-byte, as offsets may not be aligned. This is bad for
@@ -30,8 +37,6 @@
  * processing stops.
  */
 
-/* Max number of args to parse */
-#define MAXARGS 20
 /* Max length of any given arg */
 #define MAXARGLENGTH 256
 /* This is the absolute buffer size for args and filenames including some
@@ -92,36 +97,23 @@
  *
  * Phew all clear now?
  */
-#define CWD_MAX	     256
-#define BUFFER	     1024
-#define SIZEOF_EVENT 56
+#define CWD_MAX		   4096
+#define BUFFER		   1024
+#define SIZEOF_MSG_PROCESS sizeof(struct msg_process)
 #define PADDED_BUFFER \
-	(BUFFER + MAXARGLENGTH + SIZEOF_EVENT + SIZEOF_EVENT + CWD_MAX)
-/* This is the usable buffer size for args and filenames. It is calculated
- * as the (BUFFER SIZE - sizeof(parent) - sizeof(curr) but unfortunately
- * preprocess doesn't know types so we do it manually without sizeof().
- */
-#define ARGSBUFFER	 (BUFFER - SIZEOF_EVENT - SIZEOF_EVENT)
-#define __ASM_ARGSBUFFER 976
-#define ARGSBUFFERMASK	 (ARGSBUFFER - 1)
-#define MAXARGMASK	 (MAXARG - 1)
-#define PATHNAME_SIZE	 256
-
-/* Task flags */
-#ifndef PF_KTHREAD
-#define PF_KTHREAD 0x00200000 /* I am a kernel thread */
-#endif
+	(BUFFER + MAXARGLENGTH + SIZEOF_MSG_PROCESS + SIZEOF_MSG_PROCESS + CWD_MAX)
+#define PATHNAME_SIZE 256
 
 /* Msg flags */
 #define EVENT_UNKNOWN		      0x00
 #define EVENT_EXECVE		      0x01
-#define EVENT_EXECVEAT		      0x02
+#define EVENT_ENVS_DATA		      0x02
 #define EVENT_PROCFS		      0x04
-#define EVENT_TRUNC_FILENAME	      0x08
+#define EVENT_ENVS_ERROR	      0x08
 #define EVENT_TRUNC_ARGS	      0x10
-#define EVENT_TASK_WALK		      0x20
+#define EVENT_AVAIL_3		      0x20
 #define EVENT_MISS		      0x40
-#define EVENT_NEEDS_AUID	      0x80
+#define EVENT_AVAIL_4		      0x80
 #define EVENT_ERROR_FILENAME	      0x100
 #define EVENT_ERROR_ARGS	      0x200
 #define EVENT_NEEDS_CWD		      0x400
@@ -129,9 +121,9 @@
 #define EVENT_ROOT_CWD		      0x1000
 #define EVENT_ERROR_CWD		      0x2000
 #define EVENT_CLONE		      0x4000
-#define EVENT_ERROR_SOCK	      0x8000
+#define EVENT_AVAIL_5		      0x8000
 #define EVENT_ERROR_CGROUP_NAME	      0x010000
-#define EVENT_ERROR_CGROUP_KN	      0x020000
+#define EVENT_AVAIL_6		      0x020000
 #define EVENT_ERROR_CGROUP_SUBSYSCGRP 0x040000
 #define EVENT_ERROR_CGROUP_SUBSYS     0x080000
 #define EVENT_ERROR_CGROUPS	      0x100000
@@ -139,6 +131,7 @@
 #define EVENT_ERROR_PATH_COMPONENTS   0x400000
 #define EVENT_DATA_FILENAME	      0x800000
 #define EVENT_DATA_ARGS		      0x1000000
+#define EVENT_IN_INIT_TREE	      0x2000000
 
 #define EVENT_COMMON_FLAG_CLONE 0x01
 
@@ -183,9 +176,6 @@ struct execve_info {
 };
 
 /* process information
- *
- * Manually linked to ARGSBUFFER and PADDED_BUFFER if this changes then please
- * also change SIZEOF_EVENT.
  */
 struct msg_process {
 	__u32 size;
@@ -200,7 +190,11 @@ struct msg_process {
 	__u32 pad;
 	__u64 i_ino;
 	__u64 ktime;
-	char *args;
+	__u16 size_path;
+	__u16 size_args;
+	__u16 size_cwd;
+	__u16 size_envs;
+	char args[0];
 }; // All fields aligned so no 'packed' attribute.
 
 /* msg_clone_event holds only the necessary fields to construct a new entry from
@@ -264,24 +258,33 @@ struct msg_ns {
 }; // All fields aligned so no 'packed' attribute.
 
 struct msg_k8s {
-	__u32 net_ns;
-	__u32 cid;
 	__u64 cgrpid;
+	__u64 cgrp_tracker_id;
 	char docker_id[DOCKER_ID_LENGTH];
 }; // All fields aligned so no 'packed' attribute.
 
 #define BINARY_PATH_MAX_LEN 256
 
 struct heap_exe {
-	// because of verifier limitations, this has to be 2 * 256 bytes while 256
-	// should be theoretically sufficient, and actually is, in unit tests.
-	char buf[BINARY_PATH_MAX_LEN * 2];
-	// offset points to the start of the path in the above buffer. Use offset to
-	// read the path in the buffer since it's written from the end.
-	char *off;
+	char buf[BINARY_PATH_MAX_LEN];
+	char end[STRING_POSTFIX_MAX_LENGTH];
 	__u32 len;
 	__u32 error;
 }; // All fields aligned so no 'packed' attribute.
+
+/* Internal state carried between execve initialization and send. */
+struct args_source {
+	__u64 start;
+	__u64 len;
+};
+
+struct args {
+	// NUL-delimited argv entries excluding argv[0].
+	char buf[MAXARGLENGTH];
+	// len includes every NUL byte copied from the process argument range.
+	__u32 len;
+	__u32 pad;
+};
 
 struct msg_execve_event {
 	struct msg_common common;
@@ -298,12 +301,17 @@ struct msg_execve_event {
 		char buffer[PADDED_BUFFER];
 	};
 	/* below fields are not part of the event, serve just as
-	 * heap for execve programs
+	 * heap for execve programs between execve and send.
 	 */
 #ifdef __LARGE_BPF_PROG
 	struct heap_exe exe;
+	struct args_source args_source;
 #endif
 }; // All fields aligned so no 'packed' attribute.
+
+#define MBSET_INVALID_ID 0xffffffff
+
+typedef __u64 mbset_t;
 
 // This structure stores the binary path that was recorded on execve.
 // Technically PATH_MAX is 4096 but we limit the length we store since we have
@@ -314,11 +322,34 @@ struct msg_execve_event {
 struct binary {
 	// length of the path stored in path, this should be < BINARY_PATH_MAX_LEN
 	// but can contain negative value in case of copy error.
-	// While s16 would be sufficient, 64 bits are handy for alignment.
-	__s64 path_length;
+	// While s16 would be sufficient, 32 bits are handy for alignment.
+	__s32 path_length;
+	// if end_r contains reversed path postfix
+	__u32 reversed;
 	// BINARY_PATH_MAX_LEN first bytes of the path
 	char path[BINARY_PATH_MAX_LEN];
+	// STRING_POSTFIX_MAX_LENGTH last bytes of the path
+	char end[STRING_POSTFIX_MAX_LENGTH];
+	// STRING_POSTFIX_MAX_LENGTH reversed last bytes of the path
+	char end_r[STRING_POSTFIX_MAX_LENGTH];
+	// matchBinary bitset for binary
+	// NB: everything after and including ->mb_bitset will not be zeroed on a new exec. See
+	// binary_reset().
+	mbset_t mb_bitset;
+	// mb generation value aka last mbset filter timestamp
+	__u64 mb_gen;
 }; // All fields aligned so no 'packed' attribute
+
+FUNC_INLINE void
+binary_reset(struct binary *b)
+{
+	// buffer can be written at clone stage with parent's info, if previous path is longer than
+	// current, we can have leftovers at the end, so zero out bin structure.
+	//
+	// Do not zero the ->mb_bitset however, so that it can be inherited if exec() is called.
+	// This depends on ->mb_bitset being the last part of the struct.
+	__bpf_memset_builtin(b, 0, offsetof(struct binary, mb_bitset));
+}
 
 // The execve_map_value is tracked by the TGID of the thread group
 // the msg_execve_key.pid. The thread IDs are recorded on the
@@ -331,6 +362,7 @@ struct execve_map_value {
 	struct msg_ns ns;
 	struct msg_capabilities caps;
 	struct binary bin;
+	struct args args;
 } __attribute__((packed)) __attribute__((aligned(8)));
 
 struct {
@@ -341,23 +373,43 @@ struct {
 } execve_msg_heap_map SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct binary);
+} tg_binary_heap SEC(".maps");
+
+// Parent binaries map is used for saving actual immediate parents
+// for processes to get check them in matchParentBinaries selector.
+// If multiple execs are called in same process without fork, the map
+// stores process binary itself instead of its parent binary.
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct binary);
+} tg_parents_bin SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 32768);
+	__uint(max_entries, 1);
 	__type(key, __u32);
 	__type(value, struct execve_map_value);
 } execve_map SEC(".maps");
 
+enum {
+	MAP_STATS_COUNT = 0,
+	MAP_STATS_EUPDATE = 1,
+	MAP_STATS_EDELETE = 2,
+	MAP_STATS_MAX = 3,
+};
+
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 2);
+	__uint(max_entries, MAP_STATS_MAX);
 	__type(key, __s32);
 	__type(value, __s64);
 } execve_map_stats SEC(".maps");
-
-enum {
-	MAP_STATS_COUNT = 0,
-	MAP_STATS_ERROR = 1,
-};
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -386,7 +438,7 @@ struct {
  * through the execve call. The list of current hooks is:
  *   1. kprobe/security_bprm_committing_creds
  *      For details check tg_kp_bprm_committing_creds bpf program.
- *   2. tracepoint/sys_execve
+ *   2. raw_tracepoint/sys_execve
  *      For details see event_execve bpf program.
  *
  * Important: the information stored here is complementary
@@ -410,7 +462,7 @@ struct {
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 2);
+	__uint(max_entries, MAP_STATS_MAX);
 	__type(key, __s32);
 	__type(value, __s64);
 } tg_execve_joined_info_map_stats SEC(".maps");
@@ -436,16 +488,17 @@ FUNC_INLINE int64_t validate_msg_execve_size(int64_t size)
 	return size;
 }
 
-// execve_map_error() will increment the map error counter
-FUNC_INLINE void execve_map_error(void)
+FUNC_INLINE void stats_update(struct bpf_map_def *map, __u32 key, int inc)
 {
-	int one = MAP_STATS_ERROR;
 	__s64 *cntr;
 
-	cntr = map_lookup_elem(&execve_map_stats, &one);
+	cntr = map_lookup_elem(map, &key);
 	if (cntr)
-		*cntr = *cntr + 1;
+		*cntr = *cntr + inc;
 }
+
+#define STATS_INC(map, key) stats_update((struct bpf_map_def *)&(map), MAP_STATS_##key, 1)
+#define STATS_DEC(map, key) stats_update((struct bpf_map_def *)&(map), MAP_STATS_##key, -1)
 
 // execve_map_get will look up if pid exists and return it if it does. If it
 // does not, it will create a new one and return it.
@@ -457,20 +510,17 @@ FUNC_INLINE struct execve_map_value *execve_map_get(__u32 pid)
 	if (!event) {
 		struct execve_map_value *value;
 		int err, zero = MAP_STATS_COUNT;
-		__s64 *cntr;
 
 		value = map_lookup_elem(&execve_val, &zero);
 		if (!value)
 			return 0;
 
-		memset(value, 0, sizeof(struct execve_map_value));
+		__bpf_memset_builtin(value, 0, sizeof(struct execve_map_value));
 		err = map_update_elem(&execve_map, &pid, value, 0);
 		if (!err) {
-			cntr = map_lookup_elem(&execve_map_stats, &zero);
-			if (cntr)
-				*cntr = *cntr + 1;
+			STATS_INC(execve_map_stats, COUNT);
 		} else {
-			execve_map_error();
+			STATS_INC(execve_map_stats, EUPDATE);
 		}
 		event = map_lookup_elem(&execve_map, &pid);
 	}
@@ -485,61 +535,41 @@ FUNC_INLINE struct execve_map_value *execve_map_get_noinit(__u32 pid)
 FUNC_INLINE void execve_map_delete(__u32 pid)
 {
 	int err = map_delete_elem(&execve_map, &pid);
-	int zero = MAP_STATS_COUNT;
-	__s64 *cntr;
 
 	if (!err) {
-		cntr = map_lookup_elem(&execve_map_stats, &zero);
-		if (cntr)
-			*cntr = *cntr - 1;
+		STATS_DEC(execve_map_stats, COUNT);
 	} else {
-		execve_map_error();
+		STATS_INC(execve_map_stats, EDELETE);
 	}
-}
-
-// execve_joined_info_map_error() will increment the map error counter
-FUNC_INLINE void execve_joined_info_map_error(void)
-{
-	int one = MAP_STATS_ERROR;
-	__s64 *cntr;
-
-	cntr = map_lookup_elem(&tg_execve_joined_info_map_stats, &one);
-	if (cntr)
-		*cntr = *cntr + 1;
 }
 
 FUNC_INLINE void execve_joined_info_map_set(__u64 tid, struct execve_info *info)
 {
-	int err, zero = MAP_STATS_COUNT;
-	__s64 *cntr;
+	int err;
 
 	err = map_update_elem(&tg_execve_joined_info_map, &tid, info, BPF_ANY);
-	if (err < 0) {
+	if (!err) {
+		STATS_INC(tg_execve_joined_info_map_stats, COUNT);
+	} else {
 		/* -EBUSY or -ENOMEM with the help of the cntr error
 		 * on the stats map this can be a good indication of
 		 * long running workloads and if we have to make the
 		 * map size bigger for such cases.
 		 */
-		execve_joined_info_map_error();
-		return;
+		STATS_INC(tg_execve_joined_info_map_stats, EUPDATE);
 	}
-
-	cntr = map_lookup_elem(&tg_execve_joined_info_map_stats, &zero);
-	if (cntr)
-		*cntr = *cntr + 1;
 }
 
 /* Clear up some space for next threads */
 FUNC_INLINE void execve_joined_info_map_clear(__u64 tid)
 {
-	int err, zero = MAP_STATS_COUNT;
-	__s64 *cntr;
+	int err;
 
 	err = map_delete_elem(&tg_execve_joined_info_map, &tid);
 	if (!err) {
-		cntr = map_lookup_elem(&tg_execve_joined_info_map_stats, &zero);
-		if (cntr)
-			*cntr = *cntr - 1;
+		STATS_DEC(tg_execve_joined_info_map_stats, COUNT);
+	} else {
+		STATS_INC(tg_execve_joined_info_map_stats, EDELETE);
 	}
 	/* We don't care here about -ENOENT as there is no guarantee entries
 	 * will be present anyway.
@@ -557,8 +587,17 @@ FUNC_INLINE struct execve_info *execve_joined_info_map_get(__u64 tid)
 _Static_assert(sizeof(struct execve_map_value) % 8 == 0,
 	       "struct execve_map_value should have size multiple of 8 bytes");
 
+#define SENT_FAILED_UNKNOWN 0 // unknown error
+#define SENT_FAILED_ENOENT  1 // ENOENT
+#define SENT_FAILED_E2BIG   2 // E2BIG
+#define SENT_FAILED_EBUSY   3 // EBUSY
+#define SENT_FAILED_EINVAL  4 // EINVAL
+#define SENT_FAILED_ENOSPC  5 // ENOSPC
+#define SENT_FAILED_EAGAIN  6 // EAGAIN
+#define SENT_FAILED_MAX	    7
+
 struct kernel_stats {
-	__u64 sent_failed[256];
+	__u64 sent_failed[256][SENT_FAILED_MAX];
 };
 
 struct {
@@ -569,18 +608,138 @@ struct {
 } tg_stats_map SEC(".maps");
 
 FUNC_INLINE void
-perf_event_output_metric(void *ctx, u8 metric, void *map, u64 flags, void *data, u64 size)
+event_output_update_error_metric(u8 msg_op, long err)
 {
 	struct kernel_stats *valp;
 	__u32 zero = 0;
+
+	valp = map_lookup_elem(&tg_stats_map, &zero);
+	if (valp) {
+		switch (err) {
+		case -2: // ENOENT
+			lock_add(&valp->sent_failed[msg_op][SENT_FAILED_ENOENT], 1);
+			break;
+		case -7: // E2BIG
+			lock_add(&valp->sent_failed[msg_op][SENT_FAILED_E2BIG], 1);
+			break;
+		case -11: // EAGAIN
+			lock_add(&valp->sent_failed[msg_op][SENT_FAILED_EAGAIN], 1);
+			break;
+		case -16: // EBUSY
+			lock_add(&valp->sent_failed[msg_op][SENT_FAILED_EBUSY], 1);
+			break;
+		case -22: // EINVAL
+			lock_add(&valp->sent_failed[msg_op][SENT_FAILED_EINVAL], 1);
+			break;
+		case -28: // ENOSPC
+			lock_add(&valp->sent_failed[msg_op][SENT_FAILED_ENOSPC], 1);
+			break;
+		default:
+			lock_add(&valp->sent_failed[msg_op][SENT_FAILED_UNKNOWN], 1);
+			break;
+		}
+	}
+}
+
+FUNC_INLINE bool
+perf_event_output_metric(void *ctx, u8 msg_op, void *map, u64 flags, void *data, u64 size)
+{
 	long err;
 
 	err = perf_event_output(ctx, map, flags, data, size);
 	if (err < 0) {
-		valp = map_lookup_elem(&tg_stats_map, &zero);
-		if (valp)
-			__sync_fetch_and_add(&valp->sent_failed[metric], 1);
+		event_output_update_error_metric(msg_op, err);
+		return false;
 	}
+
+	return true;
 }
 
+#ifdef __V511_BPF_PROG
+FUNC_INLINE long
+event_output(void *ctx, void *data, u64 size)
+{
+	if (CONFIG(USE_PERF_RING_BUF))
+		return perf_event_output(ctx, &tcpmon_map, BPF_F_CURRENT_CPU, data, size);
+	return ringbuf_output(&tg_rb_events, data, size, 0);
+}
+
+FUNC_INLINE bool
+event_output_metric(void *ctx, u8 msg_op, void *data, u64 size)
+{
+	long err;
+
+	if (CONFIG(USE_PERF_RING_BUF))
+		return perf_event_output_metric(ctx, msg_op, &tcpmon_map, BPF_F_CURRENT_CPU, data, size);
+
+	err = ringbuf_output(&tg_rb_events, data, size, 0);
+
+	if (err < 0) {
+		event_output_update_error_metric(msg_op, err);
+		return false;
+	}
+
+	return true;
+}
+#else
+FUNC_INLINE long
+event_output(void *ctx, void *data, u64 size)
+{
+	return perf_event_output(ctx, &tcpmon_map, BPF_F_CURRENT_CPU, data, size);
+}
+
+FUNC_INLINE bool
+event_output_metric(void *ctx, u8 msg_op, void *data, u64 size)
+{
+	return perf_event_output_metric(ctx, msg_op, &tcpmon_map, BPF_F_CURRENT_CPU, data, size);
+}
+#endif
+
+/**
+ * read_exe() Reads the path from the backing executable file of the current
+ * process.
+ *
+ * The executable file of a process can change using the prctl() system call
+ * and PR_SET_MM_EXE_FILE. Thus, this function should only be used under the
+ * execve path since the executable file is locked and usually there is only
+ * one remaining thread at its exit path.
+ */
+#ifdef __LARGE_BPF_PROG
+FUNC_INLINE __u32
+read_exe(struct task_struct *task, struct heap_exe *exe)
+{
+	struct file *file = BPF_CORE_READ(task, mm, exe_file);
+	struct path *path = __builtin_preserve_access_index(&file->f_path);
+	__u64 offset = 0;
+	__u64 revlen = STRING_POSTFIX_MAX_LENGTH - 1;
+
+	// we need to walk the complete 4096 len dentry in order to have an accurate
+	// matching on the prefix operators, even if we only keep a subset of that
+	char *buffer;
+
+	buffer = d_path_local(path, (int *)&exe->len, (int *)&exe->error);
+	if (!buffer)
+		return 0;
+
+	if (exe->len > STRING_POSTFIX_MAX_LENGTH - 1)
+		offset = exe->len - (STRING_POSTFIX_MAX_LENGTH - 1);
+	else
+		revlen = exe->len;
+	// buffer used by d_path_local can contain up to MAX_BUF_LEN i.e. 4096 we
+	// only keep the first 255 chars for our needs (we sacrifice one char to the
+	// verifier for the > 0 check)
+	if (exe->len > BINARY_PATH_MAX_LEN - 1)
+		exe->len = BINARY_PATH_MAX_LEN - 1;
+	asm volatile("%[len] &= 0xff;\n"
+		     : [len] "+r"(exe->len));
+	with_errmetrics(probe_read, exe->buf, exe->len, buffer);
+	if (revlen < STRING_POSTFIX_MAX_LENGTH) {
+		if (offset > MAX_BUF_LEN)
+			offset = MAX_BUF_LEN;
+
+		with_errmetrics(probe_read, exe->end, revlen, (char *)(buffer + offset));
+	}
+	return exe->len;
+}
+#endif
 #endif //_PROCESS__

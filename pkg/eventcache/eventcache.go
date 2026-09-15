@@ -9,10 +9,9 @@ import (
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/ktime"
-	"github.com/cilium/tetragon/pkg/metrics/eventcachemetrics"
+	"github.com/cilium/tetragon/pkg/logger"
 	"github.com/cilium/tetragon/pkg/option"
 	"github.com/cilium/tetragon/pkg/process"
-	"github.com/cilium/tetragon/pkg/reader/node"
 	"github.com/cilium/tetragon/pkg/reader/notify"
 	"github.com/cilium/tetragon/pkg/server"
 )
@@ -24,16 +23,8 @@ const (
 	FROM_EV_CACHE
 )
 
-const (
-	// garbage collection retries
-	CacheStrikes = 15
-	// garbage collection run interval
-	EventRetryTimer = time.Second * 2
-)
-
 var (
-	cache    *Cache
-	nodeName string
+	cache *Cache
 )
 
 type CacheObj struct {
@@ -49,14 +40,15 @@ type Cache struct {
 	objsChan chan CacheObj
 	done     chan bool
 	cache    []CacheObj
-	server   *server.Server
+	notifier server.Notifier
 	dur      time.Duration
 }
 
 var (
-	ErrFailedToGetPodInfo     = errors.New("failed to get pod info from event cache")
-	ErrFailedToGetProcessInfo = errors.New("failed to get process info from event cache")
-	ErrFailedToGetParentInfo  = errors.New("failed to get parent info from event cache")
+	ErrFailedToGetPodInfo       = errors.New("failed to get pod info from event cache")
+	ErrFailedToGetProcessInfo   = errors.New("failed to get process info from event cache")
+	ErrFailedToGetParentInfo    = errors.New("failed to get parent info from event cache")
+	ErrFailedToGetAncestorsInfo = errors.New("failed to get ancestors info from event cache")
 )
 
 // Generic internal lookup happens when events are received out of order and
@@ -66,10 +58,36 @@ func HandleGenericInternal(ev notify.Event, pid uint32, tid *uint32, timestamp u
 	internal, parent := process.GetParentProcessInternal(pid, timestamp)
 	var err error
 
+	eventType := notify.EventType(ev)
+	if option.AncestorsEnabled(eventType) && internal.NeededAncestors() {
+		// We do not need to try to recollect all ancestors starting from the immediate parent here,
+		// if we already collected some of them in previous attempts. So, if we already have a number
+		// of ancestors collected, we just need to try to resume the collection process from the last
+		// known ancestor.
+		tetragonAncestors := ev.GetAncestors()
+		var nextExecId string
+
+		if len(tetragonAncestors) == 0 {
+			nextExecId = internal.UnsafeGetProcess().ParentExecId
+		} else {
+			nextExecId = tetragonAncestors[len(tetragonAncestors)-1].ExecId
+		}
+
+		if ancestors, perr := process.GetAncestorProcessesInternal(nextExecId); perr == nil {
+			for _, ancestor := range ancestors {
+				tetragonAncestors = append(tetragonAncestors, ancestor.UnsafeGetProcess())
+			}
+			ev.SetAncestors(tetragonAncestors)
+		} else {
+			CacheRetries(AncestorsInfo).Inc()
+			err = ErrFailedToGetAncestorsInfo
+		}
+	}
+
 	if parent != nil {
 		ev.SetParent(parent.UnsafeGetProcess())
 	} else {
-		eventcachemetrics.EventCacheRetries(eventcachemetrics.ParentInfo).Inc()
+		CacheRetries(ParentInfo).Inc()
 		err = ErrFailedToGetParentInfo
 	}
 
@@ -85,7 +103,7 @@ func HandleGenericInternal(ev notify.Event, pid uint32, tid *uint32, timestamp u
 		process.UpdateEventProcessTid(proc, tid)
 		ev.SetProcess(proc)
 	} else {
-		eventcachemetrics.EventCacheRetries(eventcachemetrics.ProcessInfo).Inc()
+		CacheRetries(ProcessInfo).Inc()
 		err = ErrFailedToGetProcessInfo
 	}
 
@@ -102,7 +120,7 @@ func HandleGenericInternal(ev notify.Event, pid uint32, tid *uint32, timestamp u
 func HandleGenericEvent(internal *process.ProcessInternal, ev notify.Event, tid *uint32) error {
 	p := internal.UnsafeGetProcess()
 	if option.Config.EnableK8s && p.Pod == nil {
-		eventcachemetrics.EventCacheRetries(eventcachemetrics.PodInfo).Inc()
+		CacheRetries(PodInfo).Inc()
 		return ErrFailedToGetPodInfo
 	}
 
@@ -120,6 +138,10 @@ func HandleGenericEvent(internal *process.ProcessInternal, ev notify.Event, tid 
 }
 
 func (ec *Cache) handleEvents() {
+	// We reuse the same underlying array for the slice as it's efficient
+	// for this hot path.  This pattern is risky as the downside is that the
+	// slice capacity can only grow and never shrink back.  See after slice
+	// modification how we use slices.Clip to reduce the capacity.
 	tmp := ec.cache[:0]
 	for _, event := range ec.cache {
 		var err error
@@ -136,30 +158,43 @@ func (ec *Cache) handleEvents() {
 		}
 		if err != nil {
 			event.color++
-			if event.color < CacheStrikes {
+			if event.color < option.Config.EventCacheNumRetries {
 				tmp = append(tmp, event)
 				continue
 			}
+			eventType := notify.EventType(event.event).String()
 			if errors.Is(err, ErrFailedToGetParentInfo) {
-				eventcachemetrics.ParentInfoError(notify.EventType(event.event)).Inc()
+				failedFetches.WithLabelValues(eventType, ParentInfo.String()).Inc()
 			} else if errors.Is(err, ErrFailedToGetProcessInfo) {
-				eventcachemetrics.ProcessInfoError(notify.EventType(event.event)).Inc()
+				failedFetches.WithLabelValues(eventType, ProcessInfo.String()).Inc()
+			} else if errors.Is(err, ErrFailedToGetAncestorsInfo) {
+				failedFetches.WithLabelValues(eventType, AncestorsInfo.String()).Inc()
 			} else if errors.Is(err, ErrFailedToGetPodInfo) {
-				eventcachemetrics.PodInfoError(notify.EventType(event.event)).Inc()
+				failedFetches.WithLabelValues(eventType, PodInfo.String()).Inc()
 			}
 		}
 
 		if event.msg.Notify() {
 			processedEvent := &tetragon.GetEventsResponse{
-				Event:    event.event.Encapsulate(),
-				NodeName: nodeName,
-				Time:     ktime.ToProto(event.timestamp),
+				Event: event.event.Encapsulate(),
+				Time:  ktime.ToProto(event.timestamp),
 			}
 
-			ec.server.NotifyListeners(event.msg, processedEvent)
+			ec.notifier.NotifyListener(event.msg, processedEvent)
 		}
 	}
-	ec.cache = tmp
+	if len(tmp)*2 < cap(tmp) {
+		// This is the slow path, allocate a new underlying array with
+		// less capacity and thus make the old backing memory a
+		// candidate for garbage collection. This allows the slice to
+		// shrink to size 0 again and let the GC collected what might
+		// remain in the "capacity" of the slice.
+		newSlice := make([]CacheObj, len(tmp))
+		copy(newSlice, tmp)
+		ec.cache = newSlice
+	} else {
+		ec.cache = tmp
+	}
 }
 
 func (ec *Cache) loop() {
@@ -169,14 +204,14 @@ func (ec *Cache) loop() {
 	for {
 		select {
 		case <-ticker.C:
-			/* Every 'EventRetryTimer' walk the slice of events pending pod info. If
-			 * an event hasn't completed its podInfo after two iterations send the
-			 * event anyways.
+			/* Every 'option.Config.EventCacheRetryDelay' seconds walk the slice of events
+			 * pending pod info. If an event hasn't completed its podInfo after two iterations
+			 * send the event anyways.
 			 */
 			ec.handleEvents()
 
 		case event := <-ec.objsChan:
-			eventcachemetrics.EventCacheCount.Inc()
+			cacheInserts.Inc()
 			ec.cache = append(ec.cache, event)
 
 		case <-ec.done:
@@ -215,6 +250,18 @@ func (ec *Cache) Needed(proc *tetragon.Process) bool {
 	return false
 }
 
+func (ec *Cache) NeededAncestors(parent *process.ProcessInternal, ancestors []*process.ProcessInternal) bool {
+	if parent.NeededAncestors() {
+		if len(ancestors) == 0 {
+			return true
+		}
+		if ancestors[len(ancestors)-1].UnsafeGetProcess().Pid.Value > 2 {
+			return true
+		}
+	}
+	return false
+}
+
 func (ec *Cache) Add(internal *process.ProcessInternal,
 	e notify.Event,
 	t uint64,
@@ -223,25 +270,26 @@ func (ec *Cache) Add(internal *process.ProcessInternal,
 	ec.objsChan <- CacheObj{internal: internal, event: e, timestamp: t, startTime: s, msg: msg}
 }
 
-func NewWithTimer(s *server.Server, dur time.Duration) *Cache {
+func NewWithTimer(n server.Notifier, dur time.Duration) *Cache {
 	if cache != nil {
 		cache.done <- true
 	}
+
+	logger.GetLogger().Info("Creating new EventCache", "retries", option.Config.EventCacheNumRetries, "delay", dur)
 
 	cache = &Cache{
 		objsChan: make(chan CacheObj),
 		done:     make(chan bool),
 		cache:    make([]CacheObj, 0),
-		server:   s,
+		notifier: n,
 		dur:      dur,
 	}
-	nodeName = node.GetNodeNameForExport()
 	go cache.loop()
 	return cache
 }
 
-func New(s *server.Server) *Cache {
-	return NewWithTimer(s, EventRetryTimer)
+func New(n server.Notifier) *Cache {
+	return NewWithTimer(n, time.Second*time.Duration(option.Config.EventCacheRetryDelay))
 }
 
 func Get() *Cache {

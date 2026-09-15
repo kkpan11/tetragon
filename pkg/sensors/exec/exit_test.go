@@ -1,41 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package exec
 
 import (
-	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os/exec"
-	"sync"
+	"strconv"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
 	"github.com/cilium/tetragon/pkg/jsonchecker"
 	sm "github.com/cilium/tetragon/pkg/matchers/stringmatcher"
-	"github.com/cilium/tetragon/pkg/observer/observertesthelper"
 	"github.com/cilium/tetragon/pkg/testutils"
-	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
-	"github.com/sirupsen/logrus"
-	"github.com/stretchr/testify/assert"
 )
 
-func TestExit(t *testing.T) {
-	var doneWG, readyWG sync.WaitGroup
-	defer doneWG.Wait()
-
-	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
-	defer cancel()
-
-	obs, err := observertesthelper.GetDefaultObserver(t, ctx, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
-	if err != nil {
-		t.Fatalf("Failed to run observer: %s", err)
-	}
-	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
-	readyWG.Wait()
-
+func testExit(t *testing.T) {
 	testNop := testutils.RepoRootPath("contrib/tester-progs/nop")
 
 	procChecker := ec.NewProcessChecker().
@@ -50,24 +40,11 @@ func TestExit(t *testing.T) {
 		t.Fatalf("Failed to execute test binary: %s\n", err)
 	}
 
-	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	err := jsonchecker.JsonTestCheck(t, checker)
+	require.NoError(t, err)
 }
 
-func TestExitLeader(t *testing.T) {
-	var doneWG, readyWG sync.WaitGroup
-	defer doneWG.Wait()
-
-	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
-	defer cancel()
-
-	obs, err := observertesthelper.GetDefaultObserver(t, ctx, tus.Conf().TetragonLib)
-	if err != nil {
-		t.Fatalf("Failed to run observer: %s", err)
-	}
-	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
-	readyWG.Wait()
-
+func testExitLeader(t *testing.T) {
 	testExitLeader := testutils.RepoRootPath("contrib/tester-progs/exit-leader")
 
 	var startTime, exitTime time.Time
@@ -77,7 +54,7 @@ func TestExitLeader(t *testing.T) {
 	// run for 3 seconds and exits. We verify that we get exit event 3
 	// seconds after the start.
 
-	nextCheck := func(event ec.Event, _ *logrus.Logger) (bool, error) {
+	nextCheck := func(event ec.Event, _ *slog.Logger) (bool, error) {
 		switch ev := event.(type) {
 		case *tetragon.ProcessExec:
 			if ev.Process.Binary == testExitLeader {
@@ -93,7 +70,7 @@ func TestExitLeader(t *testing.T) {
 		return false, nil
 	}
 
-	finalCheck := func(_ *logrus.Logger) error {
+	finalCheck := func(_ *slog.Logger) error {
 		delta := exitTime.Sub(startTime)
 
 		fmt.Printf("execTime %v\n", startTime)
@@ -101,7 +78,7 @@ func TestExitLeader(t *testing.T) {
 		fmt.Printf("delta %v\n", delta)
 
 		if delta < 5*time.Second {
-			return fmt.Errorf("unexpected delta < 5 seconds")
+			return errors.New("unexpected delta < 5 seconds")
 		}
 		return nil
 	}
@@ -130,23 +107,9 @@ func TestExitLeader(t *testing.T) {
 //   - once this happens, the thread (which continues to run) will exec a /bin/echo command
 //
 // In our test we check that the parent of the /bin/echo command is the exit-tester program.
-func TestExitZombie(t *testing.T) {
-	var doneWG, readyWG sync.WaitGroup
-	defer doneWG.Wait()
-
-	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
-	defer cancel()
-
-	t.Logf("starting observer")
-	obs, err := observertesthelper.GetDefaultObserver(t, ctx, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
-	if err != nil {
-		t.Fatalf("GetDefaultObserverWithFile error: %s", err)
-	}
-	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
-	readyWG.Wait()
-
+func testExitZombie(t *testing.T) {
 	testBin := testutils.RepoRootPath("contrib/tester-progs/exit-tester")
-	testCmd := exec.CommandContext(ctx, testBin)
+	testCmd := exec.Command(testBin)
 	testPipes, err := testutils.NewCmdBufferedPipes(testCmd)
 	if err != nil {
 		t.Fatal(err)
@@ -161,7 +124,7 @@ func TestExitZombie(t *testing.T) {
 	logWG.Wait()
 
 	if err := testCmd.Wait(); err != nil {
-		t.Fatalf("command failed with %s. Context error: %v", err, ctx.Err())
+		t.Fatalf("command failed with %s", err)
 	}
 
 	exitTesterCheck := ec.NewProcessChecker().WithBinary(sm.Suffix("tester-progs/exit-tester"))
@@ -172,7 +135,7 @@ func TestExitZombie(t *testing.T) {
 	)
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 // TestExitCode tests whether we properly return the exit code of the process.
@@ -182,20 +145,7 @@ func TestExitZombie(t *testing.T) {
 //   - return a exit code
 //
 // In our test we check whether the observed exit code equals the real exit code.
-func TestExitCode(t *testing.T) {
-	var doneWG, readyWG sync.WaitGroup
-	defer doneWG.Wait()
-
-	ctx, cancel := context.WithTimeout(context.Background(), tus.Conf().CmdWaitTime)
-	defer cancel()
-
-	obs, err := observertesthelper.GetDefaultObserver(t, ctx, tus.Conf().TetragonLib, observertesthelper.WithMyPid())
-	if err != nil {
-		t.Fatalf("Failed to run observer: %s", err)
-	}
-	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
-	readyWG.Wait()
-
+func testExitCode(t *testing.T) {
 	testExitCodeBinary := testutils.RepoRootPath("contrib/tester-progs/exit-code")
 
 	// Test different exit codes
@@ -223,8 +173,8 @@ func TestExitCode(t *testing.T) {
 		// since Linux will return an unsigned integer after execution
 		expectedCode := uint8(testCaseCode)
 
-		if err := exec.Command(testExitCodeBinary, fmt.Sprint(testCaseCode)).Run(); err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
+		if err := exec.Command(testExitCodeBinary, strconv.Itoa(int(testCaseCode))).Run(); err != nil {
+			if exitErr := new(exec.ExitError); errors.As(err, &exitErr) {
 				if uint8(exitErr.ExitCode()) != expectedCode {
 					t.Errorf("unexpected: wanted exit code %d, execution returned %d", expectedCode, exitErr.ExitCode())
 				}
@@ -238,6 +188,47 @@ func TestExitCode(t *testing.T) {
 		)
 	}
 
-	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	err := jsonchecker.JsonTestCheck(t, checker)
+	require.NoError(t, err)
+}
+
+// TestExitSignal tests whether we properly return the exit signal of the process.
+// see: tester-progs/pause.c for the program we use to test this.
+//
+// The program will:
+//   - Pause until it receives a signal
+//
+// In our test we check whether the observed exit signal equals the real exit signal.
+func testExitSignal(t *testing.T) {
+	checker := ec.NewUnorderedEventChecker()
+	testExitSignalBinary := testutils.RepoRootPath("contrib/tester-progs/pause")
+
+	for sig := 1; sig <= 15; sig++ {
+		signal := syscall.Signal(sig)
+		expectedSignal := unix.SignalName(signal)
+		cmd := exec.Command(testExitSignalBinary)
+
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("failed to execute the test binary with signal %q: %s", expectedSignal, err)
+		}
+
+		if err := cmd.Process.Signal(signal); err != nil {
+			t.Fatalf("failed to send signal %q to the test binary: %s", expectedSignal, err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if exitErr := new(exec.ExitError); errors.As(err, &exitErr) {
+				if got := exitErr.Sys().(syscall.WaitStatus).Signal(); got != signal {
+					t.Errorf("unexpected: wanted signal %q, execution returned %q", signal, got)
+				}
+			}
+		}
+
+		checker.AddChecks(
+			ec.NewProcessExitChecker("exitSignal=" + expectedSignal).WithSignal(sm.Full(expectedSignal)),
+		)
+	}
+
+	err := jsonchecker.JsonTestCheck(t, checker)
+	require.NoError(t, err)
 }

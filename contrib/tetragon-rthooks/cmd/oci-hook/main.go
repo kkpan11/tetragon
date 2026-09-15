@@ -26,32 +26,37 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/cilium/lumberjack/v2"
-	"github.com/cilium/tetragon/api/v1/tetragon"
-	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
+	"github.com/opencontainers/cgroups/systemd"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
 )
 
 var (
 	binDir                          = getBinaryDir()
 	defaultLogFname                 = filepath.Join(binDir, "tetragon-oci-hook.log")
 	defaultConfFile                 = filepath.Join(binDir, "tetragon-oci-hook.json")
-	defaultAgentAddress             = "unix:///var/run/cilium/tetragon/tetragon.sock"
-	defaultAnnotationsNamespaceKeys = "io.kubernetes.pod.namespace,io.kubernetes.cri.sandbox-namespace"
-	defaultAllowNamspaces           = "kube-system"
+	defaultAgentAddress             = "unix:///var/run/tetragon/tetragon.sock"
+	defaultAnnotationsNamespaceKeys = []string{
+		"io.kubernetes.pod.namespace",
+		"io.kubernetes.cri.sandbox-namespace",
+	}
+	defaultAllowNamspaces = "kube-system"
 )
 
 var cliConf struct {
-	LogFname            string        `name:"log-fname" default:"${defLogFname}" help:"log output filename."`
-	LogLevel            string        `name:"log-level" default:"info" help:"log level"`
-	AgentAddr           string        `name:"grpc-address" default:"${defAgentAddress}" help:"Tetragon agent gRPC address"`
-	GrpcTimeout         time.Duration `name:"grpc-timeout" default:"10s" help:"timeout for connecting to the agent"`
-	DisableGrpc         bool          `name:"disable-grpc" default:false help:"do not connect to the agent. Instead, write a message to the log"`
-	JustPrintConfig     bool          `name:"just-print-config" default:false help:"just print the config and exit"`
-	AnnNamespaceKeys    []string      `name:"annotations-namespace-key" default:"${defAnnotationsNamespaceKeys}" help:"Runtime annotation keys for accessing k8s namespace"`
-	FailCelUser         string        `name:"fail-cel-expr" help:"CEL expression to decide whether to fail (and stop container from starting) or not"`
-	FailAllowNamespaces []string      `name:"fail-allow-namespaces" default:"${defAllowNamespaces}" help:"The hook will not fail for the specified namespaces, as determined by runtime annotation labels. Flag will be ignored if fail-cel-expr is set."`
+	LogFname                 string        `name:"log-fname" default:"${defLogFname}" help:"log output filename."`
+	LogLevel                 string        `name:"log-level" default:"info" help:"log level"`
+	AgentAddr                string        `name:"grpc-address" default:"${defAgentAddress}" help:"Tetragon agent gRPC address"`
+	GrpcTimeout              time.Duration `name:"grpc-timeout" default:"10s" help:"timeout for connecting to the agent"`
+	DisableGrpc              bool          `name:"disable-grpc" default:false help:"do not connect to the agent. Instead, write a message to the log"`
+	JustPrintConfig          bool          `name:"just-print-config" default:false help:"just print the config and exit"`
+	AnnNamespaceKeys         []string      `name:"annotations-namespace-key" default:"${defAnnotationsNamespaceKeys}" help:"Runtime annotation keys for accessing k8s namespace"`
+	FailCelUser              string        `name:"fail-cel-expr" help:"CEL expression to decide whether to fail (and stop container from starting) or not"`
+	FailAllowNamespaces      []string      `name:"fail-allow-namespaces" default:"${defAllowNamespaces}" help:"The hook will not fail for the specified namespaces, as determined by runtime annotation labels. Flag will be ignored if fail-cel-expr is set."`
+	FailAllowNamespacesRegex []string      `name:"fail-allow-namespaces-regex" help:"RE2 regex patterns for namespaces the hook will not fail for. Substring match by default; use ^ and $ anchors for full-string matching (e.g. '^kube-.*$'). Can be combined with --fail-allow-namespaces. Ignored if fail-cel-expr is set."`
 
 	HookName string `arg:"" name:"hook"`
 }
@@ -132,16 +137,111 @@ func getCgroupPath(spec *specs.Spec) (string, error) {
 
 func containerNameFromAnnotations(annotations map[string]string) string {
 	// containerd
+	// ref: https://github.com/containerd/containerd/blob/7f707b5e7970105723257d483394454049eabe47/internal/cri/annotations/annotations.go#L75-L76
+	//      https://github.com/containerd/containerd/blob/7f707b5e7970105723257d483394454049eabe47/internal/cri/nri/nri_api_linux.go#L721-L723
 	if val, ok := annotations["io.kubernetes.cri.container-name"]; ok {
 		return val
 	}
 
 	// crio
+	// ref: https://github.com/cri-o/cri-o/blob/cd3a03c9f7852227f8171e7698535610e41e2e29/server/nri-api.go#L597-L599
 	if val, ok := annotations["io.kubernetes.container.name"]; ok {
 		return val
 	}
 
 	return ""
+}
+
+func containerImageFromAnnotations(annotations map[string]string) string {
+	// containerd
+	// ref: https://github.com/containerd/containerd/blob/7f707b5e7970105723257d483394454049eabe47/internal/cri/annotations/annotations.go#L78-L79
+	if val, ok := annotations["io.kubernetes.cri.image-name"]; ok { // example value "docker.io/library/ubuntu:22.04"
+		return val
+	}
+
+	// crio
+	if val, ok := annotations["io.kubernetes.cri-o.ImageName"]; ok { // example value "docker.io/library/ubuntu:22.04"
+		return val
+	}
+
+	return ""
+}
+
+func containerIDFromAnnotations(annotations map[string]string) string {
+	// crio
+	// ref: https://github.com/cri-o/cri-o/blob/cd3a03c9f7852227f8171e7698535610e41e2e29/server/nri-api.go#L586-L591
+	//      https://github.com/cri-o/cri-o/blob/5fcc64c8d159e89c040928e4b0032f359a1c864e/pkg/annotations/internal.go#L8
+	if val, ok := annotations["io.kubernetes.cri-o.ContainerID"]; ok {
+		return val
+	}
+
+	// NB: containerd does not have the container id in the annotations
+	return ""
+}
+
+func podNameFromAnnotations(annotations map[string]string) string {
+	// containerd
+	// ref: https://github.com/containerd/containerd/blob/7f707b5e7970105723257d483394454049eabe47/internal/cri/annotations/annotations.go#L72-L73
+	if val, ok := annotations["io.kubernetes.cri.sandbox-name"]; ok {
+		return val
+	}
+
+	// crio
+	// ref: https://github.com/cri-o/cri-o/blob/cd3a03c9f7852227f8171e7698535610e41e2e29/vendor/k8s.io/kubelet/pkg/types/labels.go#L21
+	//      (not sure how the label ends up in annotations though)
+	if val, ok := annotations["io.kubernetes.pod.name"]; ok {
+		return val
+	}
+
+	return ""
+}
+
+func podUIDFromAnnotations(annotations map[string]string) string {
+	// containerd
+	// ref: https://github.com/containerd/containerd/blob/7f707b5e7970105723257d483394454049eabe47/internal/cri/annotations/annotations.go#L67-L70
+	if val, ok := annotations["io.kubernetes.cri.sandbox-uid"]; ok {
+		return val
+	}
+
+	// crio
+	// ref: https://github.com/cri-o/cri-o/blob/cd3a03c9f7852227f8171e7698535610e41e2e29/vendor/k8s.io/kubelet/pkg/types/labels.go#L23
+	//      (not sure how the label ends up in annotations though)
+	if val, ok := annotations["io.kubernetes.pod.uid"]; ok {
+		return val
+	}
+
+	return ""
+
+}
+
+func podNamespaceFromAnnotations(annotations map[string]string) string {
+	// containerd
+	// ref: https://github.com/containerd/containerd/blob/7f707b5e7970105723257d483394454049eabe47/internal/cri/annotations/annotations.go#L64-L65
+	if val, ok := annotations["io.kubernetes.cri.sandbox-namespace"]; ok {
+		return val
+	}
+
+	// crio
+	// ref: https://github.com/cri-o/cri-o/blob/cd3a03c9f7852227f8171e7698535610e41e2e29/vendor/k8s.io/kubelet/pkg/types/labels.go#L22
+	//      (not sure how the label ends up in annotations though)
+	if val, ok := annotations["io.kubernetes.pod.namespace"]; ok {
+		return val
+	}
+
+	return ""
+}
+
+func getMountsFromSpec(spec *specs.Spec) []*tetragon.Mount {
+	var containerMounts []*tetragon.Mount
+	for _, m := range spec.Mounts {
+		containerMounts = append(containerMounts, &tetragon.Mount{
+			Destination: m.Destination,
+			Type:        m.Type,
+			Source:      m.Source,
+			Options:     m.Options,
+		})
+	}
+	return containerMounts
 }
 
 // NB: the second argument is only used in case of an error, so disable revive's complains
@@ -192,23 +292,42 @@ func createContainerHook(log *slog.Logger) (error, map[string]string) {
 		return errors.New("unable to determine either RootDir or cgroupPath, bailing out"), nil
 	}
 
-	containerName := containerNameFromAnnotations(spec.Annotations)
+	// We expect the rootDir to be the root directory of the container.
+	// In "containerd (createContainer)" and "cri-o" we are already in the
+	// container root directory. In "containerd (createRuntime)" we need to
+	// append the rootDir the root path from the spec.
+	if configName == filepath.Join(rootDir, "config.json") {
+		rootDir = path.Join(rootDir, spec.Root.Path)
+	}
+
+	createContainer := &tetragon.CreateContainer{
+		CgroupsPath:    cgroupPath,
+		RootDir:        rootDir,
+		ContainerName:  containerNameFromAnnotations(spec.Annotations),
+		ContainerID:    containerIDFromAnnotations(spec.Annotations),
+		ContainerImage: containerImageFromAnnotations(spec.Annotations),
+		PodName:        podNameFromAnnotations(spec.Annotations),
+		PodUID:         podUIDFromAnnotations(spec.Annotations),
+		PodNamespace:   podNamespaceFromAnnotations(spec.Annotations),
+		Annotations:    spec.Annotations,
+		Mounts:         getMountsFromSpec(spec),
+	}
 
 	req := &tetragon.RuntimeHookRequest{
 		Event: &tetragon.RuntimeHookRequest_CreateContainer{
-			CreateContainer: &tetragon.CreateContainer{
-				CgroupsPath:   cgroupPath,
-				RootDir:       rootDir,
-				Annotations:   spec.Annotations,
-				ContainerName: containerName,
-			},
+			CreateContainer: createContainer,
 		},
 	}
 
 	log = log.With(
 		"req-cgroups", cgroupPath,
 		"req-rootdir", rootDir,
-		"req-containerName", containerName,
+		"req-containerName", createContainer.ContainerName,
+		"req-containerID", createContainer.ContainerID,
+		"req-containerImage", createContainer.ContainerImage,
+		"req-podName", createContainer.PodName,
+		"req-podUID", createContainer.PodUID,
+		"req-podNamespace", createContainer.PodNamespace,
 	)
 	if log.Enabled(context.TODO(), slog.LevelDebug) {
 		// NB: only add annotations in debug level since they are too noisy
@@ -248,14 +367,10 @@ func checkFail(log *slog.Logger, prog *celProg, annotations map[string]string) e
 }
 
 func failTestProg() (*celProg, error) {
-	var ret *celProg
-	var err error
 	if expr := cliConf.FailCelUser; expr != "" {
-		ret, err = celUserExpr(expr)
-	} else {
-		ret, err = celAllowNamespaces(cliConf.FailAllowNamespaces)
+		return celUserExpr(expr)
 	}
-	return ret, err
+	return celAllowNamespacesWithPatterns(cliConf.FailAllowNamespaces, cliConf.FailAllowNamespacesRegex)
 }
 
 type logHandler struct {
@@ -276,7 +391,7 @@ func main() {
 		kong.Vars{
 			"defLogFname":                 defaultLogFname,
 			"defAgentAddress":             defaultAgentAddress,
-			"defAnnotationsNamespaceKeys": defaultAnnotationsNamespaceKeys,
+			"defAnnotationsNamespaceKeys": strings.Join(defaultAnnotationsNamespaceKeys, ","),
 			"defAllowNamespaces":          defaultAllowNamspaces,
 		},
 		kong.Configuration(kong.JSON, defaultConfFile),

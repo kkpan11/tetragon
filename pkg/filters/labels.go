@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !nok8s
+
 package filters
 
 import (
 	"context"
 	"fmt"
 
-	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
-	hubbleFilters "github.com/cilium/cilium/pkg/hubble/filters"
-	k8sLabels "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/labels"
 	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/event"
+	k8sLabels "github.com/cilium/tetragon/pkg/k8s/slim/k8s/apis/labels"
 )
 
 // FilterByLabelSelectors returns a FilterFunc. The FilterFunc returns true if and only if any of the
 // specified selectors select the event. The caller specifies how to extract labels from the event.
-func FilterByLabelSelectors(labelSelectors []string) (hubbleFilters.FilterFunc, error) {
+func FilterByLabelSelectors(labelSelectors []string) (FilterFunc, error) {
 	selectors := make([]k8sLabels.Selector, 0, len(labelSelectors))
 	for _, selector := range labelSelectors {
 		s, err := k8sLabels.Parse(selector)
@@ -24,7 +25,7 @@ func FilterByLabelSelectors(labelSelectors []string) (hubbleFilters.FilterFunc, 
 		}
 		selectors = append(selectors, s)
 	}
-	return func(ev *v1.Event) bool {
+	return func(ev *event.Event) bool {
 		process := GetProcess(ev)
 		if process == nil || process.Pod == nil {
 			return false
@@ -43,13 +44,13 @@ func FilterByLabelSelectors(labelSelectors []string) (hubbleFilters.FilterFunc, 
 type LabelsFilter struct{}
 
 // OnBuildFilter builds a labels filter
-func (l *LabelsFilter) OnBuildFilter(_ context.Context, filter *tetragon.Filter) ([]hubbleFilters.FilterFunc, error) {
-	var fs []hubbleFilters.FilterFunc
+func (l *LabelsFilter) OnBuildFilter(_ context.Context, filter *tetragon.Filter) ([]FilterFunc, error) {
+	var fs []FilterFunc
 
 	if filter.Labels != nil {
 		slf, err := FilterByLabelSelectors(filter.Labels)
 		if err != nil {
-			return nil, fmt.Errorf("invalid pod label filter: %v", err)
+			return nil, fmt.Errorf("invalid pod label filter: %w", err)
 		}
 		fs = append(fs, slf)
 	}

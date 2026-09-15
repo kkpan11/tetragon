@@ -41,6 +41,19 @@ enum {
 	// more socket ops
 	op_filter_family = 28,
 	op_filter_state = 29,
+	// capability ops
+	op_capabilities_gained = 30,
+	// range
+	op_in_range = 31,
+	op_notin_range = 32,
+	// match substring
+	op_substring = 33,
+	op_substring_igncase = 34,
+	// CEL expression
+	op_cel_expr = 35,
+	// file type
+	op_filter_file_type = 36,
+	op_filter_not_file_type = 37,
 };
 
 #endif // __OPERATIONS_H__

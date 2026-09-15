@@ -4,47 +4,36 @@
 package errormetrics
 
 import (
-	"fmt"
+	"maps"
+	"slices"
+	"strconv"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/cilium/tetragon/pkg/api/ops"
+	"github.com/cilium/tetragon/pkg/metrics"
 	"github.com/cilium/tetragon/pkg/metrics/consts"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 type ErrorType int
 
 const (
-	// Process not found on get() call.
-	ProcessCacheMissOnGet ErrorType = iota
-	// Process evicted from the cache.
-	ProcessCacheEvicted
-	// Process not found on remove() call.
-	ProcessCacheMissOnRemove
 	// Tid and Pid mismatch that could affect BPF and user space caching logic
-	ProcessPidTidMismatch
-	// An event is missing process info.
-	EventMissingProcessInfo
-	// An error occurred in an event handler.
-	HandlerError
+	ProcessPidTidMismatchExec ErrorType = iota
+	ProcessPidTidMismatchClone
+	ProcessPidTidMismatchExit
 	// An event finalizer on Process failed
 	EventFinalizeProcessInfoFailed
 	// Failed to resolve Process uid to username
 	ProcessMetadataUsernameFailed
-	// The username resolution was skipped since the process is not in host
-	// namespaces.
-	ProcessMetadataUsernameIgnoredNotInHost
 )
 
 var errorTypeLabelValues = map[ErrorType]string{
-	ProcessCacheMissOnGet:                   "process_cache_miss_on_get",
-	ProcessCacheEvicted:                     "process_cache_evicted",
-	ProcessCacheMissOnRemove:                "process_cache_miss_on_remove",
-	ProcessPidTidMismatch:                   "process_pid_tid_mismatch",
-	EventMissingProcessInfo:                 "event_missing_process_info",
-	HandlerError:                            "handler_error",
-	EventFinalizeProcessInfoFailed:          "event_finalize_process_info_failed",
-	ProcessMetadataUsernameFailed:           "process_metadata_username_failed",
-	ProcessMetadataUsernameIgnoredNotInHost: "process_metadata_username_ignored_not_in_host_namespaces",
+	ProcessPidTidMismatchExec:      "process_pid_tid_mismatch_exec",
+	ProcessPidTidMismatchClone:     "process_pid_tid_mismatch_clone",
+	ProcessPidTidMismatchExit:      "process_pid_tid_mismatch_exit",
+	EventFinalizeProcessInfoFailed: "event_finalize_process_info_failed",
+	ProcessMetadataUsernameFailed:  "process_metadata_username_failed",
 }
 
 func (e ErrorType) String() string {
@@ -56,11 +45,13 @@ type EventHandlerError int
 // TODO: Recognize different errors returned by individual handlers
 const (
 	HandlePerfUnknownOp EventHandlerError = iota
+	HandlePerfEmptyData
 	HandlePerfHandlerError
 )
 
 var eventHandlerErrorLabelValues = map[EventHandlerError]string{
 	HandlePerfUnknownOp:    "unknown_opcode",
+	HandlePerfEmptyData:    "perf_empty_data",
 	HandlePerfHandlerError: "event_handler_failed",
 }
 
@@ -69,44 +60,64 @@ func (e EventHandlerError) String() string {
 }
 
 var (
-	ErrorTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace:   consts.MetricsNamespace,
-		Name:        "errors_total",
-		Help:        "The total number of Tetragon errors. For internal use only.",
-		ConstLabels: nil,
-	}, []string{"type"})
+	// Constrained label for error type
+	errorTypeLabel = metrics.ConstrainedLabel{
+		Name:   "error",
+		Values: slices.Collect(maps.Values(errorTypeLabelValues)),
+	}
+	// Constrained label for handler error type
+	handlerErrTypeLabel = metrics.ConstrainedLabel{
+		Name:   "error",
+		Values: slices.Collect(maps.Values(eventHandlerErrorLabelValues)),
+	}
 
-	HandlerErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace:   consts.MetricsNamespace,
-		Name:        "handler_errors_total",
-		Help:        "The total number of event handler errors. For internal use only.",
-		ConstLabels: nil,
-	}, []string{"opcode", "error_type"})
+	ErrorTotal = metrics.MustNewCounter(
+		metrics.NewOpts(
+			consts.MetricsNamespace, "", "errors_total",
+			"The total number of Tetragon errors. For internal use only.",
+			nil, []metrics.ConstrainedLabel{errorTypeLabel}, nil,
+		),
+		nil,
+	)
+
+	HandlerErrors = metrics.MustNewCounter(
+		metrics.NewOpts(
+			consts.MetricsNamespace, "", "handler_errors_total",
+			"The total number of event handler errors. For internal use only.",
+			nil, []metrics.ConstrainedLabel{
+				metrics.OpCodeLabelWithUndef,
+				metrics.OpCodeNameLabelWithUndef,
+				handlerErrTypeLabel,
+			}, nil,
+		),
+		nil,
+	)
 )
 
-func InitMetrics(registry *prometheus.Registry) {
-	registry.MustRegister(ErrorTotal)
-	registry.MustRegister(HandlerErrors)
+func RegisterMetrics(group metrics.Group) {
+	group.MustRegister(ErrorTotal)
+	group.MustRegister(HandlerErrors)
+	group.MustRegister(DebugTotal)
+}
 
+func InitMetrics() {
 	// Initialize metrics with labels
 	for er := range errorTypeLabelValues {
 		GetErrorTotal(er).Add(0)
 	}
 	for opcode := range ops.OpCodeStrings {
-		if opcode != ops.MsgOpUndef && opcode != ops.MsgOpTest {
+		if opcode != ops.MSG_OP_UNDEF && opcode != ops.MSG_OP_TEST {
 			GetHandlerErrors(opcode, HandlePerfHandlerError).Add(0)
 		}
 	}
-	// NB: We initialize only ops.MsgOpUndef here, but unknown_opcode can occur for any opcode
+	// NB: We initialize only ops.MSG_OP_UNDEF here, but unknown_opcode can occur for any opcode
 	// that is not explicitly handled.
-	GetHandlerErrors(ops.MsgOpUndef, HandlePerfUnknownOp).Add(0)
+	GetHandlerErrors(ops.MSG_OP_UNDEF, HandlePerfUnknownOp).Add(0)
+	GetHandlerErrors(ops.MSG_OP_UNDEF, HandlePerfEmptyData).Add(0)
 
-	// NOTES:
-	// * op, msg_op, opcode - standardize on a label (+ add human-readable label)
-	// * error, error_type, type - standardize on a label
-	// * Delete errors_total{type="handler_error"} - it duplicates handler_errors_total
-	// * Consider further splitting errors_total
-	// * Rename handler_errors_total to event_handler_errors_total?
+	for er := range debugTypeLabelValues {
+		GetDebugTotal(er).Add(0)
+	}
 }
 
 // Get a new handle on an ErrorTotal metric for an ErrorType
@@ -121,7 +132,7 @@ func ErrorTotalInc(er ErrorType) {
 
 // Get a new handle on the HandlerErrors metric
 func GetHandlerErrors(opcode ops.OpCode, er EventHandlerError) prometheus.Counter {
-	return HandlerErrors.WithLabelValues(fmt.Sprint(int32(opcode)), er.String())
+	return HandlerErrors.WithLabelValues(strconv.Itoa(int(opcode)), opcode.String(), er.String())
 }
 
 // Increment the HandlerErrors metric

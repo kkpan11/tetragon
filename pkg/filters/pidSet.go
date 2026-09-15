@@ -5,10 +5,11 @@ package filters
 
 import (
 	"context"
+	"fmt"
+	"slices"
 
-	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
-	hubbleFilters "github.com/cilium/cilium/pkg/hubble/filters"
 	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/event"
 	"github.com/cilium/tetragon/pkg/logger"
 )
 
@@ -23,17 +24,15 @@ func checkPidSetMembership(pid uint32, pidSet []uint32, childCache ChildCache) b
 	// Check the original pidSet. The reason for doing this separately is that we never
 	// want to drop the original pidSet from the cache. Keeping this separately in a slice
 	// is an easy way to achieve this.
-	for _, p := range pidSet {
-		if pid == p {
-			return true
-		}
+	if slices.Contains(pidSet, pid) {
+		return true
 	}
 	// Fall back to childCache to check children.
 	_, ok := childCache[pid]
 	return ok
 }
 
-func doFilterByPidSet(ev *v1.Event, pidSet []uint32, childCache ChildCache, childCacheWarning *int) bool {
+func doFilterByPidSet(ev *event.Event, pidSet []uint32, childCache ChildCache, childCacheWarning *int) bool {
 	process := GetProcess(ev)
 	if process == nil {
 		return false
@@ -58,7 +57,7 @@ func doFilterByPidSet(ev *v1.Event, pidSet []uint32, childCache ChildCache, chil
 		// If we exceeded the pre-determined warning limit, log a warning message and
 		// double it.
 		if len(childCache) == *childCacheWarning {
-			logger.GetLogger().Warnf("pidSet filter cache has exceeded %d entries. To prevent excess memory usage, consider disabling it.", childCacheWarning)
+			logger.GetLogger().Warn(fmt.Sprintf("pidSet filter cache has exceeded %d entries. To prevent excess memory usage, consider disabling it.", childCacheWarning))
 			*childCacheWarning *= 2
 		}
 		return true
@@ -68,8 +67,8 @@ func doFilterByPidSet(ev *v1.Event, pidSet []uint32, childCache ChildCache, chil
 	return false
 }
 
-func filterByPidSet(pidSet []uint32, childCache ChildCache, childCacheWarning int) hubbleFilters.FilterFunc {
-	return func(ev *v1.Event) bool {
+func filterByPidSet(pidSet []uint32, childCache ChildCache, childCacheWarning int) FilterFunc {
+	return func(ev *event.Event) bool {
 		return doFilterByPidSet(ev, pidSet, childCache, &childCacheWarning)
 	}
 }
@@ -78,8 +77,8 @@ func filterByPidSet(pidSet []uint32, childCache ChildCache, childCacheWarning in
 // PID, up to maxChildCacheSize number of children.
 type PidSetFilter struct{}
 
-func (f *PidSetFilter) OnBuildFilter(_ context.Context, ff *tetragon.Filter) ([]hubbleFilters.FilterFunc, error) {
-	var fs []hubbleFilters.FilterFunc
+func (f *PidSetFilter) OnBuildFilter(_ context.Context, ff *tetragon.Filter) ([]FilterFunc, error) {
+	var fs []FilterFunc
 	if ff.PidSet != nil {
 		childCache := make(ChildCache)
 		childCacheWarning := 8192

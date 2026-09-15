@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !nok8s
+
 package rthooks
 
 import (
 	"context"
 	"fmt"
 
+	"go.uber.org/multierr"
+
 	v1 "github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/watcher"
-	"go.uber.org/multierr"
 )
 
 type Runner struct {
 	callbacks []Callbacks
-	watcher   watcher.K8sResourceWatcher
+	watcher   watcher.PodAccessor
 }
 
-// runHooks executes all registered callbacks
+// RunHooks executes all registered callbacks
 func (r *Runner) RunHooks(ctx context.Context, req *v1.RuntimeHookRequest) error {
 	if createReq := req.GetCreateContainer(); createReq != nil {
 		var ret error
@@ -42,7 +45,7 @@ func (r *Runner) registerCallbacks(cbs Callbacks) {
 }
 
 // WithWatcher sets the watcher on a runner
-func (r *Runner) WithWatcher(watcher watcher.K8sResourceWatcher) *Runner {
+func (r *Runner) WithWatcher(watcher watcher.PodAccessor) *Runner {
 	r.watcher = watcher
 	return r
 }

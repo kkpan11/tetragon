@@ -4,16 +4,20 @@
 package process
 
 import (
-	"encoding/base64"
 	"errors"
-	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/cilium/tetragon/pkg/constants"
 	"github.com/cilium/tetragon/pkg/fieldfilters"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
 	"github.com/cilium/tetragon/pkg/metrics/errormetrics"
-	"github.com/sirupsen/logrus"
+
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/api"
@@ -24,12 +28,9 @@ import (
 	"github.com/cilium/tetragon/pkg/reader/caps"
 	"github.com/cilium/tetragon/pkg/reader/exec"
 	"github.com/cilium/tetragon/pkg/reader/namespace"
-	"github.com/cilium/tetragon/pkg/reader/node"
 	"github.com/cilium/tetragon/pkg/reader/path"
 	"github.com/cilium/tetragon/pkg/reader/proc"
 	"github.com/cilium/tetragon/pkg/watcher"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 // ProcessInternal is the internal representation of a process.
@@ -48,41 +49,60 @@ type ProcessInternal struct {
 	// will be constructed on the fly when returning these extra fields
 	// about the binary during the corresponding ProcessExec only.
 	apiBinaryProp *tetragon.BinaryProperties
-	// garbage collector metadata
-	color  int // Writes should happen only inside gc select channel
-	refcnt uint32
+	// garbage collector metadata. color is accessed from the GC goroutine and
+	// concurrently read by dump()/getEntries() and the LRU eviction callback, so
+	// it is stored as an atomic and must only be touched via getColor/setColor.
+	color  atomic.Int32
+	refcnt atomic.Uint32
+	// parentRefcntDecreased tracks whether the parent reference count has been
+	// decreased for this process. This is used to avoid double parent-- when
+	// a process is evicted by the LRU and then handled by the exit handler.
+	parentRefcntDecreased bool
+	// refcntOps is a map of operations to refcnt change
+	// keys can be:
+	// - "process++": process increased refcnt (i.e. this process starts)
+	// - "process--": process decreased refcnt (i.e. this process exits)
+	// - "parent++": parent increased refcnt (i.e. a process starts that has this process as a parent)
+	// - "parent--": parent decreased refcnt (i.e. a process exits that has this process as a parent)
+	refcntOps map[string]int32
+	// protects the refcntOps map
+	refcntOpsLock sync.Mutex
 }
 
 var (
-	nodeName  string
 	procCache *Cache
-	k8s       watcher.K8sResourceWatcher
 )
 
 var (
 	ErrProcessInfoMissing = errors.New("failed process info missing")
 )
 
-func InitCache(w watcher.K8sResourceWatcher, size int) error {
+func InitCache(w watcher.PodAccessor, size int, GCInterval time.Duration) error {
 	var err error
 
 	if procCache != nil {
 		FreeCache()
 	}
 
-	nodeName = node.GetNodeNameForExport()
-	k8s = w
-	procCache, err = NewCache(size)
+	SetK8sWatcher(w)
+	procCache, err = NewCache(size, GCInterval)
 	if err != nil {
-		k8s = nil
+		SetK8sWatcher(nil)
 	}
 	return err
 }
 
+// SetK8sWatcher sets the k8s watcher used to retrieve pod metadata for
+// processes. This is independent of the process cache, so callers should
+// invoke it even when the process cache is disabled (e.g. via
+// --disable-process-cache) to ensure pod info is still attached to events.
+func SetK8sWatcher(w watcher.PodAccessor) {
+	k8s = w
+}
+
 func FreeCache() {
-	procCache.Purge()
+	procCache.purge()
 	procCache = nil
-	ProcessCacheTotal.Set(0)
 }
 
 // GetProcessCopy() duplicates tetragon.Process and returns it
@@ -93,7 +113,7 @@ func (pi *ProcessInternal) GetProcessCopy() *tetragon.Process {
 	pi.mu.Lock()
 	proc := proto.Clone(pi.process).(*tetragon.Process)
 	pi.mu.Unlock()
-	proc.Refcnt = atomic.LoadUint32(&pi.refcnt)
+	proc.Refcnt = pi.refcnt.Load()
 	return proc
 }
 
@@ -102,14 +122,16 @@ func (pi *ProcessInternal) GetProcessCopy() *tetragon.Process {
 func (pi *ProcessInternal) cloneInternalProcessCopy() *ProcessInternal {
 	pi.mu.Lock()
 	defer pi.mu.Unlock()
-	return &ProcessInternal{
+	npi := &ProcessInternal{
 		process:       proto.Clone(pi.process).(*tetragon.Process),
 		capabilities:  pi.capabilities,
 		apiCreds:      pi.apiCreds,
 		apiBinaryProp: pi.apiBinaryProp,
 		namespaces:    pi.namespaces,
-		refcnt:        1, // Explicitly initialize refcnt to 1
+		refcntOps:     map[string]int32{"process++": 1},
 	}
+	npi.refcnt.Store(1) // Explicitly initialize refcnt to 1
+	return npi
 }
 
 func (pi *ProcessInternal) AddPodInfo(pod *tetragon.Pod) {
@@ -156,7 +178,7 @@ func (pi *ProcessInternal) UnsafeGetProcess() *tetragon.Process {
 //     c. if it is a filesystem capability execution
 //     d. Execution of an unlinked binary (shm, memfd, or deleted binaries)
 //
-//     a b and c are subject to the --enable-process-creds flag
+//     a b and c are subject to the --enable-process-cred flag
 func (pi *ProcessInternal) UpdateExecOutsideCache(cred bool) (*tetragon.Process, bool) {
 	update := false
 	// Get reference on the process
@@ -200,7 +222,7 @@ func (pi *ProcessInternal) AnnotateProcess(cred, ns bool) error {
 	process := pi.getProcess()
 	defer pi.putProcess()
 	if process == nil {
-		return fmt.Errorf("Process is nil")
+		return errors.New("process is nil")
 	}
 	if cred {
 		process.Cap = pi.capabilities
@@ -212,16 +234,43 @@ func (pi *ProcessInternal) AnnotateProcess(cred, ns bool) error {
 	return nil
 }
 
-func (pi *ProcessInternal) RefDec() {
-	procCache.refDec(pi)
+func (pi *ProcessInternal) RefDec(reason string) {
+	procCache.refDec(pi, reason+"--")
 }
 
-func (pi *ProcessInternal) RefInc() {
-	procCache.refInc(pi)
+func (pi *ProcessInternal) RefInc(reason string) {
+	procCache.refInc(pi, reason+"++")
 }
 
 func (pi *ProcessInternal) RefGet() uint32 {
-	return atomic.LoadUint32(&pi.refcnt)
+	return pi.refcnt.Load()
+}
+
+func (pi *ProcessInternal) SetParentRefcntDecreased(val bool) {
+	pi.mu.Lock()
+	defer pi.mu.Unlock()
+	pi.parentRefcntDecreased = val
+}
+
+func (pi *ProcessInternal) GetParentRefcntDecreased() bool {
+	pi.mu.Lock()
+	defer pi.mu.Unlock()
+	return pi.parentRefcntDecreased
+}
+
+func (pi *ProcessInternal) getColor() processColor {
+	return processColor(pi.color.Load())
+}
+
+func (pi *ProcessInternal) setColor(c processColor) {
+	pi.color.Store(int32(c))
+}
+
+func (pi *ProcessInternal) NeededAncestors() bool {
+	if pi != nil && pi.process.Pid.Value > 2 {
+		return true
+	}
+	return false
 }
 
 // UpdateEventProcessTID Updates the Process.Tid of the event on the fly.
@@ -245,16 +294,32 @@ func UpdateEventProcessTid(process *tetragon.Process, tid *uint32) {
 	}
 }
 
-func GetProcessID(pid uint32, ktime uint64) string {
-	return base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%d:%d", nodeName, ktime, pid)))
-}
-
 func GetExecID(proc *tetragonAPI.MsgProcess) string {
 	return GetProcessID(proc.PID, proc.Ktime)
 }
 
 func GetExecIDFromKey(key *tetragonAPI.MsgExecveKey) string {
 	return GetProcessID(key.Pid, key.Ktime)
+}
+
+func getEnvironmentVariables(envs []string) []*tetragon.EnvVar {
+	res := []*tetragon.EnvVar{}
+
+	for _, v := range envs {
+		var key, val string
+
+		before, after, ok := strings.Cut(v, "=")
+		if !ok {
+			// unlikely, but let's not just ignore
+			key = "invalid"
+			val = v
+		} else {
+			key = before
+			val = after
+		}
+		res = append(res, &tetragon.EnvVar{Key: key, Value: val})
+	}
+	return res
 }
 
 // initProcessInternalExec() initialize and returns ProcessInternal and
@@ -264,7 +329,6 @@ func initProcessInternalExec(
 	parent tetragonAPI.MsgExecveKey,
 ) *ProcessInternal {
 	process := event.Process
-	containerID := event.Kube.Docker
 	args, cwd := ArgsDecoder(process.Args, process.Flags)
 	var parentExecID string
 	if parent.Pid != 0 {
@@ -274,19 +338,21 @@ func initProcessInternalExec(
 	}
 	creds := &event.Msg.Creds
 	execID := GetExecID(&process)
-	protoPod := GetPodInfo(containerID, process.Filename, args, process.NSPID)
+	var protoPod *tetragon.Pod
+	if option.Config.EnableK8s && event.Kube.Docker != "" {
+		protoPod = GetPodInfo(event.Kube.Docker, process.Filename, args, process.NSPID)
+	}
 	apiCaps := caps.GetMsgCapabilities(event.Msg.Creds.Cap)
 	binary := path.GetBinaryAbsolutePath(process.Filename, cwd)
 	apiNs, err := namespace.GetMsgNamespaces(event.Msg.Namespaces)
 	if err != nil {
-		logger.GetLogger().WithFields(logrus.Fields{
-			"event.name":            "Execve",
-			"event.process.pid":     process.PID,
-			"event.process.tid":     process.TID,
-			"event.process.binary":  binary,
-			"event.process.exec_id": execID,
-			"event.parent.exec_id":  parentExecID,
-		}).Warn("ExecveEvent: parsing namespaces failed")
+		logger.GetLogger().Warn("ExecveEvent: parsing namespaces failed",
+			"event.name", "Execve",
+			"event.process.pid", process.PID,
+			"event.process.tid", process.TID,
+			"event.process.binary", binary,
+			"event.process.exec_id", execID,
+			"event.parent.exec_id", parentExecID)
 	}
 
 	apiCreds := &tetragon.ProcessCredentials{
@@ -332,21 +398,31 @@ func initProcessInternalExec(
 	// kernel threads PID will be 0, so instead of checking against 0,
 	// assert that TGID == TID
 	if process.PID != process.TID {
-		logger.GetLogger().WithFields(logrus.Fields{
-			"event.name":            "Execve",
-			"event.process.pid":     process.PID,
-			"event.process.tid":     process.TID,
-			"event.process.binary":  binary,
-			"event.process.exec_id": execID,
-			"event.parent.exec_id":  parentExecID,
-		}).Warn("ExecveEvent: process PID and TID mismatch")
+		logger.GetLogger().Warn("ExecveEvent: process PID and TID mismatch",
+			"event.name", "Execve",
+			"event.process.pid", process.PID,
+			"event.process.tid", process.TID,
+			"event.process.binary", binary,
+			"event.process.exec_id", execID,
+			"event.parent.exec_id", parentExecID)
 		// Explicitly reset TID to be PID
 		process.TID = process.PID
-		errormetrics.ErrorTotalInc(errormetrics.ProcessPidTidMismatch)
+		errormetrics.ErrorTotalInc(errormetrics.ProcessPidTidMismatchExec)
+	}
+
+	envs := process.Envs
+
+	// Apply user filter on environment variables before redaction.
+	if option.Config.FilterEnvironmentVariables != nil {
+		envs = slices.DeleteFunc(envs, func(v string) bool {
+			before, _, _ := strings.Cut(v, "=")
+			_, ok := option.Config.FilterEnvironmentVariables[before]
+			return !ok
+		})
 	}
 
 	if fieldfilters.RedactionFilters != nil {
-		args = fieldfilters.RedactionFilters.Redact(binary, args)
+		args, envs = fieldfilters.RedactionFilters.Redact(binary, args, envs)
 	}
 
 	var user *tetragon.UserRecord
@@ -357,30 +433,41 @@ func initProcessInternalExec(
 		}
 	}
 
-	return &ProcessInternal{
+	pi := &ProcessInternal{
 		process: &tetragon.Process{
-			Pid:          &wrapperspb.UInt32Value{Value: process.PID},
-			Tid:          &wrapperspb.UInt32Value{Value: process.TID},
-			Uid:          &wrapperspb.UInt32Value{Value: process.UID},
-			Cwd:          cwd,
-			Binary:       binary,
-			Arguments:    args,
-			Flags:        strings.Join(exec.DecodeCommonFlags(process.Flags), " "),
-			StartTime:    ktime.ToProtoOpt(process.Ktime, (process.Flags&api.EventProcFS) == 0),
-			Auid:         &wrapperspb.UInt32Value{Value: process.AUID},
-			Pod:          protoPod,
-			ExecId:       execID,
-			Docker:       containerID,
-			ParentExecId: parentExecID,
-			Refcnt:       0,
-			User:         user,
+			Pid:                  &wrapperspb.UInt32Value{Value: process.PID},
+			Tid:                  &wrapperspb.UInt32Value{Value: process.TID},
+			Uid:                  &wrapperspb.UInt32Value{Value: process.UID},
+			Cwd:                  cwd,
+			Binary:               binary,
+			Arguments:            args,
+			Flags:                strings.Join(exec.DecodeCommonFlags(process.Flags), " "),
+			StartTime:            ktime.ToProtoOpt(process.Ktime, (process.Flags&api.EventProcFS) == 0),
+			Auid:                 &wrapperspb.UInt32Value{Value: process.AUID},
+			Pod:                  protoPod,
+			ExecId:               execID,
+			Docker:               event.Kube.Docker,
+			ParentExecId:         parentExecID,
+			Refcnt:               0,
+			User:                 user,
+			EnvironmentVariables: getEnvironmentVariables(envs),
 		},
 		capabilities:  apiCaps,
 		apiCreds:      apiCreds,
 		apiBinaryProp: apiBinaryProp,
 		namespaces:    apiNs,
-		refcnt:        1,
+		refcntOps:     map[string]int32{"process++": 1},
 	}
+	pi.refcnt.Store(1)
+
+	// Set in_init_tree flag
+	if event.Process.Flags&api.EventInInitTree == api.EventInInitTree {
+		pi.process.InInitTree = &wrapperspb.BoolValue{Value: true}
+	} else {
+		pi.process.InInitTree = &wrapperspb.BoolValue{Value: false}
+	}
+
+	return pi
 }
 
 // initProcessInternalClone() initialize and returns ProcessInternal from
@@ -389,12 +476,12 @@ func initProcessInternalClone(event *tetragonAPI.MsgCloneEvent,
 	parent *ProcessInternal, parentExecId string) (*ProcessInternal, error) {
 	pi := parent.cloneInternalProcessCopy()
 	if pi.process == nil {
-		err := fmt.Errorf("failed to clone parent process from cache")
-		logger.GetLogger().WithFields(logrus.Fields{
-			"event.name":           "Clone",
-			"event.parent.pid":     event.Parent.Pid,
-			"event.parent.exec_id": parentExecId,
-		}).WithError(err).Debug("CloneEvent: parent process information is missing")
+		err := errors.New("failed to clone parent process from cache")
+		logger.GetLogger().Debug("CloneEvent: parent process information is missing",
+			logfields.Error, err,
+			"event.name", "Clone",
+			"event.parent.pid", event.Parent.Pid,
+			"event.parent.exec_id", parentExecId)
 		return nil, err
 	}
 
@@ -405,14 +492,13 @@ func initProcessInternalClone(event *tetragonAPI.MsgCloneEvent,
 	//  Since from BPF side we only generate one clone event per
 	//  thread group that is for the leader, assert on that.
 	if event.PID != event.TID {
-		logger.GetLogger().WithFields(logrus.Fields{
-			"event.name":            "Clone",
-			"event.process.pid":     event.PID,
-			"event.process.tid":     event.TID,
-			"event.process.exec_id": pi.process.ExecId,
-			"event.parent.exec_id":  parentExecId,
-		}).Debug("CloneEvent: process PID and TID mismatch")
-		errormetrics.ErrorTotalInc(errormetrics.ProcessPidTidMismatch)
+		logger.GetLogger().Debug("CloneEvent: process PID and TID mismatch",
+			"event.name", "Clone",
+			"event.process.pid", event.PID,
+			"event.process.tid", event.TID,
+			"event.process.exec_id", pi.process.ExecId,
+			"event.parent.exec_id", parentExecId)
+		errormetrics.ErrorTotalInc(errormetrics.ProcessPidTidMismatchClone)
 	}
 	// Set the TID here and if we have an exit without an exec we report
 	// directly this TID without copying again objects.
@@ -431,32 +517,72 @@ func initProcessInternalClone(event *tetragonAPI.MsgCloneEvent,
 			pi.AddPodInfo(podInfo)
 		}
 	}
+	// Set in_init_tree flag
+	if event.Flags&api.EventInInitTree == api.EventInInitTree {
+		pi.process.InInitTree = &wrapperspb.BoolValue{Value: true}
+	} else {
+		pi.process.InInitTree = &wrapperspb.BoolValue{Value: false}
+	}
 
 	return pi, nil
 }
 
-// GetPodInfo constructs and returns the Kubernetes Pod information associated with
-// the Container ID and the PID inside this container.
-func GetPodInfo(cid, bin, args string, nspid uint32) *tetragon.Pod {
-	return getPodInfo(k8s, cid, bin, args, nspid)
+// GetPodInfo constructs and returns the Kubernetes Pod information associated with an event.
+func GetPodInfo(containerID, bin, args string, nspid uint32) *tetragon.Pod {
+	return getPodInfo(k8s, containerID, bin, args, nspid)
 }
 
 func GetParentProcessInternal(pid uint32, ktime uint64) (*ProcessInternal, *ProcessInternal) {
+	if option.Config.DisableProcessCache {
+		return nil, nil
+	}
+
 	var parent, process *ProcessInternal
 	var err error
 
 	processID := GetProcessID(pid, ktime)
 
 	if process, err = procCache.get(processID); err != nil {
-		logger.GetLogger().WithField("id in event", processID).WithField("pid", pid).WithField("ktime", ktime).Debug("process not found in cache")
+		logger.GetLogger().Debug("process not found in cache",
+			"id in event", processID,
+			"pid", pid,
+			"ktime", ktime)
 		return nil, nil
 	}
 
 	if parent, err = procCache.get(process.process.ParentExecId); err != nil {
-		logger.GetLogger().WithField("id in event", process.process.ParentExecId).WithField("pid", pid).WithField("ktime", ktime).Debug("parent process not found in cache")
+		logger.GetLogger().Debug("parent process not found in cache",
+			"id in event", processID,
+			"pid", pid,
+			"ktime", ktime)
 		return process, nil
 	}
 	return process, parent
+}
+
+// GetAncestorProcessesInternal returns a slice, representing a continuous sequence of ancestors
+// of the process up to init process (PID 1) or kthreadd (PID 2), including the immediate parent.
+func GetAncestorProcessesInternal(execId string) ([]*ProcessInternal, error) {
+	var ancestors []*ProcessInternal
+	var process *ProcessInternal
+	var err error
+
+	if process, err = procCache.get(execId); err != nil {
+		return nil, err
+	}
+
+	// No need to include <kernel> process (PID 0)
+	for process.process.Pid.Value > constants.OLDEST_ANCESTOR_PID {
+		if process, err = procCache.get(process.process.ParentExecId); err != nil {
+			logger.GetLogger().Debug("ancestor process not found in cache",
+				logfields.Error, err,
+				"id in event", execId)
+			break
+		}
+		ancestors = append(ancestors, process)
+	}
+
+	return ancestors, err
 }
 
 // AddExecEvent constructs a new ProcessInternal structure from an Execve event, adds it to the cache, and also returns it
@@ -470,41 +596,52 @@ func AddExecEvent(event *tetragonAPI.MsgExecveEventUnix) *ProcessInternal {
 		proc = initProcessInternalExec(event, event.Msg.CleanupProcess)
 	}
 
-	procCache.add(proc)
-	ProcessCacheTotal.Inc()
+	if !option.Config.DisableProcessCache {
+		procCache.add(proc)
+	}
+
 	return proc
 }
 
 // AddCloneEvent adds a new process into the cache from a CloneEvent
-func AddCloneEvent(event *tetragonAPI.MsgCloneEvent) error {
+func AddCloneEvent(event *tetragonAPI.MsgCloneEvent) (*ProcessInternal, error) {
 	parentExecId := GetProcessID(event.Parent.Pid, event.Parent.Ktime)
 	parent, err := Get(parentExecId)
 	if err != nil {
-		logger.GetLogger().WithFields(logrus.Fields{
-			"event.name":           "Clone",
-			"event.parent.pid":     event.Parent.Pid,
-			"event.parent.exec_id": parentExecId,
-		}).WithError(err).Debug("CloneEvent: parent process not found in cache")
-		return err
+		logger.GetLogger().Debug("CloneEvent: parent process not found in cache",
+			logfields.Error, err,
+			"event.name", "Clone",
+			"event.parent.pid", event.Parent.Pid,
+			"event.parent.exec_id", parentExecId)
+		return nil, err
 	}
 
 	proc, err := initProcessInternalClone(event, parent, parentExecId)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	parent.RefInc()
+	parent.RefInc("parent")
 	procCache.add(proc)
-	ProcessCacheTotal.Inc()
-	return nil
+	return proc, nil
 }
 
 func Get(execId string) (*ProcessInternal, error) {
 	return procCache.get(execId)
 }
 
-// GetK8s returns K8sResourceWatcher. You must call InitCache before calling this function to ensure
-// that k8s has been initialized.
-func GetK8s() watcher.K8sResourceWatcher {
-	return k8s
+func DumpProcessCache(opts *tetragon.DumpProcessCacheReqArgs) []*tetragon.ProcessInternal {
+	if !option.Config.DisableProcessCache {
+		return procCache.dump(opts)
+	}
+	return []*tetragon.ProcessInternal{}
+}
+
+// This function returns the process cache entries (and not the copies
+// of them as opposed to dump function). Thus any changes to the return
+// value results in affecting the process cache entries.
+// This is mainly for tests where we want to check the values of the
+// process cache.
+func GetCacheEntries() []*tetragon.ProcessInternal {
+	return procCache.getEntries()
 }

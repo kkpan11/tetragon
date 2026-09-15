@@ -1,3 +1,4 @@
+{{- if .Values.tetragon.enabled }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -11,7 +12,7 @@ metadata:
   {{- else }}
     {{- include "tetragon.labels" . | nindent 4 }}
   {{- end }}
-  name: {{ .Release.Name }}
+  name: {{ include "tetragon.name" . }}
   namespace: {{ .Release.Namespace }}
 spec:
   selector:
@@ -51,17 +52,13 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       initContainers:
-{{- if .Values.tetragon.ociHookSetup.enabled }}
-      {{- include "container.tetragon-oci-hook-setup" . | nindent 6 -}}
-{{- end }}
       {{- include "initcontainers.extra" . | nindent 6 }}
       containers:
 {{- if eq .Values.export.mode "stdout" }}
       {{- include "container.export.stdout" . | nindent 6 -}}
 {{- end }}
-{{- if .Values.tetragon.enabled }}
       {{- include "container.tetragon" . | nindent 6 -}}
-{{- end }}
+      {{- include "containers.extra" . | nindent 6 -}}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -75,6 +72,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       hostNetwork: {{ .Values.hostNetwork }}
+      {{- if (semverCompare ">= 1.33-0" .Capabilities.KubeVersion.Version) }}
+      hostUsers: true
+      {{- end }}
       dnsPolicy: {{ .Values.dnsPolicy }}
       terminationGracePeriodSeconds: 1
       volumes:
@@ -82,14 +82,17 @@ spec:
         hostPath:
           path: /var/run/cilium
           type: DirectoryOrCreate
+      - name: tetragon-run
+        hostPath:
+          path: /var/run/tetragon
+          type: DirectoryOrCreate
       - name: export-logs
         hostPath:
           path: {{ .Values.exportDirectory }}
           type: DirectoryOrCreate
-{{- if .Values.tetragon.enabled }}
       - name: tetragon-config
         configMap:
-          name: {{ .Release.Name }}-config
+          name: {{ include "tetragon.configMapName" . }}
       - name: bpf-maps
         hostPath:
           path: /sys/fs/bpf
@@ -98,16 +101,17 @@ spec:
         hostPath:
           path: {{ .Values.tetragon.hostProcPath }}
           type: Directory
-{{- if .Values.tetragon.ociHookSetup.enabled }}
-      - name: oci-hooks-path
+{{- if and (.Values.tetragon.cri.enabled) (.Values.tetragon.cri.socketHostPath) }}
+      - name: cri-socket
         hostPath:
-          path: /usr/share/containers/oci/hooks.d/
+          path: {{ dir .Values.tetragon.cri.socketHostPath | quote }}
           type: Directory
-      - name: oci-hooks-install-path
-        hostPath:
-          path: {{ quote .Values.tetragon.ociHookSetup.installDir }}
-          type: DirectoryOrCreate
 {{- end }}
+{{- if and .Values.tetragon.grpc.enabled .Values.tetragon.grpc.tls.enabled }}
+      - name: tetragon-grpc-tls
+        secret:
+          secretName: {{ .Values.tetragon.grpc.tls.server.existingSecret | default (include "tetragon.grpcTlsSecretName" .) }}
+          defaultMode: 0400
 {{- end }}
       {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 6 }}
@@ -121,4 +125,5 @@ spec:
 {{- with .Values.updateStrategy }}
   updateStrategy:
     {{- toYaml . | nindent 4 }}
+{{- end }}
 {{- end }}

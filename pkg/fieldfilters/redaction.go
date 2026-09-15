@@ -13,11 +13,12 @@ import (
 	"github.com/cilium/tetragon/api/v1/tetragon"
 )
 
-const REDACTION_STR = "*****"
+const DefaultRedactionString = "*****"
 
 type RedactionFilter struct {
 	binaryRegex []*regexp.Regexp
 	redact      []*regexp.Regexp
+	redactStr   string
 }
 
 type RedactionFilterList struct {
@@ -68,6 +69,11 @@ func RedactionFilterListFromProto(protoFilters []*tetragon.RedactionFilter) ([]*
 func redactionFilterFromProto(protoFilter *tetragon.RedactionFilter) (*RedactionFilter, error) {
 	filter := &RedactionFilter{}
 
+	filter.redactStr = protoFilter.GetRedactStr()
+	if filter.redactStr == "" {
+		filter.redactStr = DefaultRedactionString
+	}
+
 	for _, re := range protoFilter.BinaryRegex {
 		compiled, err := regexp.Compile(re)
 		if err != nil {
@@ -89,18 +95,18 @@ func redactionFilterFromProto(protoFilter *tetragon.RedactionFilter) (*Redaction
 }
 
 // Redact redacts a string based on redaction filters.
-func (f RedactionFilterList) Redact(binary, args string) string {
+func (f RedactionFilterList) Redact(binary, args string, envs []string) (string, []string) {
 	for _, filter := range f.list {
-		args = filter.Redact(binary, args)
+		args, envs = filter.Redact(binary, args, envs)
 	}
-	return args
+	return args, envs
 }
 
 // Redact resursively checks any string fields in the event for matches to
 // redaction regexes and replaces any capture groups with `*****`.
 //
 // NOTE: If you're using multiple redaction filters, reach for RedactionFilterList.Redact() instead.
-func (f RedactionFilter) Redact(binary, args string) string {
+func (f RedactionFilter) Redact(binary, args string, envs []string) (string, []string) {
 	// Default match to true if we have no binary regexes
 	binaryMatch := len(f.binaryRegex) == 0
 	for _, re := range f.binaryRegex {
@@ -109,15 +115,26 @@ func (f RedactionFilter) Redact(binary, args string) string {
 		}
 	}
 	if !binaryMatch {
-		return args
+		return args, envs
 	}
+
 	for _, re := range f.redact {
-		args, _ = redactString(re, args)
+		args, _ = redactString(re, args, f.redactStr)
 	}
-	return args
+
+	var envsRedacted []string
+
+	for _, v := range envs {
+		for _, re := range f.redact {
+			v, _ = redactString(re, v, f.redactStr)
+		}
+		envsRedacted = append(envsRedacted, v)
+	}
+
+	return args, envsRedacted
 }
 
-func redactString(re *regexp.Regexp, s string) (string, bool) {
+func redactString(re *regexp.Regexp, s string, redactStr string) (string, bool) {
 	modified := false
 	res := re.ReplaceAllStringFunc(s, func(s string) string {
 		var redacted strings.Builder
@@ -136,7 +153,7 @@ func redactString(re *regexp.Regexp, s string) (string, bool) {
 			}
 			modified = true
 			redacted.WriteString(s[lastOffset:idx[i]])
-			redacted.WriteString(REDACTION_STR)
+			redacted.WriteString(redactStr)
 			lastOffset = idx[i+1]
 		}
 		// Write the rest of the string

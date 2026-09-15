@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package test
 
 import (
@@ -9,13 +11,17 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
+
+	"github.com/cilium/tetragon/pkg/testutils"
+
 	ec "github.com/cilium/tetragon/api/v1/tetragon/codegen/eventchecker"
 	"github.com/cilium/tetragon/pkg/jsonchecker"
 	"github.com/cilium/tetragon/pkg/observer/observertesthelper"
 	_ "github.com/cilium/tetragon/pkg/sensors/exec"
+	tuo "github.com/cilium/tetragon/pkg/testutils/observer"
 	tus "github.com/cilium/tetragon/pkg/testutils/sensors"
-	"github.com/stretchr/testify/assert"
-	"golang.org/x/sys/unix"
 )
 
 // This bpf_lseek is a simple BPF program used for tests
@@ -26,7 +32,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestSensorLseekLoad(t *testing.T) {
-	if _, err := os.Stat("/sys/kernel/debug/tracing/events/syscalls"); os.IsNotExist(err) {
+	if !testutils.CheckKernelTracingExists() {
 		t.Skip("cannot use syscall tracepoints (consider enabling CONFIG_FTRACE_SYSCALLS)")
 	}
 
@@ -51,11 +57,11 @@ func TestSensorLseekLoad(t *testing.T) {
 	unix.Seek(BogusFd, 0, BogusWhenceVal)
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestSensorLseekEnable(t *testing.T) {
-	if _, err := os.Stat("/sys/kernel/debug/tracing/events/syscalls"); os.IsNotExist(err) {
+	if !testutils.CheckKernelTracingExists() {
 		t.Skip("cannot use syscall tracepoints (consider enabling CONFIG_FTRACE_SYSCALLS)")
 	}
 
@@ -76,7 +82,7 @@ func TestSensorLseekEnable(t *testing.T) {
 
 	sensor := GetTestSensor()
 
-	smanager := tus.GetTestSensorManager(ctx, t)
+	smanager := tuo.GetTestSensorManager(t)
 	smanager.AddAndEnableSensor(ctx, t, sensor, sensor.Name)
 
 	observertesthelper.LoopEvents(ctx, t, &doneWG, &readyWG, obs)
@@ -84,5 +90,5 @@ func TestSensorLseekEnable(t *testing.T) {
 	unix.Seek(BogusFd, 0, BogusWhenceVal)
 
 	err = jsonchecker.JsonTestCheck(t, checker)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }

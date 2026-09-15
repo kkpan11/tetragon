@@ -4,10 +4,11 @@
 package eventchecker
 
 import (
-	"fmt"
+	"strings"
+
+	"google.golang.org/protobuf/compiler/protogen"
 
 	"github.com/cilium/tetragon/tools/protoc-gen-go-tetragon/common"
-	"google.golang.org/protobuf/compiler/protogen"
 )
 
 // Generate generates boilerplate code for the eventcheckers
@@ -16,8 +17,12 @@ func Generate(gen *protogen.Plugin, files []*protogen.File) error {
 	// generated files will be in pkg tetragon so its not important
 	// from packaging side and any prefix will work fine we just pick
 	// the first file arbitrarily.
-	g := common.NewCodegenFile(gen, files[0], "eventchecker")
-	yaml := common.NewCodegenFile(gen, files[0], "eventchecker/yaml")
+	f, err := common.GetFirstTetragonFile(files)
+	if err != nil {
+		return err
+	}
+	g := common.NewCodegenFile(gen, f, "eventchecker")
+	yaml := common.NewCodegenFile(gen, f, "eventchecker/yaml")
 
 	if err := generateEventCheckerConf(yaml); err != nil {
 		return err
@@ -55,6 +60,10 @@ func Generate(gen *protogen.Plugin, files []*protogen.File) error {
 		return err
 	}
 
+	if err := generateUnsetChecks(g, files); err != nil {
+		return err
+	}
+
 	if err := generateFieldCheckers(g, files); err != nil {
 		return err
 	}
@@ -74,14 +83,14 @@ func generateEventToChecker(g *protogen.GeneratedFile, f []*protogen.File) error
 	}
 
 	doCases := func() string {
-		var ret string
+		var ret strings.Builder
 		for _, msg := range events {
 			msgIdent := common.TetragonApiIdent(g, msg.GoIdent.GoName)
-			ret += `case *` + msgIdent + `:
+			ret.WriteString(`case *` + msgIdent + `:
             return New` + msg.checkerName(g) + `("").From` + msg.GoIdent.GoName + `(ev), nil
-            `
+            `)
 		}
-		return ret
+		return ret.String()
 	}
 
 	g.P(`// CheckerFromEvent converts an event into an EventChecker
@@ -155,7 +164,7 @@ func generateEventFromResponse(g *protogen.GeneratedFile, f []*protogen.File) er
     func EventFromResponse(response *` + tetragonGER + `) (Event, error) {
         switch ev := response.Event.(type) {`)
 	for _, event := range events {
-		g.P(`case *` + common.TetragonApiIdent(g, fmt.Sprintf("GetEventsResponse_%s", event.GoIdent.GoName)) + `:
+		g.P(`case *` + common.TetragonApiIdent(g, "GetEventsResponse_"+event.GoIdent.GoName) + `:
             return ev.` + event.GoIdent.GoName + `, nil`)
 	}
 	g.P(`
@@ -178,6 +187,55 @@ func generateEventCheckers(g *protogen.GeneratedFile, f []*protogen.File) error 
 			return err
 		}
 	}
+
+	return nil
+}
+
+// generateUnsetChecks generates helpers to strip the Process and Parent checks
+// from all the event checks of a MultiEventChecker.
+func generateUnsetChecks(g *protogen.GeneratedFile, f []*protogen.File) error {
+	events, err := getEvents(f)
+	if err != nil {
+		return err
+	}
+
+	doCases := func(fieldName string, skipped map[string]bool) string {
+		var ret strings.Builder
+		for _, msg := range events {
+			if skipped[msg.GoIdent.GoName] || !msg.hasField(fieldName) {
+				continue
+			}
+			ret.WriteString(`case *` + msg.checkerName(g) + `:
+                v.Unset` + fieldName + `()
+            `)
+		}
+		return ret.String()
+	}
+
+	doFunc := func(fieldName string, skipped map[string]bool) {
+		g.P(`func Unset` + fieldName + `Checks(checker MultiEventChecker) {
+            getter, ok := checker.(interface{ GetChecks() []EventChecker })
+            if !ok {
+                return
+            }
+            for _, c := range getter.GetChecks() {
+                switch v := c.(type) {
+                ` + doCases(fieldName, skipped) + `
+                }
+            }
+        }`)
+	}
+
+	g.P(`// UnsetProcessChecks strips any Process check set via WithProcess() from the
+    // individual checks of a MultiEventChecker, e.g. for cases where the process cache
+    // is disabled and the Process field can't be checked. The ProcessExec check is left
+    // as is, because its Process field is valid regardless of the process cache.`)
+	doFunc("Process", map[string]bool{"ProcessExec": true})
+
+	g.P(`// UnsetParentChecks strips any Parent check set via WithParent() from the
+    // individual checks of a MultiEventChecker, e.g. for cases where the process cache
+    // is disabled and the Parent field can't be checked.`)
+	doFunc("Parent", nil)
 
 	return nil
 }

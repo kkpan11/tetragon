@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package helpers
 
 import (
@@ -49,7 +51,7 @@ func CreateNamespace(namespace string, waitForCreation bool) env.Func {
 
 		if waitForCreation {
 			klog.InfoS("Waiting for namespace to be created...", "namespace", namespace)
-			ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+			ns := &v1.Namespace{Name: namespace}
 			wait.For(conditions.New(r).ResourceMatch(ns, func(_ k8s.Object) bool {
 				return true
 			}))
@@ -76,7 +78,7 @@ func DeleteNamespace(namespace string, waitForDeletion bool) env.Func {
 		}
 
 		if waitForDeletion {
-			ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+			ns := &v1.Namespace{Name: namespace}
 			wait.For(conditions.New(r).ResourceDeleted(ns))
 		}
 
@@ -114,11 +116,7 @@ func LoadObjects(namespace string, objs []k8s.Object, waitForPods bool) env.Func
 			r.List(ctx, podList)
 			wait.For(conditions.New(r).ResourcesMatch(podList, func(object k8s.Object) bool {
 				o := object.(*v1.Pod)
-				done, err := conditions.New(r).PodRunning(o)()
-				if done && err == nil {
-					return true
-				}
-				return false
+				return o.Status.Phase == v1.PodRunning || o.Status.Phase == v1.PodSucceeded
 			}))
 
 			klog.Infof("Resources created and all pods in %s ready!", namespace)

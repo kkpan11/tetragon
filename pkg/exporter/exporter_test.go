@@ -6,19 +6,31 @@ package exporter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/cilium/lumberjack/v2"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/cilium/tetragon/pkg/server/eventlog"
+
+	"github.com/cilium/tetragon/pkg/option"
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/encoder"
 	"github.com/cilium/tetragon/pkg/ratelimit"
+	"github.com/cilium/tetragon/pkg/reader/node"
 	"github.com/cilium/tetragon/pkg/rthooks"
 	"github.com/cilium/tetragon/pkg/server"
-	"github.com/stretchr/testify/assert"
 )
 
 type arrayWriter struct {
@@ -29,7 +41,9 @@ type arrayWriter struct {
 func newArrayWriter(size int) *arrayWriter {
 	return &arrayWriter{
 		items: make([]string, 0, size),
-		done:  make(chan bool),
+		// Buffered so Write never blocks the producer goroutine if nobody
+		// is currently waiting on done (e.g. after a polling loop breaks).
+		done: make(chan bool, 1),
 	}
 }
 
@@ -54,7 +68,9 @@ type fakeNotifier struct {
 func newFakeNotifier() *fakeNotifier {
 	return &fakeNotifier{
 		listeners: make(map[server.Listener]struct{}),
-		removed:   make(chan bool),
+		// Buffered so RemoveListener never blocks the producer goroutine if nobody
+		// is currently waiting on removed (e.g. after a polling loop breaks).
+		removed: make(chan bool, 1),
 	}
 }
 
@@ -67,11 +83,11 @@ func (f *fakeNotifier) AddListener(listener server.Listener) {
 func (f *fakeNotifier) RemoveListener(listener server.Listener) {
 	f.mux.Lock()
 	delete(f.listeners, listener)
-	f.removed <- true
 	f.mux.Unlock()
+	f.removed <- true
 }
 
-func (f *fakeNotifier) NotifyListener(_ interface{}, processed *tetragon.GetEventsResponse) {
+func (f *fakeNotifier) NotifyListener(_ any, processed *tetragon.GetEventsResponse) {
 	f.mux.Lock()
 	defer f.mux.Unlock()
 	for l := range f.listeners {
@@ -85,13 +101,14 @@ func TestExporter_Send(t *testing.T) {
 	eventNotifier := newFakeNotifier()
 	ctx, cancel := context.WithCancel(context.Background())
 	dr := rthooks.DummyHookRunner{}
-	grpcServer := server.NewServer(ctx, &wg, eventNotifier, &server.FakeObserver{}, dr)
+	grpcServer := server.NewServer(ctx, &wg, eventNotifier, &server.FakeObserver{}, dr, nil)
 	numRecords := 2
 	results := newArrayWriter(numRecords)
 	encoder := encoder.NewProtojsonEncoder(results)
 	request := tetragon.GetEventsRequest{DenyList: []*tetragon.Filter{{BinaryRegex: []string{"b"}}}}
-	exporter := NewExporter(ctx, &request, grpcServer, encoder, results, nil)
-	assert.NoError(t, exporter.Start(), "exporter must start without errors")
+	exporter, err := NewExporter(ctx, &request, grpcServer, encoder, results, nil)
+	require.NoError(t, err)
+	require.NoError(t, exporter.Start(), "exporter must start without errors")
 	eventNotifier.NotifyListener(nil, &tetragon.GetEventsResponse{
 		Event: &tetragon.GetEventsResponse_ProcessExec{
 			ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Binary: "a"}},
@@ -160,8 +177,6 @@ func checkEvents(t *testing.T, eventsJSON []string, wantEvents, wantRateLimitInf
 }
 
 func Test_rateLimitExport(t *testing.T) {
-	var wg sync.WaitGroup
-
 	// set node name to be reported in RateLimitInfo events
 	hubbleNodeNameEnv := "HUBBLE_NODE_NAME"
 	value, ok := os.LookupEnv(hubbleNodeNameEnv)
@@ -171,6 +186,7 @@ func Test_rateLimitExport(t *testing.T) {
 		}
 		defer os.Unsetenv(hubbleNodeNameEnv)
 	}
+	node.SetExportNodeName()
 
 	tests := []struct {
 		name              string
@@ -187,35 +203,205 @@ func Test_rateLimitExport(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("%s (%d events, %d rate limit)", tt.name, tt.totalEvents, tt.rateLimit), func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			eventNotifier := newFakeNotifier()
-			dr := rthooks.DummyHookRunner{}
-			grpcServer := server.NewServer(ctx, &wg, eventNotifier, &server.FakeObserver{}, dr)
-			results := newArrayWriter(tt.totalEvents)
-			encoder := encoder.NewProtojsonEncoder(results)
-			request := &tetragon.GetEventsRequest{}
-			exporter := NewExporter(
-				ctx,
-				request,
-				grpcServer,
-				encoder,
-				results,
-				ratelimit.NewRateLimiter(ctx, 50*time.Millisecond, tt.rateLimit, encoder),
-			)
-			assert.NoError(t, exporter.Start(), "exporter must start without errors")
-			for i := 0; i < tt.totalEvents; i++ {
-				eventNotifier.NotifyListener(nil, &tetragon.GetEventsResponse{
-					Event: &tetragon.GetEventsResponse_ProcessExec{
-						ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Binary: fmt.Sprintf("a%d", i)}},
-					}})
-			}
+			synctest.Test(t, func(t *testing.T) {
+				var wg sync.WaitGroup
+				ctx, cancel := context.WithCancel(context.Background())
+				eventNotifier := newFakeNotifier()
+				dr := rthooks.DummyHookRunner{}
+				grpcServer := server.NewServer(ctx, &wg, eventNotifier, &server.FakeObserver{}, dr, nil)
+				results := newArrayWriter(tt.totalEvents)
+				encoder := encoder.NewProtojsonEncoder(results)
+				request := &tetragon.GetEventsRequest{}
+				exporter, err := NewExporter(
+					ctx,
+					request,
+					grpcServer,
+					encoder,
+					results,
+					ratelimit.NewRateLimiter(ctx, 50*time.Millisecond, tt.rateLimit, encoder),
+				)
+				require.NoError(t, err)
+				require.NoError(t, exporter.Start(), "exporter must start without errors")
+				for i := range tt.totalEvents {
+					eventNotifier.NotifyListener(nil, &tetragon.GetEventsResponse{
+						Event: &tetragon.GetEventsResponse_ProcessExec{
+							ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Binary: fmt.Sprintf("a%d", i)}},
+						}})
+				}
 
-			reportInterval := 100 * time.Millisecond
-			// wait for ~2 report intervals to make sure we get a rate-limit-info event
-			time.Sleep(2 * reportInterval)
-			cancel()
+				// Allow the rate limiter (50ms tick) to fire and flush pending
+				// events / emit the rate-limit-info record. Under synctest,
+				// time advances deterministically while goroutines are blocked.
+				synctest.Sleep(100 * time.Millisecond)
 
-			checkEvents(t, results.items, tt.wantEvents, tt.wantRateLimitInfo, tt.wantDropped)
+				cancel()
+				<-eventNotifier.removed
+
+				checkEvents(t, results.items, tt.wantEvents, tt.wantRateLimitInfo, tt.wantDropped)
+			})
 		})
 	}
+}
+
+type failingEncoder struct {
+	err error
+}
+
+func (f *failingEncoder) Encode(_ any) error {
+	return f.err
+}
+
+func TestExporter_SendEncodeErrorCountsFailed(t *testing.T) {
+	exportedBefore := testutil.ToFloat64(eventsExportedTotal)
+	failedBefore := testutil.ToFloat64(eventsExportFailedTotal)
+
+	e := &Exporter{encoder: &failingEncoder{err: errors.New("disk full")}}
+	ev := &tetragon.GetEventsResponse{
+		Event: &tetragon.GetEventsResponse_ProcessExec{
+			ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Binary: "a"}},
+		},
+	}
+	require.NoError(t, e.Send(ev), "Send keeps warn+continue semantics and returns nil")
+
+	assert.InDelta(t, exportedBefore, testutil.ToFloat64(eventsExportedTotal), 1e-9, "failed encodes must not count as exported")
+	assert.InDelta(t, failedBefore+1, testutil.ToFloat64(eventsExportFailedTotal), 1e-9, "failed encodes must increment failed counter")
+}
+
+func TestExporterSetLoggingParams(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var wg sync.WaitGroup
+		ctx, cancel := context.WithCancel(context.Background())
+		eventNotifier := newFakeNotifier()
+
+		dr := rthooks.DummyHookRunner{}
+		grpcServer := server.NewServer(ctx, &wg, eventNotifier, &server.FakeObserver{}, dr, nil)
+
+		tempDir := t.TempDir()
+
+		oldRotationInterval := option.Config.ExportFileRotationInterval
+		oldExportFilename := option.Config.ExportFilename
+		option.Config.ExportFileRotationInterval = 5 * time.Second
+		option.Config.ExportFilename = filepath.Join(tempDir, "test.txt")
+		t.Cleanup(func() {
+			option.Config.ExportFileRotationInterval = oldRotationInterval
+			option.Config.ExportFilename = oldExportFilename
+		})
+
+		writer := &lumberjack.Logger{
+			Filename: option.Config.ExportFilename,
+		}
+		encoderWriter := NewExportedBytesTotalWriter(writer)
+		encoder := encoder.NewProtojsonEncoder(encoderWriter)
+		request := &tetragon.GetEventsRequest{}
+
+		e, err := NewExporter(
+			ctx,
+			request,
+			grpcServer,
+			encoder,
+			writer,
+			nil,
+		)
+		require.NoError(t, err)
+		require.NoError(t, e.Start(), "exporter must start without errors")
+		// Generate a fake event so that `test.txt` is created by dumping it
+		eventNotifier.NotifyListener(nil, &tetragon.GetEventsResponse{
+			Event: &tetragon.GetEventsResponse_ProcessExec{
+				ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Binary: "a0"}},
+			}})
+
+		// wait for 1s and check that no export file rotation happened yet
+		time.Sleep(1 * time.Second)
+		// check that export file was not rotated
+		files, _ := os.ReadDir(tempDir)
+		assert.Len(t, files, 1) // we have the `test.txt` file only
+
+		// wait for ~5s to allow the ExportFileRotationInterval to kick in
+		time.Sleep(5 * time.Second)
+		// check that export file has been rotated
+		files, _ = os.ReadDir(tempDir)
+		assert.Len(t, files, 2)
+
+		// Set a new export file rotation interval (2s)
+		err = e.SetLogParams(eventlog.Params{
+			RotationInterval: new(2 * time.Second),
+		})
+		require.NoError(t, err)
+
+		// wait for ~3s to allow the new ExportFileRotationInterval to kick in
+		time.Sleep(3 * time.Second)
+		// check that export file has been newly rotated
+		files, _ = os.ReadDir(tempDir)
+		assert.Len(t, files, 3)
+
+		cancel()
+		wg.Wait()
+		<-eventNotifier.removed
+	})
+}
+
+func TestExporterSetRotationIntervalInvalidatesOldTimer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	writer := &lumberjack.Logger{
+		Filename: filepath.Join(t.TempDir(), "test.txt"),
+	}
+	t.Cleanup(func() {
+		require.NoError(t, writer.Close())
+	})
+
+	e := &Exporter{
+		ctx:              ctx,
+		closer:           writer,
+		logFile:          filepath.Base(writer.Filename),
+		logsDir:          filepath.Dir(writer.Filename),
+		rotationInterval: time.Hour,
+	}
+	e.mu.Lock()
+	staleGeneration := e.rotationGeneration
+	e.scheduleRotateLocked()
+	e.mu.Unlock()
+
+	require.NoError(t, e.SetLogParams(eventlog.Params{
+		RotationInterval: new(2 * time.Hour),
+	}))
+
+	e.mu.Lock()
+	rotationInterval := e.rotationInterval
+	rotateTimer := e.rotateTimer
+	e.mu.Unlock()
+	require.Equal(t, 2*time.Hour, rotationInterval)
+	require.NotNil(t, rotateTimer)
+
+	// Simulate the old timer callback completing after SetLogParams installed
+	// the new timer. It must not overwrite the new timer and create a second
+	// independent rotation loop.
+	e.rotate(staleGeneration)
+
+	e.mu.Lock()
+	gotRotateTimer := e.rotateTimer
+	staleGeneration = e.rotationGeneration
+	e.mu.Unlock()
+	require.Same(t, rotateTimer, gotRotateTimer)
+
+	require.NoError(t, e.SetLogParams(eventlog.Params{
+		RotationInterval: new(time.Duration),
+	}))
+
+	e.mu.Lock()
+	rotationInterval = e.rotationInterval
+	rotateTimer = e.rotateTimer
+	e.mu.Unlock()
+	require.Zero(t, rotationInterval)
+	require.Nil(t, rotateTimer)
+
+	// A callback from the previously active configuration must not re-enable
+	// rotation after a zero interval disables it.
+	e.rotate(staleGeneration)
+
+	e.mu.Lock()
+	rotateTimer = e.rotateTimer
+	e.mu.Unlock()
+	require.Nil(t, rotateTimer)
 }

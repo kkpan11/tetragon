@@ -65,10 +65,9 @@ FUNC_INLINE void send_throttle(void *ctx, struct msg_k8s *kube, __u64 time)
 	msg->common.op = MSG_OP_THROTTLE;
 	msg->common.flags = 0;
 
-	__builtin_memcpy(&msg->kube, kube, sizeof(*kube));
+	__bpf_memcpy_builtin(&msg->kube, kube, sizeof(*kube));
 
-	perf_event_output_metric(ctx, MSG_OP_THROTTLE, &tcpmon_map,
-				 BPF_F_CURRENT_CPU, msg, size);
+	event_output_metric(ctx, MSG_OP_THROTTLE, msg, size);
 }
 
 FUNC_INLINE bool cgroup_rate(void *ctx, struct msg_k8s *kube, __u64 time)

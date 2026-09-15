@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/little-vm-helper/pkg/slogger"
 )
 
 // BuildConf configures how a set of images are build
 type BuildConf struct {
-	Log *logrus.Logger
+	Log slogger.Logger
 
 	// if DryRun set, no actual images will be build. Instead, empty files will be created
 	DryRun bool
@@ -22,6 +22,10 @@ type BuildConf struct {
 	ForceRebuild bool
 	// if MergeSteps is set, image build steps will be merged when possible (better performance at the cost making operations more complicated)
 	MergeSteps bool
+
+	// PkgRepo is from which release branch (ex: sid, buster, bookworm, stable)
+	// to use for installing packages during bootstrap
+	PkgRepo string
 }
 
 // BuildImageResult describes the result of building a single image
@@ -58,13 +62,13 @@ func (f *ImageForest) BuildImage(bldConf *BuildConf, image string) (*BuilderResu
 	images := append(deps, image)
 	for i := range images {
 		imgRes := st.buildImage(images[i])
-		xlog := log.WithFields(logrus.Fields{
+		xlog := log.WithFields(map[string]any{
 			"image":    image[i],
 			"all-deps": images,
 			"result":   fmt.Sprintf("%+v", imgRes),
 		})
 		if imgRes.Error == nil {
-			xlog.Info("image built succesfully")
+			xlog.Info("image built successfully")
 		} else {
 			xlog.Warn("image build failed")
 			break
@@ -85,7 +89,7 @@ func (f *ImageForest) BuildAllImages(bldConf *BuildConf) *BuilderResult {
 func (f *ImageForest) BuildImages(bldConf *BuildConf, queue []string) *BuilderResult {
 	log := bldConf.Log
 	st := newBuildState(f, bldConf)
-	log.WithFields(logrus.Fields{
+	log.WithFields(map[string]any{
 		"queue": strings.Join(queue, ","),
 	}).Info("starting to build images")
 	for {
@@ -100,13 +104,13 @@ func (f *ImageForest) BuildImages(bldConf *BuildConf, queue []string) *BuilderRe
 			queue = append(queue, children...)
 		}
 
-		xlog := log.WithFields(logrus.Fields{
+		xlog := log.WithFields(map[string]any{
 			"image":  image,
 			"queue":  strings.Join(queue, ","),
 			"result": fmt.Sprintf("%+v", imgRes),
 		})
 		if imgRes.Error == nil {
-			xlog.Info("image built succesfully")
+			xlog.Info("image built successfully")
 		} else {
 			xlog.Warn("image build failed")
 		}
@@ -149,7 +153,7 @@ func (b *buildState) doBuildImage(image string) BuildImageResult {
 	}
 
 	buildImage := func(image string) error {
-		return b.f.doBuildImage(context.Background(), b.bldConf.Log, image, b.bldConf.MergeSteps)
+		return b.f.doBuildImage(context.Background(), b.bldConf.Log, image, b.bldConf.MergeSteps, b.bldConf.PkgRepo)
 	}
 	if b.bldConf.DryRun {
 		buildImage = b.f.doBuildImageDryRun

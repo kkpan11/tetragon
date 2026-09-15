@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Tetragon
 
+//go:build !windows
+
 package runners
 
 import (
@@ -9,19 +11,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cilium/tetragon/tests/e2e/flags"
-	"github.com/cilium/tetragon/tests/e2e/helpers"
-	"github.com/cilium/tetragon/tests/e2e/install/cilium"
-	"github.com/cilium/tetragon/tests/e2e/install/tetragon"
-	"github.com/cilium/tetragon/tests/e2e/state"
-	appsv1 "k8s.io/api/apps/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/textlogger"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/e2e-framework/pkg/env"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
-	"sigs.k8s.io/e2e-framework/pkg/features"
+	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
+
+	"github.com/cilium/tetragon/tests/e2e/flags"
+	"github.com/cilium/tetragon/tests/e2e/helpers"
+	"github.com/cilium/tetragon/tests/e2e/install/tetragon"
 
 	// Auth plugins
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -36,31 +35,19 @@ type PortForwardFunc func(env.Environment) env.Func
 
 type Runner struct {
 	setupCluster        SetupClusterFunc
-	installCilium       env.Func
 	installTetragon     env.Func
 	uninstallTetragon   env.Func
 	tetragonPortForward PortForwardFunc
 	hasCalledInit       bool
 	keepExportFiles     bool
 	cancel              context.CancelFunc
+	setupTetragonFailed bool
 	env.Environment
 }
 
 var DefaultRunner = Runner{
 	setupCluster: func(testenv env.Environment) env.Func {
 		return helpers.MaybeCreateTempKindCluster(testenv, ClusterPrefix)
-	},
-	installCilium: func(ctx context.Context, c *envconf.Config) (context.Context, error) {
-		client, err := c.NewClient()
-		if err != nil {
-			return ctx, err
-		}
-		// Only install Cilium if it does not already exist
-		ciliumDs := &appsv1.DaemonSet{}
-		if err := client.Resources("kube-system").Get(ctx, "cilium", "kube-system", ciliumDs); err != nil && apierrors.IsNotFound(err) {
-			return cilium.Setup(cilium.WithNamespace("kube-system"), cilium.WithVersion(flags.Opts.CiliumVersion))(ctx, c)
-		}
-		return ctx, nil
 	},
 	installTetragon: tetragon.Install(tetragon.WithHelmOptions(map[string]string{
 		"tetragon.exportAllowList":    "",
@@ -111,26 +98,6 @@ func (r *Runner) WithInstallTetragon(options ...tetragon.Option) *Runner {
 	return r
 }
 
-func (r *Runner) WithInstallCiliumFn(install env.Func) *Runner {
-	r.installCilium = install
-	return r
-}
-
-func (r *Runner) WithInstallCilium(options ...cilium.Option) *Runner {
-	r.installCilium = func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-		return cilium.Setup(options...)(ctx, cfg)
-	}
-	return r
-}
-
-func (r *Runner) NoInstallCilium() *Runner {
-	r.installCilium = func(ctx context.Context, _ *envconf.Config) (context.Context, error) {
-		klog.Info("Skipping Cilium install")
-		return ctx, nil
-	}
-	return r
-}
-
 // Initialize the configured runner. Must be called exactly once.
 func (r *Runner) Init() *Runner {
 	if r.hasCalledInit {
@@ -148,6 +115,10 @@ func (r *Runner) Init() *Runner {
 	if err != nil {
 		klog.Fatalf("Failed to configure test environment")
 	}
+
+	if flags.Opts.Minikube {
+		envfuncs.LoadDockerImageToCluster = helpers.LoadImageToMinikubeEnvFunc
+	}
 	klog.Info("IMPORTANT: Tetragon e2e tests require parallel tests enabled. User preferences will be ignored.")
 	cfg = cfg.WithParallelTestEnabled()
 
@@ -157,7 +128,7 @@ func (r *Runner) Init() *Runner {
 	r.Environment = env.NewWithConfig(cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
-	r.Environment = r.Environment.WithContext(ctx)
+	r.Environment = r.WithContext(ctx)
 
 	if r.setupCluster == nil {
 		klog.Fatalf("Runner.setupCluster cannot be nil")
@@ -166,48 +137,62 @@ func (r *Runner) Init() *Runner {
 
 	r.Setup(helpers.SetMinKernelVersion())
 
-	if r.installCilium != nil && flags.Opts.InstallCilium {
-		r.Setup(r.installCilium)
-	}
-
 	if r.installTetragon == nil {
 		klog.Fatalf("Runner.installTetragon cannot be nil")
 	}
-	r.Setup(r.installTetragon)
-
-	// Store test success or failure
-	r.AfterEachTest(func(ctx context.Context, _ *envconf.Config, t *testing.T) (context.Context, error) {
-		if t.Failed() {
-			return context.WithValue(ctx, state.TestFailure, true), nil
+	r.Setup(func(ctx context.Context, config *envconf.Config) (context.Context, error) {
+		ctx, err := r.installTetragon(ctx, config)
+		if err != nil {
+			klog.Errorf("Runner.installTetragon failed: %v", err)
+			r.setupTetragonFailed = true
 		}
 		return ctx, err
 	})
 
-	r.Finish(func(ctx context.Context, c *envconf.Config) (context.Context, error) {
-		failure, ok := ctx.Value(state.TestFailure).(bool)
-		if !ok {
-			failure = false
+	r.BeforeEachTest(func(ctx context.Context, _ *envconf.Config, t *testing.T) (context.Context, error) {
+		return r.SetupExport(ctx, t)
+	})
+
+	r.AfterEachTest(func(ctx context.Context, c *envconf.Config, t *testing.T) (context.Context, error) {
+		if t.Failed() {
+			return helpers.DumpInfo(ctx, c)
 		}
-		ctx = context.WithValue(ctx, state.TestFailure, nil)
-		// The test passed and we are not keeping export files, remove the export dir
-		// and return early
-		if !r.keepExportFiles && !failure {
-			if exportDir, err := helpers.GetExportDir(ctx); err == nil {
-				klog.Info("test passed and keep-export not set, removing export dir")
-				if err := os.RemoveAll(exportDir); err != nil {
-					klog.ErrorS(err, "failed to remove export dir")
-				}
-			}
+		if r.keepExportFiles {
+			return ctx, nil
+		}
+		exportDir, err := helpers.GetExportDir(ctx)
+		if err != nil {
 			return ctx, err
 		}
-		return helpers.DumpInfo(ctx, c)
+		klog.InfoS("test passed and keep-export not set, removing export dir", "dir", exportDir)
+		if err := os.RemoveAll(exportDir); err != nil {
+			return ctx, err
+		}
+		return ctx, nil
 	})
 
 	if r.tetragonPortForward != nil {
-		r.Setup(r.tetragonPortForward(r.Environment))
+		r.Setup(func(ctx context.Context, config *envconf.Config) (context.Context, error) {
+			ctx, err := r.tetragonPortForward(r.Environment)(ctx, config)
+			if err != nil {
+				r.setupTetragonFailed = true
+			}
+			return ctx, err
+		})
 	}
 
-	if r.uninstallTetragon != nil {
+	r.Finish(func(ctx context.Context, config *envconf.Config) (context.Context, error) {
+		if !r.setupTetragonFailed {
+			return ctx, nil
+		}
+		ctx, err := helpers.CreateExportDir(ctx, "setup")
+		if err != nil {
+			return ctx, err
+		}
+		return helpers.DumpInfo(ctx, config)
+	})
+
+	if r.uninstallTetragon != nil && flags.Opts.UninstallTetragon {
 		r.Finish(r.uninstallTetragon)
 	}
 
@@ -232,25 +217,19 @@ func (r *Runner) cancelContext() {
 	}
 }
 
-// Must be called at the beinning of every test.
-func (r *Runner) SetupExport(t *testing.T) {
-	setup := features.New("Setup Export").Assess("Setup Export", func(ctx context.Context, _ *testing.T, _ *envconf.Config) context.Context {
-		ctx, err := helpers.CreateExportDir(ctx, t)
-		if err != nil {
-			t.Fatalf("failed to create export dir: %s", err)
-		}
+func (r *Runner) SetupExport(ctx context.Context, t *testing.T) (context.Context, error) {
+	ctx, err := helpers.CreateExportDir(ctx, t.Name())
+	if err != nil {
+		return ctx, err
+	}
 
-		exportDir, err := helpers.GetExportDir(ctx)
-		if err != nil {
-			t.Fatalf("failed to get export dir: %s", err)
-		}
+	exportDir, err := helpers.GetExportDir(ctx)
+	if err != nil {
+		return ctx, err
+	}
 
-		// Start the metrics and gops dumpers
-		helpers.StartMetricsDumper(ctx, exportDir, 30*time.Second)
-		helpers.StartGopsDumper(ctx, exportDir, 30*time.Second)
-
-		return ctx
-	}).Feature()
-
-	r.Test(t, setup)
+	// Start the metrics and gops dumpers
+	helpers.StartMetricsDumper(ctx, exportDir, 30*time.Second)
+	helpers.StartGopsDumper(ctx, exportDir, 30*time.Second)
+	return ctx, nil
 }

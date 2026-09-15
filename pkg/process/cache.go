@@ -5,13 +5,20 @@ package process
 
 import (
 	"fmt"
-	"sync/atomic"
+	"maps"
+	"path/filepath"
 	"time"
 
-	"github.com/cilium/tetragon/api/v1/tetragon"
-	"github.com/cilium/tetragon/pkg/logger"
-	"github.com/cilium/tetragon/pkg/metrics/errormetrics"
+	"github.com/cilium/ebpf"
 	lru "github.com/hashicorp/golang-lru/v2"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/defaults"
+	"github.com/cilium/tetragon/pkg/logger"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
+	"github.com/cilium/tetragon/pkg/sensors/exec/execvemap"
 )
 
 type Cache struct {
@@ -21,27 +28,32 @@ type Cache struct {
 	stopChan   chan bool
 }
 
+// processColor tracks the garbage collection state of a process. It is stored
+// in ProcessInternal as an atomic and accessed via getColor/setColor.
+type processColor int32
+
 // garbage collection states
 const (
-	inUse = iota
+	inUse processColor = iota
 	deletePending
 	deleteReady
 	deleted
 )
 
-// garbage collection run interval
-const (
-	intervalGC = time.Second * 30
-)
+var colorStr = map[processColor]string{
+	inUse:         "inUse",
+	deletePending: "deletePending",
+	deleteReady:   "deleteReady",
+	deleted:       "deleted",
+}
 
-func (pc *Cache) cacheGarbageCollector() {
+func (pc *Cache) cacheGarbageCollector(intervalGC time.Duration) {
 	ticker := time.NewTicker(intervalGC)
 	pc.deleteChan = make(chan *ProcessInternal)
 	pc.stopChan = make(chan bool)
 
 	go func() {
-		var deleteQueue, newQueue []*ProcessInternal
-
+		var deleteQueue []*ProcessInternal
 		for {
 			select {
 			case <-pc.stopChan:
@@ -49,7 +61,7 @@ func (pc *Cache) cacheGarbageCollector() {
 				pc.cache.Purge()
 				return
 			case <-ticker.C:
-				newQueue = newQueue[:0]
+				newQueue := []*ProcessInternal{}
 				for _, p := range deleteQueue {
 					/* If the ref != 0 this means we have bounced
 					 * through !refcnt and now have a refcnt. This
@@ -68,38 +80,35 @@ func (pc *Cache) cacheGarbageCollector() {
 					 * later if we care. Also we may try to delete the
 					 * process a second time, but that is harmless.
 					 */
-					ref := atomic.LoadUint32(&p.refcnt)
-					if ref != 0 {
+					if p.refcnt.Load() != 0 {
+						p.setColor(inUse)
 						continue
 					}
-					if p.color == deleteReady {
-						p.color = deleted
+					if p.getColor() == deleteReady {
+						p.setColor(deleted)
 						pc.remove(p.process)
 					} else {
 						newQueue = append(newQueue, p)
-						p.color = deleteReady
+						p.setColor(deleteReady)
 					}
 				}
 				deleteQueue = newQueue
 			case p := <-pc.deleteChan:
-				// duplicate deletes can happen, if they do reset
-				// color to pending and move along. This will cause
-				// the GC to keep it alive for at least another pass.
-				// Notice color is only ever touched inside GC behind
-				// select channel logic so should be safe to work on
-				// and assume its visible everywhere.
-				if p.color != inUse {
-					p.color = deletePending
-					continue
-				}
 				// The object has already been deleted let if fall of
 				// the edge of the world. Hitting this could mean our
 				// GC logic deleted a process too early.
-				// TBD add a counter around this to alert on it.
-				if p.color == deleted {
+				if p.getColor() == deleted {
+					processCacheEarlyDeletions.Inc()
 					continue
 				}
-				p.color = deletePending
+				// duplicate deletes can happen, if they do reset
+				// color to pending and move along. This will cause
+				// the GC to keep it alive for at least another pass.
+				if p.getColor() != inUse {
+					p.setColor(deletePending)
+					continue
+				}
+				p.setColor(deletePending)
 				deleteQueue = append(deleteQueue, p)
 			}
 		}
@@ -110,46 +119,84 @@ func (pc *Cache) deletePending(process *ProcessInternal) {
 	pc.deleteChan <- process
 }
 
-func (pc *Cache) refDec(p *ProcessInternal) {
-	ref := atomic.AddUint32(&p.refcnt, ^uint32(0))
+func (pc *Cache) refDec(p *ProcessInternal, reason string) {
+	p.refcntOpsLock.Lock()
+	// count number of times refcnt is decremented for a specific reason (i.e. process, parent, etc.)
+	p.refcntOps[reason]++
+	p.refcntOpsLock.Unlock()
+	ref := p.refcnt.Add(^uint32(0))
 	if ref == 0 {
 		pc.deletePending(p)
 	}
 }
 
-func (pc *Cache) refInc(p *ProcessInternal) {
-	atomic.AddUint32(&p.refcnt, 1)
+func (pc *Cache) refInc(p *ProcessInternal, reason string) {
+	p.refcntOpsLock.Lock()
+	// count number of times refcnt is increamented for a specific reason (i.e. process, parent, etc.)
+	p.refcntOps[reason]++
+	p.refcntOpsLock.Unlock()
+	p.refcnt.Add(1)
 }
 
-func (pc *Cache) Purge() {
+func (pc *Cache) purge() {
 	pc.stopChan <- true
+	processCacheTotal.Set(0)
 }
 
 func NewCache(
 	processCacheSize int,
+	GCInterval time.Duration,
 ) (*Cache, error) {
+	// Stash a reference to the Cache to refer to later in the eviction closure.
+	pm := &Cache{
+		size: processCacheSize,
+	}
+
 	lruCache, err := lru.NewWithEvict(
 		processCacheSize,
-		func(_ string, _ *ProcessInternal) {
-			errormetrics.ErrorTotalInc(errormetrics.ProcessCacheEvicted)
+		func(_ string, evicted *ProcessInternal) {
+			processCacheEvictions.Inc()
+
+			// Perform parent-- for LRU-evicted entries that will never
+			// reach the exit handler.
+
+			// Skip entries whose exit path already performed parent--
+			if evicted.GetParentRefcntDecreased() {
+				return
+			}
+
+			// Skip non-inUse entries whose exit path already performed parent--
+			if evicted.getColor() != inUse {
+				return
+			}
+
+			// Is the parent still in the cache?
+			if evicted.process == nil {
+				return
+			}
+			parent, ok := pm.cache.Peek(evicted.process.ParentExecId)
+			if !ok {
+				return
+			}
+
+			pm.refDec(parent, "parent--")
+			evicted.SetParentRefcntDecreased(true)
 		},
 	)
 	if err != nil {
 		return nil, err
 	}
-	pm := &Cache{
-		cache: lruCache,
-		size:  processCacheSize,
-	}
-	pm.cacheGarbageCollector()
+
+	pm.cache = lruCache
+	pm.cacheGarbageCollector(GCInterval)
 	return pm, nil
 }
 
 func (pc *Cache) get(processID string) (*ProcessInternal, error) {
 	process, ok := pc.cache.Get(processID)
 	if !ok {
-		logger.GetLogger().WithField("id in event", processID).Debug("process not found in cache")
-		errormetrics.ErrorTotalInc(errormetrics.ProcessCacheMissOnGet)
+		logger.GetLogger().Debug("process not found in cache", "id", processID)
+		processCacheMisses.WithLabelValues("get").Inc()
 		return nil, fmt.Errorf("invalid entry for process ID: %s", processID)
 	}
 	return process, nil
@@ -159,17 +206,73 @@ func (pc *Cache) get(processID string) (*ProcessInternal, error) {
 // clone or execve events
 func (pc *Cache) add(process *ProcessInternal) bool {
 	evicted := pc.cache.Add(process.process.ExecId, process)
+	if !evicted {
+		processCacheTotal.Inc()
+	} else {
+		processCacheCapacityEvictions.Inc()
+	}
 	return evicted
 }
 
 func (pc *Cache) remove(process *tetragon.Process) bool {
 	present := pc.cache.Remove(process.ExecId)
-	if !present {
-		errormetrics.ErrorTotalInc(errormetrics.ProcessCacheMissOnRemove)
+	if present {
+		processCacheTotal.Dec()
+	} else {
+		processCacheMisses.WithLabelValues("remove").Inc()
 	}
 	return present
 }
 
 func (pc *Cache) len() int {
 	return pc.cache.Len()
+}
+
+func (pc *Cache) dump(opts *tetragon.DumpProcessCacheReqArgs) []*tetragon.ProcessInternal {
+	execveMapPath := filepath.Join(defaults.DefaultMapRoot, defaults.DefaultMapPrefix, "execve_map")
+	var execveMap *ebpf.Map
+	var err error
+	if opts.ExcludeExecveMapProcesses {
+		execveMap, err = ebpf.LoadPinnedMap(execveMapPath, &ebpf.LoadPinOptions{ReadOnly: true})
+		if err != nil {
+			logger.GetLogger().Warn("failed to open execve_map", logfields.Error, err)
+			return []*tetragon.ProcessInternal{}
+		}
+		defer execveMap.Close()
+	}
+
+	var processes []*tetragon.ProcessInternal
+	for _, v := range pc.cache.Values() {
+		ref := v.refcnt.Load()
+		if opts.SkipZeroRefcnt && ref == 0 {
+			continue
+		}
+		if opts.ExcludeExecveMapProcesses {
+			var val execvemap.ExecveValue
+			if err := execveMap.Lookup(&execvemap.ExecveKey{Pid: v.process.Pid.Value}, &val); err == nil {
+				// pid exists in the execve_map, so skip this process
+				continue
+			}
+		}
+		processes = append(processes, &tetragon.ProcessInternal{
+			Process:   proto.Clone(v.process).(*tetragon.Process),
+			Refcnt:    &wrapperspb.UInt32Value{Value: ref},
+			RefcntOps: maps.Clone(v.refcntOps),
+			Color:     colorStr[v.getColor()],
+		})
+	}
+	return processes
+}
+
+func (pc *Cache) getEntries() []*tetragon.ProcessInternal {
+	var processes []*tetragon.ProcessInternal
+	for _, v := range pc.cache.Values() {
+		processes = append(processes, &tetragon.ProcessInternal{
+			Process:   v.process,
+			Refcnt:    &wrapperspb.UInt32Value{Value: v.refcnt.Load()},
+			RefcntOps: v.refcntOps,
+			Color:     colorStr[v.getColor()],
+		})
+	}
+	return processes
 }

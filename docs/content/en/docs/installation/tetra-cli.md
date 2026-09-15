@@ -70,14 +70,14 @@ sudo mv tetra /usr/local/bin
 {{< /tab >}}
 
 {{< tab header="Windows amd64" >}}
-curl -L https://github.com/cilium/tetragon/releases/latest/download/tetra-windows-amd64.tar.gz
-tar -xz tetra-windows-amd64.tar.gz
+curl -LO https://github.com/cilium/tetragon/releases/latest/download/tetra-windows-amd64.tar.gz
+tar -xzf tetra-windows-amd64.tar.gz
 # move the binary in a directory in your PATH
 {{< /tab >}}
 
 {{< tab header="Windows arm64" >}}
-curl -L https://github.com/cilium/tetragon/releases/latest/download/tetra-windows-arm64.tar.gz
-tar -xz tetra-windows-arm64.tar.gz
+curl -LO https://github.com/cilium/tetragon/releases/latest/download/tetra-windows-arm64.tar.gz
+tar -xzf tetra-windows-arm64.tar.gz
 # move the binary in a directory in your PATH
 {{< /tab >}}
 {{< /tabpane >}}
@@ -92,6 +92,23 @@ fetch precompiled binaries. You can also use it to build from sources (using the
 ```shell
 brew install tetra
 ```
+
+## Connect to a TLS-protected server
+
+If the Tetragon agent runs the gRPC API over TLS or mTLS, point `tetra` at the
+TCP listener and pass the matching credentials:
+
+```shell
+tetra \
+  --server-address tetragon.example.com:54321 \
+  --tls-ca-cert-files ca.crt \
+  --tls-cert-file client.crt \
+  --tls-key-file client.key \
+  getevents
+```
+
+See [gRPC TLS / mTLS]({{< ref "/docs/installation/grpc-tls" >}}) for the full
+flag list and provisioning options.
 
 ## Install a specific release
 
